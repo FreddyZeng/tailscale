@@ -33,15 +33,170 @@ import (
 	"tailscale.com/util/mak"
 )
 
-const testProxyImage = "tailscale/tailscale:test"
+const (
+	testProxyImage = "tailscale/tailscale:test"
+	initialCfgHash = "6632726be70cf224049580deb4d317bba065915b5fd415461d60ed621c91b196"
+)
 
 var defaultProxyClassAnnotations = map[string]string{
 	"some-annotation": "from-the-proxy-class",
 }
 
-func TestProxyGroup(t *testing.T) {
-	const initialCfgHash = "6632726be70cf224049580deb4d317bba065915b5fd415461d60ed621c91b196"
+func TestProxyGroupWithStaticEndpoints(t *testing.T) {
+	testCases := []struct {
+		name                  string
+		listenerConfig        tsapi.TailnetListenerConfig
+		replicas              *int32
+		expectStaticEndpoints bool
+	}{
+		{
+			name: "PortsAutoAllocated",
+			listenerConfig: tsapi.TailnetListenerConfig{
+				Type: "NodePort",
+			},
+			replicas:              ptr.To(int32(3)),
+			expectStaticEndpoints: true,
+		},
+		{
+			name: "InvalidType",
+			listenerConfig: tsapi.TailnetListenerConfig{
+				Type: "BlumBlum",
+			},
+			replicas:              ptr.To(int32(4)),
+			expectStaticEndpoints: false,
+		},
+		{
+			name: "SpecificPorts",
+			listenerConfig: tsapi.TailnetListenerConfig{
+				Type: "NodePort",
+				NodePortConfig: &tsapi.NodePort{
+					PortRanges: []string{"3001", "3005", "3007", "3009"},
+				},
+			},
+			replicas:              ptr.To(int32(4)),
+			expectStaticEndpoints: true,
+		},
+	}
 
+	tsClient := &fakeTSClient{}
+	zl, _ := zap.NewDevelopment()
+	fr := record.NewFakeRecorder(1)
+	cl := tstest.NewClock(tstest.ClockOpts{})
+
+	for _, tt := range testCases {
+		pc := &tsapi.ProxyClass{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "default-pc",
+			},
+			Spec: tsapi.ProxyClassSpec{
+				StatefulSet: &tsapi.StatefulSet{
+					Annotations: defaultProxyClassAnnotations,
+				},
+				TailnetListenerConfig: &tt.listenerConfig,
+			},
+			Status: tsapi.ProxyClassStatus{
+				Conditions: []metav1.Condition{{
+					Type:               string(tsapi.ProxyClassReady),
+					Status:             metav1.ConditionTrue,
+					Reason:             reasonProxyClassValid,
+					Message:            reasonProxyClassValid,
+					LastTransitionTime: metav1.Time{Time: cl.Now().Truncate(time.Second)},
+				}},
+			},
+		}
+
+		pg := &tsapi.ProxyGroup{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "test",
+				Finalizers: []string{"tailscale.com/finalizer"},
+			},
+			Spec: tsapi.ProxyGroupSpec{
+				Type:       tsapi.ProxyGroupTypeEgress,
+				ProxyClass: pc.Name,
+				Replicas:   tt.replicas,
+			},
+		}
+
+		fc := fake.NewClientBuilder().
+			WithScheme(tsapi.GlobalScheme).
+			WithObjects(pg, pc).
+			WithStatusSubresource(pg, pc).
+			Build()
+
+		reconciler := &ProxyGroupReconciler{
+			tsNamespace:       tsNamespace,
+			proxyImage:        testProxyImage,
+			defaultTags:       []string{"tag:test-tag"},
+			tsFirewallMode:    "auto",
+			defaultProxyClass: "default-pc",
+
+			Client:   fc,
+			tsClient: tsClient,
+			recorder: fr,
+			l:        zl.Sugar(),
+			clock:    cl,
+		}
+
+		// opts := configOpts{
+		// 	proxyType:          "proxygroup",
+		// 	stsName:            pg.Name,
+		// 	parentType:         "proxygroup",
+		// 	tailscaleNamespace: "tailscale",
+		// 	resourceVersion:    "1",
+		// }
+		expectReconciled(t, reconciler, "", pg.Name)
+
+		svcs := []corev1.Service{}
+		if tt.expectStaticEndpoints {
+			for i := range *tt.replicas {
+				svc := &corev1.Service{}
+				err := fc.Get(context.Background(), client.ObjectKey{Namespace: tsNamespace, Name: fmt.Sprintf("%s-%d", pg.Name, i)}, svc)
+				if err != nil {
+					t.Logf("TestCase-%s: %s", tt.name, err.Error())
+				}
+				svcs = append(svcs, *svc)
+			}
+		}
+
+		if !tt.expectStaticEndpoints && len(svcs) > 0 {
+			t.Fatalf("TestCase-%s: expected 0 static endpoint services, found %d", tt.name, len(svcs))
+		}
+
+		if tt.expectStaticEndpoints {
+			if tt.listenerConfig.NodePortConfig == nil || len(tt.listenerConfig.NodePortConfig.PortRanges) > 0 {
+				for i, svc := range svcs {
+					svc.Spec.Ports = []corev1.ServicePort{
+						{
+							Name:       directConnPortName,
+							Port:       int32(directConnProxyPort),
+							Protocol:   corev1.ProtocolUDP,
+							NodePort:   int32(3000 + i),
+							TargetPort: intstr.FromInt(directConnProxyPort),
+						},
+					}
+				}
+			}
+		}
+
+		t.Run("delete_and_cleanup", func(t *testing.T) {
+			if err := fc.Delete(context.Background(), pg); err != nil {
+				t.Fatalf("TestCase-%s: %s", tt.name, err.Error())
+			}
+
+			expectReconciled(t, reconciler, "", pg.Name)
+
+			expectMissing[tsapi.ProxyGroup](t, fc, "", pg.Name)
+			if expected := 0; reconciler.egressProxyGroups.Len() != expected {
+				t.Fatalf("TestCase-%s: expected %d ProxyGroups, got %d", tt.name, expected, reconciler.egressProxyGroups.Len())
+			}
+			// The fake client does not clean up objects whose owner has been
+			// deleted, so we can't test for the owned resources getting deleted.
+		})
+
+	}
+}
+
+func TestProxyGroup(t *testing.T) {
 	pc := &tsapi.ProxyClass{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "default-pc",

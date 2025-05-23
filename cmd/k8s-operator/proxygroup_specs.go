@@ -144,7 +144,7 @@ func pgStatefulSet(pg *tsapi.ProxyGroup, namespace, image, tsFirewallMode string
 			},
 		}
 
-		if len(proxyClass.Spec.TailnetListenerConfig.NodePortConfig.PortRanges) > 0 {
+		if proxyClass != nil && proxyClass.Spec.TailnetListenerConfig != nil && proxyClass.Spec.TailnetListenerConfig.Type == "NodePort" {
 			envs = append(envs, corev1.EnvVar{
 				Name:  "PORT",
 				Value: strconv.Itoa(directConnProxyPort),

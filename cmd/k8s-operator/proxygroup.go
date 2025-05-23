@@ -317,23 +317,22 @@ func validatePortRanges(pr []string) ([]portRange, error) {
 	return ranges, nil
 }
 
-func (r *ProxyGroupReconciler) maybeExposeViaNodePort(ctx context.Context, pc *tsapi.ProxyClass, pg *tsapi.ProxyGroup, logger *zap.SugaredLogger) (map[string]int32, error) {
-	if pc == nil || pc.Spec.TailnetListenerConfig == nil || pc.Spec.TailnetListenerConfig.Type != nodePortType {
-		return nil, nil
-	}
-
+func (r *ProxyGroupReconciler) maybeExposeViaNodePort(ctx context.Context, pc *tsapi.ProxyClass, pg *tsapi.ProxyGroup, logger *zap.SugaredLogger) (map[string]int32, bool, error) {
 	ports := make(map[string]int32)
-	pr := pc.Spec.TailnetListenerConfig.NodePortConfig.PortRanges
-	if len(pr) == 0 {
-		logger.Infof("no port ranges specified in ProxyClass config, leaving NodePort unspecified")
-	} else {
-		err := allocatePorts(pg, pr, ports)
-		if err != nil {
-			return nil, fmt.Errorf("failed to allocate NodePorts to ProxyGroup Services: %w", err)
+	if pc.Spec.TailnetListenerConfig.NodePortConfig != nil {
+		pr := pc.Spec.TailnetListenerConfig.NodePortConfig.PortRanges
+		if len(pr) == 0 {
+			logger.Infof("no port ranges specified in ProxyClass config, leaving NodePort unspecified")
+		} else {
+			err := allocatePorts(pg, pr, ports)
+			if err != nil {
+				return nil, false, fmt.Errorf("failed to allocate NodePorts to ProxyGroup Services: %w", err)
+			}
 		}
 	}
 
-	for i := range *(pg.Spec.Replicas) {
+	extraReconcile := false
+	for i := range pgReplicas(pg) {
 		replicaName := fmt.Sprintf("%s-%d", pg.Name, i)
 		port, ok := ports[replicaName]
 		if !ok {
@@ -365,6 +364,8 @@ func (r *ProxyGroupReconciler) maybeExposeViaNodePort(ctx context.Context, pc *t
 			},
 		}
 
+		logger.Debugf("creating Kubernetes Service %q", svc.Name)
+
 		createOrUpdate(ctx, r.Client, r.tsNamespace, svc, func(s *corev1.Service) {
 			s.ObjectMeta.Labels = svc.ObjectMeta.Labels
 			s.ObjectMeta.Annotations = svc.ObjectMeta.Annotations
@@ -377,26 +378,28 @@ func (r *ProxyGroupReconciler) maybeExposeViaNodePort(ctx context.Context, pc *t
 
 		if port == 0 {
 			if err := r.Get(ctx, client.ObjectKeyFromObject(svc), svc); err != nil && !apierrors.IsNotFound(err) {
-				return nil, fmt.Errorf("error retrieving Kubernetes NodePort Service %s: %w", svc.Name, err)
+				return nil, false, fmt.Errorf("error retrieving Kubernetes NodePort Service %s: %w", svc.Name, err)
 			}
 
 			for _, p := range svc.Spec.Ports {
 				if p.Name == directConnPortName {
+					logger.Infof("found nodeport of %d", int(p.NodePort))
 					port = p.NodePort
 					ports[replicaName] = port
 				}
 			}
 
 			if port == 0 {
-				logger.Warn("ProxyGroup %q replica %q NodePort not configured")
-				return nil, nil
+				logger.Debugf("ProxyGroup %q replica %q NodePort not configured", pg.Name, svc.Name)
+				extraReconcile = true
+				continue
 			}
 
 			logger.Info("ProxyGroup %q replica %q exposed on NodePort %q. Please ensure the appropriate firewall rules are configured to expose it on the desired network.", pg.Name, svc.Name, port)
 		}
 	}
 
-	return ports, nil
+	return ports, extraReconcile, nil
 }
 
 // validateProxyClassForPG applies custom validation logic for ProxyClass applied to ProxyGroup.
@@ -430,9 +433,17 @@ func (r *ProxyGroupReconciler) maybeProvision(ctx context.Context, pg *tsapi.Pro
 	r.ensureAddedToGaugeForProxyGroup(pg)
 	r.mu.Unlock()
 
-	ports, err := r.maybeExposeViaNodePort(ctx, proxyClass, pg, logger)
-	if err != nil {
-		return fmt.Errorf("error getting device info: %w", err)
+	ports := make(map[string]int32)
+	var err error
+	var rec bool
+	if proxyClass != nil && proxyClass.Spec.TailnetListenerConfig != nil && proxyClass.Spec.TailnetListenerConfig.Type == nodePortType {
+		ports, rec, err = r.maybeExposeViaNodePort(ctx, proxyClass, pg, logger)
+		if err != nil {
+			return fmt.Errorf("error getting device info: %w", err)
+		}
+		if rec {
+			return nil
+		}
 	}
 
 	cfgHash, err := r.ensureConfigSecretsCreated(ctx, pg, proxyClass, ports)
@@ -682,7 +693,7 @@ func (r *ProxyGroupReconciler) ensureConfigSecretsCreated(ctx context.Context, p
 		}
 
 		endpoints := []netip.AddrPort{}
-		if proxyClass != nil && proxyClass.Spec.TailnetListenerConfig.Type == nodePortType {
+		if proxyClass != nil && proxyClass.Spec.TailnetListenerConfig != nil && proxyClass.Spec.TailnetListenerConfig.Type == nodePortType {
 			replicaName := fmt.Sprintf("%s-%d", pg.Name, i)
 			port, ok := ports[replicaName]
 			if !ok {
