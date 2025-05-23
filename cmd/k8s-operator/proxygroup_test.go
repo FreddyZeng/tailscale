@@ -45,35 +45,62 @@ var defaultProxyClassAnnotations = map[string]string{
 func TestProxyGroupWithStaticEndpoints(t *testing.T) {
 	testCases := []struct {
 		name                  string
-		listenerConfig        tsapi.TailnetListenerConfig
+		listenerConfig        *tsapi.TailnetListenerConfig
 		replicas              *int32
 		expectStaticEndpoints bool
+		numNodes              int
+		nodeLabels            map[string]string
 	}{
 		{
 			name: "PortsAutoAllocated",
-			listenerConfig: tsapi.TailnetListenerConfig{
+			listenerConfig: &tsapi.TailnetListenerConfig{
 				Type: "NodePort",
+				NodePortConfig: &tsapi.NodePort{
+					Selector: map[string]string{
+						"foo/bar": "baz",
+					},
+				},
 			},
-			replicas:              ptr.To(int32(3)),
+			replicas: ptr.To(int32(3)),
+			nodeLabels: map[string]string{
+				"foo/bar": "baz",
+			},
+			numNodes:              4,
 			expectStaticEndpoints: true,
 		},
 		{
 			name: "InvalidType",
-			listenerConfig: tsapi.TailnetListenerConfig{
+			listenerConfig: &tsapi.TailnetListenerConfig{
 				Type: "BlumBlum",
+				NodePortConfig: &tsapi.NodePort{
+					Selector: map[string]string{
+						"foo/bar": "baz",
+					},
+				},
 			},
-			replicas:              ptr.To(int32(4)),
+			replicas: ptr.To(int32(4)),
+			nodeLabels: map[string]string{
+				"foo/bar": "baz",
+			},
+			numNodes:              4,
 			expectStaticEndpoints: false,
 		},
 		{
 			name: "SpecificPorts",
-			listenerConfig: tsapi.TailnetListenerConfig{
+			listenerConfig: &tsapi.TailnetListenerConfig{
 				Type: "NodePort",
 				NodePortConfig: &tsapi.NodePort{
 					PortRanges: []string{"3001", "3005", "3007", "3009"},
+					Selector: map[string]string{
+						"foo/bar": "baz",
+					},
 				},
 			},
-			replicas:              ptr.To(int32(4)),
+			replicas: ptr.To(int32(4)),
+			nodeLabels: map[string]string{
+				"foo/bar": "baz",
+			},
+			numNodes:              4,
 			expectStaticEndpoints: true,
 		},
 	}
@@ -92,7 +119,7 @@ func TestProxyGroupWithStaticEndpoints(t *testing.T) {
 				StatefulSet: &tsapi.StatefulSet{
 					Annotations: defaultProxyClassAnnotations,
 				},
-				TailnetListenerConfig: &tt.listenerConfig,
+				TailnetListenerConfig: tt.listenerConfig,
 			},
 			Status: tsapi.ProxyClassStatus{
 				Conditions: []metav1.Condition{{
@@ -123,6 +150,24 @@ func TestProxyGroupWithStaticEndpoints(t *testing.T) {
 			WithStatusSubresource(pg, pc).
 			Build()
 
+		ppc := &tsapi.ProxyClass{}
+		_ = fc.Get(context.Background(), client.ObjectKey{Namespace: tsNamespace, Name: "default-pc"}, ppc)
+
+		if tt.numNodes == 0 {
+			tt.numNodes = 1
+		}
+
+		for i := range tt.numNodes {
+			no := &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:   fmt.Sprintf("test-%d", i),
+					Labels: tt.nodeLabels,
+				},
+			}
+
+			fc.Create(context.Background(), no)
+		}
+
 		reconciler := &ProxyGroupReconciler{
 			tsNamespace:       tsNamespace,
 			proxyImage:        testProxyImage,
@@ -137,13 +182,6 @@ func TestProxyGroupWithStaticEndpoints(t *testing.T) {
 			clock:    cl,
 		}
 
-		// opts := configOpts{
-		// 	proxyType:          "proxygroup",
-		// 	stsName:            pg.Name,
-		// 	parentType:         "proxygroup",
-		// 	tailscaleNamespace: "tailscale",
-		// 	resourceVersion:    "1",
-		// }
 		expectReconciled(t, reconciler, "", pg.Name)
 
 		svcs := []corev1.Service{}
@@ -154,17 +192,8 @@ func TestProxyGroupWithStaticEndpoints(t *testing.T) {
 				if err != nil {
 					t.Logf("TestCase-%s: %s", tt.name, err.Error())
 				}
-				svcs = append(svcs, *svc)
-			}
-		}
 
-		if !tt.expectStaticEndpoints && len(svcs) > 0 {
-			t.Fatalf("TestCase-%s: expected 0 static endpoint services, found %d", tt.name, len(svcs))
-		}
-
-		if tt.expectStaticEndpoints {
-			if tt.listenerConfig.NodePortConfig == nil || len(tt.listenerConfig.NodePortConfig.PortRanges) > 0 {
-				for i, svc := range svcs {
+				if tt.listenerConfig.NodePortConfig == nil || len(tt.listenerConfig.NodePortConfig.PortRanges) == 0 {
 					svc.Spec.Ports = []corev1.ServicePort{
 						{
 							Name:       directConnPortName,
@@ -174,8 +203,19 @@ func TestProxyGroupWithStaticEndpoints(t *testing.T) {
 							TargetPort: intstr.FromInt(directConnProxyPort),
 						},
 					}
+
+					err := fc.Update(context.Background(), svc)
+					if err != nil {
+						t.Fatalf("TestCase-%s: %s", tt.name, err.Error())
+					}
+
+					expectReconciled(t, reconciler, "", pg.Name)
 				}
 			}
+		}
+
+		if !tt.expectStaticEndpoints && len(svcs) > 0 {
+			t.Fatalf("TestCase-%s: expected 0 static endpoint services, found %d", tt.name, len(svcs))
 		}
 
 		t.Run("delete_and_cleanup", func(t *testing.T) {

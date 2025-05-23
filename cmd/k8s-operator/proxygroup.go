@@ -693,7 +693,7 @@ func (r *ProxyGroupReconciler) ensureConfigSecretsCreated(ctx context.Context, p
 		}
 
 		endpoints := []netip.AddrPort{}
-		if proxyClass != nil && proxyClass.Spec.TailnetListenerConfig != nil && proxyClass.Spec.TailnetListenerConfig.Type == nodePortType {
+		if len(ports) > 0 {
 			replicaName := fmt.Sprintf("%s-%d", pg.Name, i)
 			port, ok := ports[replicaName]
 			if !ok {
@@ -769,6 +769,11 @@ func (r *ProxyGroupReconciler) ensureConfigSecretsCreated(ctx context.Context, p
 
 func (r *ProxyGroupReconciler) findStaticEndpoints(ctx context.Context, port int32, endpoints []netip.AddrPort, proxyClass *tsapi.ProxyClass, logger *zap.SugaredLogger) error {
 	nodes := new(corev1.NodeList)
+	selectors := proxyClass.Spec.TailnetListenerConfig.NodePortConfig.Selector
+	if len(selectors) < 1 {
+		return fmt.Errorf("no LabelSelectors specified on tailnetListenerConfig for ProxyClass %q", proxyClass.Name)
+	}
+
 	err := r.List(ctx, nodes, client.MatchingLabels(proxyClass.Spec.TailnetListenerConfig.NodePortConfig.Selector))
 	if err != nil {
 		return fmt.Errorf("failed to list nodes: %w", err)
