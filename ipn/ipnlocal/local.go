@@ -4150,8 +4150,8 @@ func (b *LocalBackend) SetUseExitNodeEnabled(v bool) (ipn.PrefsView, error) {
 // AdvertiseRoutes has been set in the MaskedPrefs.
 func (b *LocalBackend) MaybeClearAppConnector(mp *ipn.MaskedPrefs) error {
 	var err error
-	if b.appConnector != nil && mp.AdvertiseRoutesSet {
-		err = b.appConnector.ClearRoutes()
+	if ac := b.AppConnector(); ac != nil && mp.AdvertiseRoutesSet {
+		err = ac.ClearRoutes()
 		if err != nil {
 			b.logf("appc: clear routes error: %v", err)
 		}
@@ -4755,9 +4755,7 @@ func (b *LocalBackend) readvertiseAppConnectorRoutes() {
 	//
 	// Grab a copy of the field, since b.mu only guards access to the
 	// b.appConnector field itself.
-	b.mu.Lock()
-	appConnector := b.appConnector
-	b.mu.Unlock()
+	appConnector := b.AppConnector()
 
 	if appConnector == nil {
 		return
@@ -5830,7 +5828,14 @@ func (b *LocalBackend) setNetMapLocked(nm *netmap.NetworkMap) {
 	b.pauseOrResumeControlClientLocked()
 
 	if nm != nil {
-		b.health.SetControlHealth(nm.DisplayMessages)
+		messages := make(map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage)
+		for id, msg := range nm.DisplayMessages {
+			if msg.PrimaryAction != nil && !b.validPopBrowserURL(msg.PrimaryAction.URL) {
+				msg.PrimaryAction = nil
+			}
+			messages[id] = msg
+		}
+		b.health.SetControlHealth(messages)
 	} else {
 		b.health.SetControlHealth(nil)
 	}
@@ -6430,6 +6435,15 @@ func (b *LocalBackend) OfferingAppConnector() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.appConnector != nil
+}
+
+// AppConnector returns the current AppConnector, or nil if not configured.
+//
+// TODO(nickkhyl): move app connectors to [nodeBackend], or perhaps a feature package?
+func (b *LocalBackend) AppConnector() *appc.AppConnector {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.appConnector
 }
 
 // allowExitNodeDNSProxyToServeName reports whether the Exit Node DNS
