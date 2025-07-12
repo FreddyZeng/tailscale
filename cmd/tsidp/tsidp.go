@@ -39,6 +39,7 @@ import (
 	"tailscale.com/client/local"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/envknob"
+	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
@@ -121,6 +122,7 @@ func main() {
 		}
 		defer cleanup()
 	} else {
+		hostinfo.SetApp("tsidp")
 		ts := &tsnet.Server{
 			Hostname: *flagHostname,
 			Dir:      *flagDir,
@@ -161,16 +163,17 @@ func main() {
 	} else {
 		srv.serverURL = fmt.Sprintf("https://%s", strings.TrimSuffix(st.Self.DNSName, "."))
 	}
-	if *flagFunnel {
-		f, err := os.Open(funnelClientsFile)
-		if err == nil {
-			srv.funnelClients = make(map[string]*funnelClient)
-			if err := json.NewDecoder(f).Decode(&srv.funnelClients); err != nil {
-				log.Fatalf("could not parse %s: %v", funnelClientsFile, err)
-			}
-		} else if !errors.Is(err, os.ErrNotExist) {
-			log.Fatalf("could not open %s: %v", funnelClientsFile, err)
+
+	// Load funnel clients from disk if they exist, regardless of whether funnel is enabled
+	// This ensures OIDC clients persist across restarts
+	f, err := os.Open(funnelClientsFile)
+	if err == nil {
+		if err := json.NewDecoder(f).Decode(&srv.funnelClients); err != nil {
+			log.Fatalf("could not parse %s: %v", funnelClientsFile, err)
 		}
+		f.Close()
+	} else if !errors.Is(err, os.ErrNotExist) {
+		log.Fatalf("could not open %s: %v", funnelClientsFile, err)
 	}
 
 	log.Printf("Running tsidp at %s ...", srv.serverURL)

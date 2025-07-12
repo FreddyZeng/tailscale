@@ -9,7 +9,6 @@ package logpolicy
 import (
 	"bufio"
 	"bytes"
-	"cmp"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -225,6 +224,9 @@ func LogsDir(logf logger.Logf) string {
 		logf("logpolicy: using LocalAppData dir %v", dir)
 		return dir
 	case "linux":
+		if distro.Get() == distro.JetKVM {
+			return "/userdata/tailscale/var"
+		}
 		// STATE_DIRECTORY is set by systemd 240+ but we support older
 		// systems-d. For example, Ubuntu 18.04 (Bionic Beaver) is 237.
 		systemdStateDir := os.Getenv("STATE_DIRECTORY")
@@ -911,8 +913,7 @@ func (opts TransportOptions) New() http.RoundTripper {
 		tr.TLSNextProto = map[string]func(authority string, c *tls.Conn) http.RoundTripper{}
 	}
 
-	host := cmp.Or(opts.Host, logtail.DefaultHost)
-	tr.TLSClientConfig = tlsdial.Config(host, opts.Health, tr.TLSClientConfig)
+	tr.TLSClientConfig = tlsdial.Config(opts.Health, tr.TLSClientConfig)
 	// Force TLS 1.3 since we know log.tailscale.com supports it.
 	tr.TLSClientConfig.MinVersion = tls.VersionTLS13
 

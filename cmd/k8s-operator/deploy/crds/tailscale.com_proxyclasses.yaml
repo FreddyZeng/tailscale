@@ -1379,12 +1379,21 @@ spec:
                                     type: string
                             image:
                               description: |-
-                                Container image name. By default images are pulled from
-                                docker.io/tailscale/tailscale, but the official images are also
-                                available at ghcr.io/tailscale/tailscale. Specifying image name here
-                                will override any proxy image values specified via the Kubernetes
-                                operator's Helm chart values or PROXY_IMAGE env var in the operator
-                                Deployment.
+                                Container image name. By default images are pulled from docker.io/tailscale,
+                                but the official images are also available at ghcr.io/tailscale.
+
+                                For all uses except on ProxyGroups of type "kube-apiserver", this image must
+                                be either tailscale/tailscale, or an equivalent mirror of that image.
+                                To apply to ProxyGroups of type "kube-apiserver", this image must be
+                                tailscale/k8s-proxy or a mirror of that image.
+
+                                For "tailscale/tailscale"-based proxies, specifying image name here will
+                                override any proxy image values specified via the Kubernetes operator's
+                                Helm chart values or PROXY_IMAGE env var in the operator Deployment.
+                                For "tailscale/k8s-proxy"-based proxies, there is currently no way to
+                                configure your own default, and this field is the only way to use a
+                                custom image.
+
                                 https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#image
                               type: string
                             imagePullPolicy:
@@ -1655,7 +1664,9 @@ spec:
                                         PodSecurityContext, the value specified in SecurityContext takes precedence.
                                       type: string
                         tailscaleInitContainer:
-                          description: Configuration for the proxy init container that enables forwarding.
+                          description: |-
+                            Configuration for the proxy init container that enables forwarding.
+                            Not valid to apply to ProxyGroups of type "kube-apiserver".
                           type: object
                           properties:
                             debug:
@@ -1709,12 +1720,21 @@ spec:
                                     type: string
                             image:
                               description: |-
-                                Container image name. By default images are pulled from
-                                docker.io/tailscale/tailscale, but the official images are also
-                                available at ghcr.io/tailscale/tailscale. Specifying image name here
-                                will override any proxy image values specified via the Kubernetes
-                                operator's Helm chart values or PROXY_IMAGE env var in the operator
-                                Deployment.
+                                Container image name. By default images are pulled from docker.io/tailscale,
+                                but the official images are also available at ghcr.io/tailscale.
+
+                                For all uses except on ProxyGroups of type "kube-apiserver", this image must
+                                be either tailscale/tailscale, or an equivalent mirror of that image.
+                                To apply to ProxyGroups of type "kube-apiserver", this image must be
+                                tailscale/k8s-proxy or a mirror of that image.
+
+                                For "tailscale/tailscale"-based proxies, specifying image name here will
+                                override any proxy image values specified via the Kubernetes operator's
+                                Helm chart values or PROXY_IMAGE env var in the operator Deployment.
+                                For "tailscale/k8s-proxy"-based proxies, there is currently no way to
+                                configure your own default, and this field is the only way to use a
+                                custom image.
+
                                 https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#image
                               type: string
                             imagePullPolicy:
@@ -2203,6 +2223,51 @@ spec:
                                   won't make it *more* imbalanced.
                                   It's a required field.
                                 type: string
+                staticEndpoints:
+                  description: |-
+                    Configuration for 'static endpoints' on proxies in order to facilitate
+                    direct connections from other devices on the tailnet.
+                    See https://tailscale.com/kb/1445/kubernetes-operator-customization#static-endpoints.
+                  type: object
+                  required:
+                    - nodePort
+                  properties:
+                    nodePort:
+                      description: The configuration for static endpoints using NodePort Services.
+                      type: object
+                      required:
+                        - ports
+                      properties:
+                        ports:
+                          description: |-
+                            The port ranges from which the operator will select NodePorts for the Services.
+                            You must ensure that firewall rules allow UDP ingress traffic for these ports
+                            to the node's external IPs.
+                            The ports must be in the range of service node ports for the cluster (default `30000-32767`).
+                            See https://kubernetes.io/docs/concepts/services-networking/service/#type-nodeport.
+                          type: array
+                          minItems: 1
+                          items:
+                            type: object
+                            required:
+                              - port
+                            properties:
+                              endPort:
+                                description: |-
+                                  endPort indicates that the range of ports from port to endPort if set, inclusive,
+                                  should be used. This field cannot be defined if the port field is not defined.
+                                  The endPort must be either unset, or equal or greater than port.
+                                type: integer
+                              port:
+                                description: port represents a port selected to be used. This is a required field.
+                                type: integer
+                        selector:
+                          description: |-
+                            A selector which will be used to select the node's that will have their `ExternalIP`'s advertised
+                            by the ProxyGroup as Static Endpoints.
+                          type: object
+                          additionalProperties:
+                            type: string
                 tailscale:
                   description: |-
                     TailscaleConfig contains options to configure the tailscale-specific
