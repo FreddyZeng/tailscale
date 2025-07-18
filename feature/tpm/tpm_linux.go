@@ -4,15 +4,14 @@
 package tpm
 
 import (
+	"github.com/google/go-tpm/tpm2/transport"
 	"github.com/google/go-tpm/tpm2/transport/linuxtpm"
-	"tailscale.com/tailcfg"
 )
 
-func info() *tailcfg.TPMInfo {
-	t, err := linuxtpm.Open("/dev/tpm0")
-	if err != nil {
-		return nil
+func open() (transport.TPMCloser, error) {
+	tpm, err := linuxtpm.Open("/dev/tpmrm0")
+	if err == nil {
+		return tpm, nil
 	}
-	defer t.Close()
-	return infoFromCapabilities(t)
+	return linuxtpm.Open("/dev/tpm0")
 }

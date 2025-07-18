@@ -467,28 +467,47 @@ func TestControlHealth(t *testing.T) {
 	baseWarns := ht.CurrentState().Warnings
 	baseStrs := ht.Strings()
 
-	ht.SetControlHealth(map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{
-		"control-health-test": {
+	msgs := map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{
+		"test": {
 			Title: "Control health message",
-			Text:  "Extra help",
+			Text:  "Extra help.",
 		},
-		"control-health-title": {
+		"title": {
 			Title: "Control health title only",
 		},
-	})
+		"with-action": {
+			Title: "Control health message",
+			Text:  "Extra help.",
+			PrimaryAction: &tailcfg.DisplayMessageAction{
+				URL:   "http://www.example.com",
+				Label: "Learn more",
+			},
+		},
+	}
+	ht.SetControlHealth(msgs)
 
 	t.Run("Warnings", func(t *testing.T) {
 		wantWarns := map[WarnableCode]UnhealthyState{
-			"control-health-test": {
-				WarnableCode: "control-health-test",
+			"control-health.test": {
+				WarnableCode: "control-health.test",
 				Severity:     SeverityMedium,
 				Title:        "Control health message",
-				Text:         "Extra help",
+				Text:         "Extra help.",
 			},
-			"control-health-title": {
-				WarnableCode: "control-health-title",
+			"control-health.title": {
+				WarnableCode: "control-health.title",
 				Severity:     SeverityMedium,
 				Title:        "Control health title only",
+			},
+			"control-health.with-action": {
+				WarnableCode: "control-health.with-action",
+				Severity:     SeverityMedium,
+				Title:        "Control health message",
+				Text:         "Extra help.",
+				PrimaryAction: &UnhealthyStateAction{
+					URL:   "http://www.example.com",
+					Label: "Learn more",
+				},
 			},
 		}
 		state := ht.CurrentState()
@@ -505,8 +524,9 @@ func TestControlHealth(t *testing.T) {
 
 	t.Run("Strings()", func(t *testing.T) {
 		wantStrs := []string{
-			"Control health message: Extra help",
-			"Control health title only",
+			"Control health message: Extra help.",
+			"Control health message: Extra help. Learn more: http://www.example.com",
+			"Control health title only.",
 		}
 		var gotStrs []string
 		for _, s := range ht.Strings() {
@@ -527,8 +547,7 @@ func TestControlHealth(t *testing.T) {
 			Type: MetricLabelWarning,
 		}).String()
 		want := strconv.Itoa(
-			2 + // from SetControlHealth
-				len(baseStrs),
+			len(msgs) + len(baseStrs),
 		)
 		if got != want {
 			t.Errorf("metricsHealthMessage.Get(warning) = %q, want %q", got, want)
@@ -536,98 +555,88 @@ func TestControlHealth(t *testing.T) {
 	})
 }
 
-func TestControlHealthNotifiesOnSet(t *testing.T) {
-	ht := Tracker{}
-	ht.SetIPNState("NeedsLogin", true)
-	ht.GotStreamedMapResponse()
-
-	gotNotified := false
-	ht.registerSyncWatcher(func(_ Change) {
-		gotNotified = true
-	})
-
-	ht.SetControlHealth(map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{
-		"test": {},
-	})
-
-	if !gotNotified {
-		t.Errorf("watcher did not get called, want it to be called")
+func TestControlHealthNotifies(t *testing.T) {
+	type test struct {
+		name         string
+		initialState map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage
+		newState     map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage
+		wantNotify   bool
 	}
-}
-
-func TestControlHealthNotifiesOnChange(t *testing.T) {
-	ht := Tracker{}
-	ht.SetIPNState("NeedsLogin", true)
-	ht.GotStreamedMapResponse()
-
-	ht.SetControlHealth(map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{
-		"test-1": {},
-	})
-
-	gotNotified := false
-	ht.registerSyncWatcher(func(_ Change) {
-		gotNotified = true
-	})
-
-	ht.SetControlHealth(map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{
-		"test-2": {},
-	})
-
-	if !gotNotified {
-		t.Errorf("watcher did not get called, want it to be called")
-	}
-}
-
-func TestControlHealthNotifiesOnDetailsChange(t *testing.T) {
-	ht := Tracker{}
-	ht.SetIPNState("NeedsLogin", true)
-	ht.GotStreamedMapResponse()
-
-	ht.SetControlHealth(map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{
-		"test-1": {
-			Title: "Title",
+	tests := []test{
+		{
+			name: "no-change",
+			initialState: map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{
+				"test": {},
+			},
+			newState: map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{
+				"test": {},
+			},
+			wantNotify: false,
 		},
-	})
-
-	gotNotified := false
-	ht.registerSyncWatcher(func(_ Change) {
-		gotNotified = true
-	})
-
-	ht.SetControlHealth(map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{
-		"test-1": {
-			Title: "Updated title",
+		{
+			name:         "on-set",
+			initialState: map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{},
+			newState: map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{
+				"test": {},
+			},
+			wantNotify: true,
 		},
-	})
-
-	if !gotNotified {
-		t.Errorf("watcher did not get called, want it to be called")
+		{
+			name: "details-change",
+			initialState: map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{
+				"test": {
+					Title: "Title",
+				},
+			},
+			newState: map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{
+				"test": {
+					Title: "Updated title",
+				},
+			},
+			wantNotify: true,
+		},
+		{
+			name: "action-changes",
+			initialState: map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{
+				"test": {
+					PrimaryAction: &tailcfg.DisplayMessageAction{
+						URL:   "http://www.example.com/a/123456",
+						Label: "Sign in",
+					},
+				},
+			},
+			newState: map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{
+				"test": {
+					PrimaryAction: &tailcfg.DisplayMessageAction{
+						URL:   "http://www.example.com/a/abcdefg",
+						Label: "Sign in",
+					},
+				},
+			},
+			wantNotify: true,
+		},
 	}
-}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ht := Tracker{}
+			ht.SetIPNState("NeedsLogin", true)
+			ht.GotStreamedMapResponse()
 
-func TestControlHealthNoNotifyOnUnchanged(t *testing.T) {
-	ht := Tracker{}
-	ht.SetIPNState("NeedsLogin", true)
-	ht.GotStreamedMapResponse()
+			if len(test.initialState) != 0 {
+				ht.SetControlHealth(test.initialState)
+			}
 
-	// Set up an existing control health issue
-	ht.SetControlHealth(map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{
-		"test": {},
-	})
+			gotNotified := false
+			ht.registerSyncWatcher(func(_ Change) {
+				gotNotified = true
+			})
 
-	// Now register our watcher
-	gotNotified := false
-	ht.registerSyncWatcher(func(_ Change) {
-		gotNotified = true
-	})
+			ht.SetControlHealth(test.newState)
 
-	// Send the same control health message again - should not notify
-	ht.SetControlHealth(map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{
-		"test": {},
-	})
-
-	if gotNotified {
-		t.Errorf("watcher got called, want it to not be called")
+			if gotNotified != test.wantNotify {
+				t.Errorf("notified: got %v, want %v", gotNotified, test.wantNotify)
+			}
+		})
 	}
 }
 

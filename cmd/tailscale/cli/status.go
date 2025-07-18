@@ -183,10 +183,12 @@ func runStatus(ctx context.Context, args []string) error {
 			} else if ps.ExitNodeOption {
 				f("offers exit node; ")
 			}
-			if relay != "" && ps.CurAddr == "" {
+			if relay != "" && ps.CurAddr == "" && ps.PeerRelay == "" {
 				f("relay %q", relay)
 			} else if ps.CurAddr != "" {
 				f("direct %s", ps.CurAddr)
+			} else if ps.PeerRelay != "" {
+				f("peer-relay %s", ps.PeerRelay)
 			}
 			if !ps.Online {
 				f("; offline")
@@ -260,7 +262,7 @@ func printFunnelStatus(ctx context.Context) {
 		}
 		sni, portStr, _ := net.SplitHostPort(string(hp))
 		p, _ := strconv.ParseUint(portStr, 10, 16)
-		isTCP := sc.IsTCPForwardingOnPort(uint16(p))
+		isTCP := sc.IsTCPForwardingOnPort(uint16(p), noService)
 		url := "https://"
 		if isTCP {
 			url = "tcp://"

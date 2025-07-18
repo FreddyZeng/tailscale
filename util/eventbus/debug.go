@@ -186,3 +186,25 @@ type hookFn[T any] struct {
 	ID uint64
 	Fn func(T)
 }
+
+// DebugEvent is a representation of an event used for debug clients.
+type DebugEvent struct {
+	Count int
+	Type  string
+	From  string
+	To    []string
+	Event any
+}
+
+// DebugTopics provides the JSON encoding as a wrapper for a collection of [DebugTopic].
+type DebugTopics struct {
+	Topics []DebugTopic
+}
+
+// DebugTopic provides the JSON encoding of publishers and subscribers for a
+// given topic.
+type DebugTopic struct {
+	Name        string
+	Publisher   string
+	Subscribers []string
+}

@@ -61,7 +61,8 @@ func (menu *Menu) Run() {
 		case <-menu.bgCtx.Done():
 		}
 	}()
-	go menu.lc.IncrementCounter(menu.bgCtx, "systray_start", 1)
+	go menu.lc.IncrementGauge(menu.bgCtx, "systray_running", 1)
+	defer menu.lc.IncrementGauge(menu.bgCtx, "systray_running", -1)
 
 	systray.Run(menu.onReady, menu.onExit)
 }
@@ -127,7 +128,7 @@ func init() {
 
 	desktop := strings.ToLower(os.Getenv("XDG_CURRENT_DESKTOP"))
 	switch desktop {
-	case "gnome":
+	case "gnome", "ubuntu:gnome":
 		// GNOME expands submenus downward in the main menu, rather than flyouts to the side.
 		// Either as a result of that or another limitation, there seems to be a maximum depth of submenus.
 		// Mullvad countries that have a city submenu are not being rendered, and so can't be selected.

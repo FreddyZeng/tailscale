@@ -137,14 +137,23 @@ func ProxyClassIsReady(pc *tsapi.ProxyClass) bool {
 }
 
 func ProxyGroupIsReady(pg *tsapi.ProxyGroup) bool {
+	cond := proxyGroupCondition(pg, tsapi.ProxyGroupReady)
+	return cond != nil && cond.Status == metav1.ConditionTrue && cond.ObservedGeneration == pg.Generation
+}
+
+func ProxyGroupAvailable(pg *tsapi.ProxyGroup) bool {
+	cond := proxyGroupCondition(pg, tsapi.ProxyGroupAvailable)
+	return cond != nil && cond.Status == metav1.ConditionTrue
+}
+
+func proxyGroupCondition(pg *tsapi.ProxyGroup, condType tsapi.ConditionType) *metav1.Condition {
 	idx := xslices.IndexFunc(pg.Status.Conditions, func(cond metav1.Condition) bool {
-		return cond.Type == string(tsapi.ProxyGroupReady)
+		return cond.Type == string(condType)
 	})
 	if idx == -1 {
-		return false
+		return nil
 	}
-	cond := pg.Status.Conditions[idx]
-	return cond.Status == metav1.ConditionTrue && cond.ObservedGeneration == pg.Generation
+	return &pg.Status.Conditions[idx]
 }
 
 func DNSCfgIsReady(cfg *tsapi.DNSConfig) bool {
