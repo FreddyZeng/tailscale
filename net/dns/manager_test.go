@@ -1,31 +1,49 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package dns
 
 import (
+	"bytes"
+	"context"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"net/netip"
+	"reflect"
 	"runtime"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	dns "golang.org/x/net/dns/dnsmessage"
 	"tailscale.com/control/controlknobs"
 	"tailscale.com/health"
+	"tailscale.com/net/dns/publicdns"
 	"tailscale.com/net/dns/resolver"
 	"tailscale.com/net/netmon"
+	"tailscale.com/net/tsaddr"
 	"tailscale.com/net/tsdial"
+	"tailscale.com/tstest"
 	"tailscale.com/types/dnstype"
 	"tailscale.com/util/dnsname"
+	"tailscale.com/util/eventbus/eventbustest"
+	"tailscale.com/util/httpm"
 )
 
 type fakeOSConfigurator struct {
 	SplitDNS   bool
 	BaseConfig OSConfig
 
-	OSConfig       OSConfig
-	ResolverConfig resolver.Config
+	OSConfig         OSConfig
+	ResolverConfig   resolver.Config
+	GetBaseConfigErr *error
 }
 
 func (c *fakeOSConfigurator) SetDNS(cfg OSConfig) error {
@@ -45,6 +63,9 @@ func (c *fakeOSConfigurator) SupportsSplitDNS() bool {
 }
 
 func (c *fakeOSConfigurator) GetBaseConfig() (OSConfig, error) {
+	if c.GetBaseConfigErr != nil {
+		return OSConfig{}, *c.GetBaseConfigErr
+	}
 	return c.BaseConfig, nil
 }
 
@@ -152,6 +173,17 @@ func TestCompileHostEntries(t *testing.T) {
 	}
 }
 
+var serviceAddr46 = []netip.Addr{tsaddr.TailscaleServiceIP(), tsaddr.TailscaleServiceIPv6()}
+
+// scopeQuad100Knobs returns Knobs with ScopeQuad100OnMacOS set, i.e. the
+// NodeAttrScopeQuad100OnMacOS opt-in that lets sandboxed macOS scope quad-100
+// to its match domains instead of installing it as the primary resolver.
+func scopeQuad100Knobs() *controlknobs.Knobs {
+	k := new(controlknobs.Knobs)
+	k.ScopeQuad100OnMacOS.Store(true)
+	return k
+}
+
 func TestManager(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skipf("test's assumptions break because of https://github.com/tailscale/corp/issues/1662")
@@ -164,13 +196,16 @@ func TestManager(t *testing.T) {
 	// reasonable to make this unsupported as well, in which case
 	// these tests will need tweaking.
 	tests := []struct {
-		name  string
-		in    Config
-		split bool
-		bs    OSConfig
-		os    OSConfig
-		rs    resolver.Config
-		goos  string // empty means "linux"
+		name           string
+		in             Config
+		split          bool
+		bs             OSConfig
+		bsErr          error // if set, GetBaseConfig returns this
+		os             OSConfig
+		knobs          *controlknobs.Knobs
+		rs             resolver.Config
+		goos           string // empty means "linux"
+		sandboxedMacOS bool
 	}{
 		{
 			name: "empty",
@@ -211,7 +246,7 @@ func TestManager(t *testing.T) {
 					"bar.tld.", "2.3.4.5"),
 			},
 			os: OSConfig{
-				Nameservers: mustIPs("100.100.100.100"),
+				Nameservers: serviceAddr46,
 			},
 			rs: resolver.Config{
 				Hosts: hosts(
@@ -297,7 +332,7 @@ func TestManager(t *testing.T) {
 					"bradfitz.ts.com.", "2.3.4.5"),
 			},
 			os: OSConfig{
-				Nameservers:   mustIPs("100.100.100.100"),
+				Nameservers:   serviceAddr46,
 				SearchDomains: fqdns("tailscale.com", "universe.tf"),
 			},
 			rs: resolver.Config{
@@ -320,7 +355,7 @@ func TestManager(t *testing.T) {
 			},
 			split: true,
 			os: OSConfig{
-				Nameservers:   mustIPs("100.100.100.100"),
+				Nameservers:   serviceAddr46,
 				SearchDomains: fqdns("tailscale.com", "universe.tf"),
 			},
 			rs: resolver.Config{
@@ -339,7 +374,7 @@ func TestManager(t *testing.T) {
 				SearchDomains:    fqdns("tailscale.com", "universe.tf"),
 			},
 			os: OSConfig{
-				Nameservers:   mustIPs("100.100.100.100"),
+				Nameservers:   serviceAddr46,
 				SearchDomains: fqdns("tailscale.com", "universe.tf"),
 			},
 			rs: resolver.Config{
@@ -357,13 +392,40 @@ func TestManager(t *testing.T) {
 			},
 			split: true,
 			os: OSConfig{
-				Nameservers:   mustIPs("100.100.100.100"),
+				Nameservers:   serviceAddr46,
 				SearchDomains: fqdns("tailscale.com", "universe.tf"),
 			},
 			rs: resolver.Config{
 				Routes: upstreams(
 					".", "1.1.1.1", "9.9.9.9",
 					"corp.com.", "2.2.2.2"),
+			},
+		},
+		{
+			name: "controlknob-disable-v6-registration",
+			in: Config{
+				DefaultResolvers: mustRes("1.1.1.1", "9.9.9.9"),
+				SearchDomains:    fqdns("tailscale.com", "universe.tf"),
+				Routes:           upstreams("ts.com", ""),
+				Hosts: hosts(
+					"dave.ts.com.", "1.2.3.4",
+					"bradfitz.ts.com.", "2.3.4.5"),
+			},
+			knobs: (func() *controlknobs.Knobs {
+				k := new(controlknobs.Knobs)
+				k.ForceRegisterMagicDNSIPv4Only.Store(true)
+				return k
+			})(),
+			os: OSConfig{
+				Nameservers:   mustIPs("100.100.100.100"), // without IPv6
+				SearchDomains: fqdns("tailscale.com", "universe.tf"),
+			},
+			rs: resolver.Config{
+				Routes: upstreams(".", "1.1.1.1", "9.9.9.9"),
+				Hosts: hosts(
+					"dave.ts.com.", "1.2.3.4",
+					"bradfitz.ts.com.", "2.3.4.5"),
+				LocalDomains: fqdns("ts.com."),
 			},
 		},
 		{
@@ -377,7 +439,7 @@ func TestManager(t *testing.T) {
 				SearchDomains: fqdns("coffee.shop"),
 			},
 			os: OSConfig{
-				Nameservers:   mustIPs("100.100.100.100"),
+				Nameservers:   serviceAddr46,
 				SearchDomains: fqdns("tailscale.com", "universe.tf", "coffee.shop"),
 			},
 			rs: resolver.Config{
@@ -400,6 +462,165 @@ func TestManager(t *testing.T) {
 			},
 		},
 		{
+			// Sandboxed macOS: split traffic stays pointed at quad-100 (upstreams
+			// may only be reachable via the tunnel). With NodeAttrScopeQuad100OnMacOS
+			// set, quad-100 is scoped to the match domains so public names fall
+			// through to the OS resolver (e.g. a DoH profile) rather than being
+			// shadowed. See the -no-knob variant for the default. tailscale/corp#45534.
+			name: "routes-split-sandboxed-darwin",
+			in: Config{
+				Routes:        upstreams("corp.com", "2.2.2.2"),
+				SearchDomains: fqdns("tailscale.com", "universe.tf"),
+			},
+			split: true,
+			knobs: scopeQuad100Knobs(),
+			bs: OSConfig{
+				Nameservers:   mustIPs("8.8.8.8"),
+				SearchDomains: fqdns("coffee.shop"),
+			},
+			os: OSConfig{
+				Nameservers:   serviceAddr46,
+				SearchDomains: fqdns("tailscale.com", "universe.tf"),
+				MatchDomains:  fqdns("corp.com"),
+			},
+			rs: resolver.Config{
+				Routes: upstreams(
+					"corp.com.", "2.2.2.2"),
+			},
+			goos:           "darwin",
+			sandboxedMacOS: true,
+		},
+		{
+			// As above but without NodeAttrScopeQuad100OnMacOS (the default,
+			// matching iOS): quad-100 is the OS primary resolver (a "." route to
+			// the base config's 8.8.8.8), shadowing any DoH profile.
+			name: "routes-split-sandboxed-darwin-no-knob",
+			in: Config{
+				Routes:        upstreams("corp.com", "2.2.2.2"),
+				SearchDomains: fqdns("tailscale.com", "universe.tf"),
+			},
+			split: true,
+			bs: OSConfig{
+				Nameservers:   mustIPs("8.8.8.8"),
+				SearchDomains: fqdns("coffee.shop"),
+			},
+			os: OSConfig{
+				Nameservers:   serviceAddr46,
+				SearchDomains: fqdns("tailscale.com", "universe.tf", "coffee.shop"),
+			},
+			rs: resolver.Config{
+				Routes: upstreams(
+					".", "8.8.8.8",
+					"corp.com.", "2.2.2.2"),
+			},
+			goos:           "darwin",
+			sandboxedMacOS: true,
+		},
+		{
+			// An ExtraRecord paired with an authoritative (resolver-less) route
+			// is scoped like any other split domain, on every platform. The
+			// darwin and linux variants must agree.
+			name: "extra-record-routed-scopes-quad100",
+			in: Config{
+				Hosts:         hosts("extra.example.com.", "100.64.0.9"),
+				Routes:        upstreams("corp.ts.net.", "", "extra.example.com.", ""),
+				SearchDomains: fqdns("corp.ts.net"),
+			},
+			split: true,
+			knobs: scopeQuad100Knobs(),
+			bs: OSConfig{
+				Nameservers: mustIPs("8.8.8.8"),
+			},
+			os: OSConfig{
+				Nameservers:   serviceAddr46,
+				SearchDomains: fqdns("corp.ts.net"),
+				MatchDomains:  fqdns("corp.ts.net", "extra.example.com"),
+			},
+			rs: resolver.Config{
+				Hosts:        hosts("extra.example.com.", "100.64.0.9"),
+				LocalDomains: fqdns("corp.ts.net.", "extra.example.com."),
+			},
+			goos:           "darwin",
+			sandboxedMacOS: true,
+		},
+		{
+			name: "extra-record-routed-scopes-quad100-linux",
+			in: Config{
+				Hosts:         hosts("extra.example.com.", "100.64.0.9"),
+				Routes:        upstreams("corp.ts.net.", "", "extra.example.com.", ""),
+				SearchDomains: fqdns("corp.ts.net"),
+			},
+			split: true,
+			bs: OSConfig{
+				Nameservers: mustIPs("8.8.8.8"),
+			},
+			os: OSConfig{
+				Nameservers:   serviceAddr46,
+				SearchDomains: fqdns("corp.ts.net"),
+				MatchDomains:  fqdns("corp.ts.net", "extra.example.com"),
+			},
+			rs: resolver.Config{
+				Hosts:        hosts("extra.example.com.", "100.64.0.9"),
+				LocalDomains: fqdns("corp.ts.net.", "extra.example.com."),
+			},
+		},
+		{
+			// MagicDNS names present but domain routing off: no route suffix
+			// covers them, so quad-100 must stay primary or they stop resolving.
+			// requiresPrimaryResolver overrides NodeAttrScopeQuad100OnMacOS, at
+			// the cost of shadowing the DoH profile.
+			name: "unrouted-magicdns-hosts-keep-quad100-primary",
+			in: Config{
+				Routes:                upstreams("corp.ts.net.", "1.2.3.4"),
+				SearchDomains:         fqdns("corp.ts.net"),
+				MagicDNSHostsUnrouted: true,
+			},
+			split: true,
+			knobs: scopeQuad100Knobs(),
+			bs: OSConfig{
+				Nameservers: mustIPs("192.168.1.1"),
+			},
+			os: OSConfig{
+				Nameservers:   serviceAddr46,
+				SearchDomains: fqdns("corp.ts.net"),
+			},
+			rs: resolver.Config{
+				Routes: upstreams(
+					".", "192.168.1.1",
+					"corp.ts.net.", "1.2.3.4"),
+			},
+			goos:           "darwin",
+			sandboxedMacOS: true,
+		},
+		{
+			// MagicDNSHostsUnrouted on a split-DNS manager with no base config
+			// (e.g. systemd-resolved): fall back to a scoped config instead of
+			// erroring. Two differing resolver sets keep us off the
+			// single-resolver fast path so we reach GetBaseConfig. Regression
+			// test for tailscale/corp#45534.
+			name: "unrouted-magicdns-hosts-no-base-config-linux",
+			in: Config{
+				Routes: upstreams(
+					"corp.ts.net.", "1.2.3.4",
+					"bigco.net.", "3.3.3.3"),
+				SearchDomains:         fqdns("corp.ts.net"),
+				MagicDNSHostsUnrouted: true,
+			},
+			split: true,
+			bsErr: ErrGetBaseConfigNotSupported,
+			os: OSConfig{
+				Nameservers:   serviceAddr46,
+				SearchDomains: fqdns("corp.ts.net"),
+				MatchDomains:  fqdns("bigco.net", "corp.ts.net"),
+			},
+			rs: resolver.Config{
+				Routes: upstreams(
+					"corp.ts.net.", "1.2.3.4",
+					"bigco.net.", "3.3.3.3"),
+			},
+			goos: "linux",
+		},
+		{
 			name: "routes-multi",
 			in: Config{
 				Routes: upstreams(
@@ -412,7 +633,7 @@ func TestManager(t *testing.T) {
 				SearchDomains: fqdns("coffee.shop"),
 			},
 			os: OSConfig{
-				Nameservers:   mustIPs("100.100.100.100"),
+				Nameservers:   serviceAddr46,
 				SearchDomains: fqdns("tailscale.com", "universe.tf", "coffee.shop"),
 			},
 			rs: resolver.Config{
@@ -432,7 +653,7 @@ func TestManager(t *testing.T) {
 			},
 			split: true,
 			os: OSConfig{
-				Nameservers:   mustIPs("100.100.100.100"),
+				Nameservers:   serviceAddr46,
 				SearchDomains: fqdns("tailscale.com", "universe.tf"),
 				MatchDomains:  fqdns("bigco.net", "corp.com"),
 			},
@@ -444,25 +665,23 @@ func TestManager(t *testing.T) {
 			goos: "linux",
 		},
 		{
-			// The `routes-multi-split-linux` test case above on Darwin should NOT result in a split
-			// DNS configuration.
-			// Check that MatchDomains is empty. Due to Apple limitations, we cannot set MatchDomains
-			// without those domains also being SearchDomains.
-			name: "routes-multi-does-not-split-on-darwin",
+			// The `routes-multi-split-linux` test case above should match on
+			// macOS, where tailscaled configures split DNS via /etc/resolver.
+			name: "routes-multi-split-darwin",
 			in: Config{
 				Routes: upstreams(
 					"corp.com", "2.2.2.2",
 					"bigco.net", "3.3.3.3"),
 				SearchDomains: fqdns("tailscale.com", "universe.tf"),
 			},
-			split: false,
+			split: true,
 			os: OSConfig{
-				Nameservers:   mustIPs("100.100.100.100"),
+				Nameservers:   serviceAddr46,
 				SearchDomains: fqdns("tailscale.com", "universe.tf"),
+				MatchDomains:  fqdns("bigco.net", "corp.com"),
 			},
 			rs: resolver.Config{
 				Routes: upstreams(
-					".", "",
 					"corp.com.", "2.2.2.2",
 					"bigco.net.", "3.3.3.3"),
 			},
@@ -482,7 +701,7 @@ func TestManager(t *testing.T) {
 			},
 			split: false,
 			os: OSConfig{
-				Nameservers:   mustIPs("100.100.100.100"),
+				Nameservers:   serviceAddr46,
 				SearchDomains: fqdns("tailscale.com", "universe.tf"),
 			},
 			rs: resolver.Config{
@@ -507,7 +726,7 @@ func TestManager(t *testing.T) {
 				SearchDomains: fqdns("coffee.shop"),
 			},
 			os: OSConfig{
-				Nameservers:   mustIPs("100.100.100.100"),
+				Nameservers:   serviceAddr46,
 				SearchDomains: fqdns("tailscale.com", "universe.tf", "coffee.shop"),
 			},
 			rs: resolver.Config{
@@ -529,7 +748,7 @@ func TestManager(t *testing.T) {
 			},
 			split: true,
 			os: OSConfig{
-				Nameservers:   mustIPs("100.100.100.100"),
+				Nameservers:   serviceAddr46,
 				SearchDomains: fqdns("tailscale.com", "universe.tf"),
 				MatchDomains:  fqdns("ts.com"),
 			},
@@ -542,10 +761,9 @@ func TestManager(t *testing.T) {
 			goos: "linux",
 		},
 		{
-			// The `magic-split` test case above on Darwin should NOT result in a split DNS configuration.
-			// Check that MatchDomains is empty. Due to Apple limitations, we cannot set MatchDomains
-			// without those domains also being SearchDomains.
-			name: "magic-split-does-not-split-on-darwin",
+			// The `magic-split` test case above should match on macOS, where
+			// tailscaled configures split DNS via /etc/resolver.
+			name: "magic-split-darwin",
 			in: Config{
 				Hosts: hosts(
 					"dave.ts.com.", "1.2.3.4",
@@ -553,13 +771,13 @@ func TestManager(t *testing.T) {
 				Routes:        upstreams("ts.com", ""),
 				SearchDomains: fqdns("tailscale.com", "universe.tf"),
 			},
-			split: false,
+			split: true,
 			os: OSConfig{
-				Nameservers:   mustIPs("100.100.100.100"),
+				Nameservers:   serviceAddr46,
 				SearchDomains: fqdns("tailscale.com", "universe.tf"),
+				MatchDomains:  fqdns("ts.com"),
 			},
 			rs: resolver.Config{
-				Routes: upstreams(".", ""),
 				Hosts: hosts(
 					"dave.ts.com.", "1.2.3.4",
 					"bradfitz.ts.com.", "2.3.4.5"),
@@ -581,7 +799,7 @@ func TestManager(t *testing.T) {
 			},
 			split: false,
 			os: OSConfig{
-				Nameservers:   mustIPs("100.100.100.100"),
+				Nameservers:   serviceAddr46,
 				SearchDomains: fqdns("tailscale.com", "universe.tf"),
 			},
 			rs: resolver.Config{
@@ -607,7 +825,7 @@ func TestManager(t *testing.T) {
 				SearchDomains: fqdns("coffee.shop"),
 			},
 			os: OSConfig{
-				Nameservers:   mustIPs("100.100.100.100"),
+				Nameservers:   serviceAddr46,
 				SearchDomains: fqdns("tailscale.com", "universe.tf", "coffee.shop"),
 			},
 			rs: resolver.Config{
@@ -633,7 +851,7 @@ func TestManager(t *testing.T) {
 			},
 			split: true,
 			os: OSConfig{
-				Nameservers:   mustIPs("100.100.100.100"),
+				Nameservers:   serviceAddr46,
 				SearchDomains: fqdns("tailscale.com", "universe.tf"),
 				MatchDomains:  fqdns("corp.com", "ts.com"),
 			},
@@ -647,11 +865,9 @@ func TestManager(t *testing.T) {
 			goos: "linux",
 		},
 		{
-			// The `routes-magic-split-linux` test case above on Darwin should NOT result in a
-			// split DNS configuration.
-			// Check that MatchDomains is empty. Due to Apple limitations, we cannot set MatchDomains
-			// without those domains also being SearchDomains.
-			name: "routes-magic-does-not-split-on-darwin",
+			// The `routes-magic-split-linux` test case above should match on
+			// macOS, where tailscaled configures split DNS via /etc/resolver.
+			name: "routes-magic-split-darwin",
 			in: Config{
 				Routes: upstreams(
 					"corp.com", "2.2.2.2",
@@ -663,14 +879,12 @@ func TestManager(t *testing.T) {
 			},
 			split: true,
 			os: OSConfig{
-				Nameservers:   mustIPs("100.100.100.100"),
+				Nameservers:   serviceAddr46,
 				SearchDomains: fqdns("tailscale.com", "universe.tf"),
+				MatchDomains:  fqdns("corp.com", "ts.com"),
 			},
 			rs: resolver.Config{
-				Routes: upstreams(
-					".", "",
-					"corp.com.", "2.2.2.2",
-				),
+				Routes: upstreams("corp.com.", "2.2.2.2"),
 				Hosts: hosts(
 					"dave.ts.com.", "1.2.3.4",
 					"bradfitz.ts.com.", "2.3.4.5"),
@@ -695,7 +909,7 @@ func TestManager(t *testing.T) {
 			},
 			split: true,
 			os: OSConfig{
-				Nameservers:   mustIPs("100.100.100.100"),
+				Nameservers:   serviceAddr46,
 				SearchDomains: fqdns("tailscale.com", "universe.tf"),
 			},
 			rs: resolver.Config{
@@ -720,7 +934,7 @@ func TestManager(t *testing.T) {
 				SearchDomains: fqdns("tailscale.com", "universe.tf"),
 			},
 			os: OSConfig{
-				Nameservers:   mustIPs("100.100.100.100"),
+				Nameservers:   serviceAddr46,
 				SearchDomains: fqdns("tailscale.com", "universe.tf"),
 			},
 			rs: resolver.Config{
@@ -748,7 +962,7 @@ func TestManager(t *testing.T) {
 				DefaultResolvers: mustRes("2a07:a8c0::c3:a884"),
 			},
 			os: OSConfig{
-				Nameservers: mustIPs("100.100.100.100"),
+				Nameservers: serviceAddr46,
 			},
 			rs: resolver.Config{
 				Routes: upstreams(".", "2a07:a8c0::c3:a884"),
@@ -760,7 +974,7 @@ func TestManager(t *testing.T) {
 				DefaultResolvers: mustRes("https://dns.nextdns.io/c3a884"),
 			},
 			os: OSConfig{
-				Nameservers: mustIPs("100.100.100.100"),
+				Nameservers: serviceAddr46,
 			},
 			rs: resolver.Config{
 				Routes: upstreams(".", "https://dns.nextdns.io/c3a884"),
@@ -776,7 +990,7 @@ func TestManager(t *testing.T) {
 			},
 			split: true,
 			os: OSConfig{
-				Nameservers:   mustIPs("100.100.100.100"),
+				Nameservers:   serviceAddr46,
 				SearchDomains: fqdns("optimistic-display.ts.net"),
 				MatchDomains:  fqdns("ts.net"),
 			},
@@ -801,7 +1015,7 @@ func TestManager(t *testing.T) {
 			},
 			split: true,
 			os: OSConfig{
-				Nameservers:   mustIPs("100.100.100.100"),
+				Nameservers:   serviceAddr46,
 				SearchDomains: fqdns("optimistic-display.ts.net"),
 			},
 			rs: resolver.Config{
@@ -815,23 +1029,21 @@ func TestManager(t *testing.T) {
 			goos: "ios",
 		},
 		{
-			// on darwin, verify that with the same config as in ios-use-split-dns-when-no-custom-resolvers,
-			// MatchDomains are NOT set.
-			name: "darwin-dont-use-split-dns-when-no-custom-resolvers",
+			// macOS should match Linux here. iOS remains special-cased above
+			// for battery-life behavior.
+			name: "darwin-use-split-dns-when-no-custom-resolvers",
 			in: Config{
 				Routes:        upstreams("ts.net", "199.247.155.52", "optimistic-display.ts.net", ""),
 				SearchDomains: fqdns("optimistic-display.ts.net"),
 			},
 			split: true,
 			os: OSConfig{
-				Nameservers:   mustIPs("100.100.100.100"),
+				Nameservers:   serviceAddr46,
 				SearchDomains: fqdns("optimistic-display.ts.net"),
+				MatchDomains:  fqdns("optimistic-display.ts.net", "ts.net"),
 			},
 			rs: resolver.Config{
-				Routes: upstreams(
-					".", "",
-					"ts.net", "199.247.155.52",
-				),
+				Routes:       upstreams("ts.net", "199.247.155.52"),
 				LocalDomains: fqdns("optimistic-display.ts.net."),
 			},
 			goos: "darwin",
@@ -865,7 +1077,7 @@ func TestManager(t *testing.T) {
 						},
 					},
 				},
-				Nameservers:   mustIPs("100.100.100.100"),
+				Nameservers:   serviceAddr46,
 				SearchDomains: fqdns("ts.com", "universe.tf"),
 				MatchDomains:  fqdns("corp.com", "ts.com"),
 			},
@@ -892,7 +1104,7 @@ func TestManager(t *testing.T) {
 			},
 			split: true,
 			os: OSConfig{
-				Nameservers:   mustIPs("100.100.100.100"),
+				Nameservers:   serviceAddr46,
 				SearchDomains: fqdns("ts.com", "universe.tf"),
 				MatchDomains:  fqdns("corp.com", "ts.com"),
 			},
@@ -906,6 +1118,23 @@ func TestManager(t *testing.T) {
 			},
 			goos: "windows",
 		},
+		{
+			// Regression test for #19834
+			name: "single-doh-splitdns-no-magicdns",
+			in: Config{
+				Routes: upstreams(
+					"example.com", "http://100.101.102.103:1234/dns-query"),
+			},
+			split: true,
+			os: OSConfig{
+				Nameservers:  serviceAddr46,
+				MatchDomains: fqdns("example.com"),
+			},
+			rs: resolver.Config{
+				Routes: upstreams("example.com.", "http://100.101.102.103:1234/dns-query"),
+			},
+			goos: "linux",
+		},
 	}
 
 	trIP := cmp.Transformer("ipStr", func(ip netip.Addr) string { return ip.String() })
@@ -918,16 +1147,26 @@ func TestManager(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			tstest.Replace(t, &isSandboxedMacOS, func() bool { return test.sandboxedMacOS })
 			f := fakeOSConfigurator{
 				SplitDNS:   test.split,
 				BaseConfig: test.bs,
+			}
+			if test.bsErr != nil {
+				f.GetBaseConfigErr = &test.bsErr
 			}
 			goos := test.goos
 			if goos == "" {
 				goos = "linux"
 			}
-			knobs := &controlknobs.Knobs{}
-			m := NewManager(t.Logf, &f, new(health.Tracker), tsdial.NewDialer(netmon.NewStatic()), nil, knobs, goos)
+			knobs := test.knobs
+			if knobs == nil {
+				knobs = &controlknobs.Knobs{}
+			}
+			bus := eventbustest.NewBus(t)
+			dialer := tsdial.NewDialer(netmon.NewStatic())
+			dialer.SetBus(bus)
+			m := NewManager(t.Logf, &f, health.NewTracker(bus), dialer, nil, knobs, goos, bus)
 			m.resolver.TestOnlySetHook(f.SetResolver)
 
 			if err := m.Set(test.in); err != nil {
@@ -1018,4 +1257,282 @@ func upstreams(strs ...string) (ret map[dnsname.FQDN][]*dnstype.Resolver) {
 		}
 	}
 	return ret
+}
+
+func TestConfigRecompilation(t *testing.T) {
+	fakeErr := errors.New("fake os configurator error")
+	f := &fakeOSConfigurator{}
+	f.GetBaseConfigErr = &fakeErr
+	f.BaseConfig = OSConfig{
+		Nameservers: mustIPs("1.1.1.1"),
+	}
+
+	config := Config{
+		Routes:        upstreams("ts.net", "69.4.2.0", "foo.ts.net", ""),
+		SearchDomains: fqdns("foo.ts.net"),
+	}
+
+	bus := eventbustest.NewBus(t)
+	dialer := tsdial.NewDialer(netmon.NewStatic())
+	dialer.SetBus(bus)
+	m := NewManager(t.Logf, f, health.NewTracker(bus), dialer, nil, nil, "darwin", bus)
+
+	var managerConfig *resolver.Config
+	m.resolver.TestOnlySetHook(func(cfg resolver.Config) {
+		managerConfig = &cfg
+	})
+
+	// Initial set should error out and store the config
+	if err := m.Set(config); err == nil {
+		t.Fatalf("Want non-nil error.  Got nil")
+	}
+	if m.config == nil {
+		t.Fatalf("Want persisted config.  Got nil.")
+	}
+	if managerConfig != nil {
+		t.Fatalf("Want nil managerConfig.  Got %v", managerConfig)
+	}
+
+	// Clear the error.  We should take the happy path now and
+	// set m.manager's Config.
+	f.GetBaseConfigErr = nil
+
+	// Recompilation without an error should succeed and set m.config and m.manager's [resolver.Config]
+	if err := m.RecompileDNSConfig(); err != nil {
+		t.Fatalf("Want nil error.  Got err %v", err)
+	}
+	if m.config == nil {
+		t.Fatalf("Want non-nil config.  Got nil")
+	}
+	if managerConfig == nil {
+		t.Fatalf("Want non nil managerConfig.  Got nil")
+	}
+}
+
+func TestTrampleRetrample(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := &fakeOSConfigurator{}
+		f.BaseConfig = OSConfig{
+			Nameservers: mustIPs("1.1.1.1"),
+		}
+
+		config := Config{
+			Routes:        upstreams("ts.net", "69.4.2.0", "foo.ts.net", ""),
+			SearchDomains: fqdns("foo.ts.net"),
+		}
+
+		bus := eventbustest.NewBus(t)
+		dialer := tsdial.NewDialer(netmon.NewStatic())
+		dialer.SetBus(bus)
+		m := NewManager(t.Logf, f, health.NewTracker(bus), dialer, nil, nil, "linux", bus)
+
+		// Initial set should error out and store the config
+		if err := m.Set(config); err != nil {
+			t.Fatalf("Want nil error. Got non-nil")
+		}
+
+		// Set no config
+		f.OSConfig = OSConfig{}
+
+		inj := eventbustest.NewInjector(t, bus)
+		eventbustest.Inject(inj, TrampleDNS{})
+		synctest.Wait()
+
+		t.Logf("OSConfig: %+v", f.OSConfig)
+		if reflect.DeepEqual(f.OSConfig, OSConfig{}) {
+			t.Errorf("Expected config to be set, got empty config")
+		}
+	})
+}
+
+// TestSystemDNSDoHUpgrade tests that if the user doesn't configure DNS servers
+// in their tailnet, and the system DNS happens to be a known DoH provider,
+// queries will use DNS-over-HTTPS.
+func TestSystemDNSDoHUpgrade(t *testing.T) {
+	var (
+		// This is a non-routable TEST-NET-2 IP (RFC 5737).
+		testDoHResolverIP = netip.MustParseAddr("198.51.100.1")
+		// This is a non-routable TEST-NET-1 IP (RFC 5737).
+		testResponseIP = netip.MustParseAddr("192.0.2.1")
+	)
+	const testDomain = "test.example.com."
+
+	var (
+		mu             sync.Mutex
+		dohRequestSeen bool
+		receivedQuery  []byte
+	)
+	dohServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Logf("[DoH Server] received request: %v %v", r.Method, r.URL)
+
+		if r.Method != httpm.POST {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if r.Header.Get("Content-Type") != "application/dns-message" {
+			http.Error(w, "bad content type", http.StatusBadRequest)
+			return
+		}
+
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "read error", http.StatusInternalServerError)
+			return
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+
+		dohRequestSeen = true
+		receivedQuery = body
+
+		// Build a DNS response
+		response := buildTestDNSResponse(t, testDomain, testResponseIP)
+		w.Header().Set("Content-Type", "application/dns-message")
+		w.Write(response)
+	}))
+	t.Cleanup(dohServer.Close)
+
+	// Register the test IP to route to our mock DoH server
+	cleanup := publicdns.RegisterTestDoHEndpoint(testDoHResolverIP, dohServer.URL)
+	t.Cleanup(cleanup)
+
+	// This simulates a system with the single DoH-capable DNS server
+	// configured.
+	f := &fakeOSConfigurator{
+		SplitDNS: false, // non-split DNS required to use the forwarder
+		BaseConfig: OSConfig{
+			Nameservers: []netip.Addr{testDoHResolverIP},
+		},
+	}
+
+	logf := tstest.WhileTestRunningLogger(t)
+	bus := eventbustest.NewBus(t)
+	dialer := tsdial.NewDialer(netmon.NewStatic())
+	dialer.SetBus(bus)
+	m := NewManager(logf, f, health.NewTracker(bus), dialer, nil, &controlknobs.Knobs{}, "linux", bus)
+	t.Cleanup(func() { m.Down() })
+
+	// Set up hook to capture the resolver config
+	m.resolver.TestOnlySetHook(f.SetResolver)
+
+	// Configure the manager with routes but no default resolvers, which
+	// reads BaseConfig from the OS configurator.
+	config := Config{
+		Routes:        upstreams("tailscale.com.", "10.0.0.1"),
+		SearchDomains: fqdns("tailscale.com."),
+	}
+	if err := m.Set(config); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify the resolver config has our test IP in Routes["."]
+	if f.ResolverConfig.Routes == nil {
+		t.Fatal("ResolverConfig.Routes is nil (SetResolver hook not called)")
+	}
+
+	const defaultRouteKey = "."
+	defaultRoute, ok := f.ResolverConfig.Routes[defaultRouteKey]
+	if !ok {
+		t.Fatalf("ResolverConfig.Routes[%q] not found", defaultRouteKey)
+	}
+	if !slices.ContainsFunc(defaultRoute, func(r *dnstype.Resolver) bool {
+		return r.Addr == testDoHResolverIP.String()
+	}) {
+		t.Errorf("test IP %v not found in Routes[%q], got: %v", testDoHResolverIP, defaultRouteKey, defaultRoute)
+	}
+
+	// Build a DNS query to something not handled by our split DNS route
+	// (tailscale.com) above.
+	query := buildTestDNSQuery(t, testDomain)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	resp, err := m.Query(ctx, query, "udp", netip.MustParseAddrPort("127.0.0.1:12345"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp) == 0 {
+		t.Fatal("empty response")
+	}
+
+	// Parse the response to verify we get our test IP back.
+	var parser dns.Parser
+	if _, err := parser.Start(resp); err != nil {
+		t.Fatalf("parsing response header: %v", err)
+	}
+	if err := parser.SkipAllQuestions(); err != nil {
+		t.Fatalf("skipping questions: %v", err)
+	}
+	answers, err := parser.AllAnswers()
+	if err != nil {
+		t.Fatalf("parsing answers: %v", err)
+	}
+	if len(answers) == 0 {
+		t.Fatal("no answers in response")
+	}
+	aRecord, ok := answers[0].Body.(*dns.AResource)
+	if !ok {
+		t.Fatalf("first answer is not A record: %T", answers[0].Body)
+	}
+	gotIP := netip.AddrFrom4(aRecord.A)
+	if gotIP != testResponseIP {
+		t.Errorf("wrong A record IP: got %v, want %v", gotIP, testResponseIP)
+	}
+
+	// Also verify that our DoH server received the query.
+	mu.Lock()
+	defer mu.Unlock()
+	if !dohRequestSeen {
+		t.Error("DoH server never received request")
+	}
+	if !bytes.Equal(receivedQuery, query) {
+		t.Errorf("DoH server received wrong query:\ngot:  %x\nwant: %x", receivedQuery, query)
+	}
+}
+
+// buildTestDNSQuery builds a simple DNS A query for the given domain.
+func buildTestDNSQuery(t *testing.T, domain string) []byte {
+	t.Helper()
+
+	builder := dns.NewBuilder(nil, dns.Header{})
+	builder.StartQuestions()
+	builder.Question(dns.Question{
+		Name:  dns.MustNewName(domain),
+		Type:  dns.TypeA,
+		Class: dns.ClassINET,
+	})
+	msg, err := builder.Finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return msg
+}
+
+// buildTestDNSResponse builds a DNS response for the given query with the specified IP.
+func buildTestDNSResponse(t *testing.T, domain string, ip netip.Addr) []byte {
+	t.Helper()
+
+	builder := dns.NewBuilder(nil, dns.Header{Response: true})
+	builder.StartQuestions()
+	builder.Question(dns.Question{
+		Name:  dns.MustNewName(domain),
+		Type:  dns.TypeA,
+		Class: dns.ClassINET,
+	})
+
+	builder.StartAnswers()
+	builder.AResource(dns.ResourceHeader{
+		Name:  dns.MustNewName(domain),
+		Class: dns.ClassINET,
+		TTL:   300,
+	}, dns.AResource{A: ip.As4()})
+
+	msg, err := builder.Finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return msg
 }

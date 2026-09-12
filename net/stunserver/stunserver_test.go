@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package stunserver
@@ -60,8 +60,7 @@ func TestSTUNServer(t *testing.T) {
 
 func BenchmarkServerSTUN(b *testing.B) {
 	b.ReportAllocs()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := b.Context()
 
 	s := New(ctx)
 	s.Listen("localhost:0")

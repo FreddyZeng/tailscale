@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package ippool
@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/netip"
 	"testing"
+	"time"
 
 	"go4.org/netipx"
 	"tailscale.com/tailcfg"
@@ -19,7 +20,7 @@ func TestIPPoolExhaustion(t *testing.T) {
 	var ipsb netipx.IPSetBuilder
 	ipsb.AddPrefix(smallPrefix)
 	addrPool := must.Get(ipsb.IPSet())
-	pool := IPPool{IPSet: addrPool}
+	pool := SingleMachineIPPool{IPSet: addrPool}
 
 	assignedIPs := make(map[netip.Addr]string)
 
@@ -29,7 +30,7 @@ func TestIPPoolExhaustion(t *testing.T) {
 
 	from := tailcfg.NodeID(12345)
 
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		for _, domain := range domains {
 			addr, err := pool.IPForDomain(from, domain)
 			if err != nil {
@@ -68,7 +69,7 @@ func TestIPPool(t *testing.T) {
 	var ipsb netipx.IPSetBuilder
 	ipsb.AddPrefix(netip.MustParsePrefix("100.64.1.0/24"))
 	addrPool := must.Get(ipsb.IPSet())
-	pool := IPPool{
+	pool := SingleMachineIPPool{
 		IPSet: addrPool,
 	}
 	from := tailcfg.NodeID(12345)
@@ -89,7 +90,7 @@ func TestIPPool(t *testing.T) {
 		t.Errorf("IPv4 address %s not in range %s", addr, addrPool)
 	}
 
-	domain, ok := pool.DomainForIP(from, addr)
+	domain, ok := pool.DomainForIP(from, addr, time.Now())
 	if !ok {
 		t.Errorf("domainForIP(%s) not found", addr)
 	} else if domain != "example.com" {

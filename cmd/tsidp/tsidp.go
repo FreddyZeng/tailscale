@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // The tsidp command is an OpenID Connect Identity Provider server.
@@ -29,6 +29,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,12 +40,15 @@ import (
 	"tailscale.com/client/local"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/envknob"
+	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/peercap"
 	"tailscale.com/tsnet"
 	"tailscale.com/types/key"
 	"tailscale.com/types/lazy"
+	"tailscale.com/types/opt"
 	"tailscale.com/types/views"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/must"
@@ -59,17 +63,40 @@ type ctxConn struct{}
 // accessing the IDP over Funnel are persisted.
 const funnelClientsFile = "oidc-funnel-clients.json"
 
+// oauthClientsFile is the new file name for OAuth clients when running in secure mode.
+const oauthClientsFile = "oauth-clients.json"
+
+// deprecatedFunnelClientsFile is the name used when renaming the old file.
+const deprecatedFunnelClientsFile = "deprecated-oidc-funnel-clients.json"
+
+// oidcKeyFile is where the OIDC private key is persisted.
+const oidcKeyFile = "oidc-key.json"
+
 var (
-	flagVerbose            = flag.Bool("verbose", false, "be verbose")
-	flagPort               = flag.Int("port", 443, "port to listen on")
-	flagLocalPort          = flag.Int("local-port", -1, "allow requests from localhost")
-	flagUseLocalTailscaled = flag.Bool("use-local-tailscaled", false, "use local tailscaled instead of tsnet")
-	flagFunnel             = flag.Bool("funnel", false, "use Tailscale Funnel to make tsidp available on the public internet")
-	flagHostname           = flag.String("hostname", "idp", "tsnet hostname to use instead of idp")
-	flagDir                = flag.String("dir", "", "tsnet state directory; a default one will be created if not provided")
+	flagVerbose                       = flag.Bool("verbose", false, "be verbose")
+	flagPort                          = flag.Int("port", 443, "port to listen on")
+	flagLocalPort                     = flag.Int("local-port", -1, "allow requests from localhost")
+	flagUseLocalTailscaled            = flag.Bool("use-local-tailscaled", false, "use local tailscaled instead of tsnet")
+	flagFunnel                        = flag.Bool("funnel", false, "use Tailscale Funnel to make tsidp available on the public internet")
+	flagHostname                      = flag.String("hostname", "idp", "tsnet hostname to use instead of idp")
+	flagDir                           = flag.String("dir", "", "tsnet state directory; a default one will be created if not provided")
+	flagAllowInsecureRegistrationBool opt.Bool
+	flagAllowInsecureRegistration     = opt.BoolFlag{Bool: &flagAllowInsecureRegistrationBool}
 )
 
+// getAllowInsecureRegistration returns whether to allow OAuth flows without pre-registered clients.
+// Default is true for backward compatibility; explicitly set to false for strict OAuth compliance.
+func getAllowInsecureRegistration() bool {
+	v, ok := flagAllowInsecureRegistration.Get()
+	if !ok {
+		// Flag not set, default to true (allow insecure for backward compatibility)
+		return true
+	}
+	return v
+}
+
 func main() {
+	flag.Var(&flagAllowInsecureRegistration, "allow-insecure-registration", "allow OAuth flows without pre-registered client credentials (default: true for backward compatibility; set to false for strict OAuth compliance)")
 	flag.Parse()
 	ctx := context.Background()
 	if !envknob.UseWIPCode() {
@@ -79,12 +106,14 @@ func main() {
 	var (
 		lc          *local.Client
 		st          *ipnstate.Status
+		rootPath    string
 		err         error
 		watcherChan chan error
 		cleanup     func()
 
 		lns []net.Listener
 	)
+
 	if *flagUseLocalTailscaled {
 		lc = &local.Client{}
 		st, err = lc.StatusWithoutPeers(ctx)
@@ -109,6 +138,15 @@ func main() {
 			log.Fatalf("failed to listen on any of %v", st.TailscaleIPs)
 		}
 
+		if flagDir == nil || *flagDir == "" {
+			// use user config directory as storage for tsidp oidc key
+			configDir, err := os.UserConfigDir()
+			if err != nil {
+				log.Fatalf("getting user config directory: %v", err)
+			}
+			rootPath = filepath.Join(configDir, "tsidp")
+		}
+
 		// tailscaled needs to be setting an HTTP header for funneled requests
 		// that older versions don't provide.
 		// TODO(naman): is this the correct check?
@@ -121,6 +159,7 @@ func main() {
 		}
 		defer cleanup()
 	} else {
+		hostinfo.SetApp("tsidp")
 		ts := &tsnet.Server{
 			Hostname: *flagHostname,
 			Dir:      *flagDir,
@@ -149,28 +188,48 @@ func main() {
 			log.Fatal(err)
 		}
 		lns = append(lns, ln)
+
+		rootPath = ts.GetRootPath()
+		log.Printf("tsidp root path: %s", rootPath)
 	}
 
 	srv := &idpServer{
-		lc:          lc,
-		funnel:      *flagFunnel,
-		localTSMode: *flagUseLocalTailscaled,
+		lc:                        lc,
+		funnel:                    *flagFunnel,
+		localTSMode:               *flagUseLocalTailscaled,
+		rootPath:                  rootPath,
+		allowInsecureRegistration: getAllowInsecureRegistration(),
 	}
+
 	if *flagPort != 443 {
 		srv.serverURL = fmt.Sprintf("https://%s:%d", strings.TrimSuffix(st.Self.DNSName, "."), *flagPort)
 	} else {
 		srv.serverURL = fmt.Sprintf("https://%s", strings.TrimSuffix(st.Self.DNSName, "."))
 	}
-	if *flagFunnel {
-		f, err := os.Open(funnelClientsFile)
-		if err == nil {
-			srv.funnelClients = make(map[string]*funnelClient)
-			if err := json.NewDecoder(f).Decode(&srv.funnelClients); err != nil {
-				log.Fatalf("could not parse %s: %v", funnelClientsFile, err)
-			}
-		} else if !errors.Is(err, os.ErrNotExist) {
-			log.Fatalf("could not open %s: %v", funnelClientsFile, err)
+
+	// If allowInsecureRegistration is enabled, the old oidc-funnel-clients.json path is used.
+	// If allowInsecureRegistration is disabled, attempt to migrate the old path to oidc-clients.json and use this new path.
+	var clientsFilePath string
+	if !srv.allowInsecureRegistration {
+		clientsFilePath, err = migrateOAuthClients(rootPath)
+		if err != nil {
+			log.Fatalf("could not migrate OAuth clients: %v", err)
 		}
+	} else {
+		clientsFilePath, err = getConfigFilePath(rootPath, funnelClientsFile)
+		if err != nil {
+			log.Fatalf("could not get funnel clients file path: %v", err)
+		}
+	}
+
+	f, err := os.Open(clientsFilePath)
+	if err == nil {
+		if err := json.NewDecoder(f).Decode(&srv.funnelClients); err != nil {
+			log.Fatalf("could not parse %s: %v", clientsFilePath, err)
+		}
+		f.Close()
+	} else if !errors.Is(err, os.ErrNotExist) {
+		log.Fatalf("could not open %s: %v", clientsFilePath, err)
 	}
 
 	log.Printf("Running tsidp at %s ...", srv.serverURL)
@@ -229,7 +288,7 @@ func serveOnLocalTailscaled(ctx context.Context, lc *local.Client, st *ipnstate.
 	// We watch the IPN bus just to get a session ID. The session expires
 	// when we stop watching the bus, and that auto-deletes the foreground
 	// serve/funnel configs we are creating below.
-	watcher, err := lc.WatchIPNBus(ctx, ipn.NotifyInitialState|ipn.NotifyNoPrivateKeys)
+	watcher, err := lc.WatchIPNBus(ctx, ipn.NotifyInitialState)
 	if err != nil {
 		return nil, nil, fmt.Errorf("could not set up ipn bus watcher: %v", err)
 	}
@@ -267,7 +326,7 @@ func serveOnLocalTailscaled(ctx context.Context, lc *local.Client, st *ipnstate.
 	foregroundSc.SetFunnel(serverURL, dstPort, shouldFunnel)
 	foregroundSc.SetWebHandler(&ipn.HTTPHandler{
 		Proxy: fmt.Sprintf("https://%s", net.JoinHostPort(serverURL, strconv.Itoa(int(dstPort)))),
-	}, serverURL, uint16(*flagPort), "/", true)
+	}, serverURL, uint16(*flagPort), "/", true, st.CurrentTailnet.MagicDNSSuffix)
 	err = lc.SetServeConfig(ctx, sc)
 	if err != nil {
 		return nil, watcherChan, fmt.Errorf("could not set serve config: %v", err)
@@ -277,11 +336,13 @@ func serveOnLocalTailscaled(ctx context.Context, lc *local.Client, st *ipnstate.
 }
 
 type idpServer struct {
-	lc          *local.Client
-	loopbackURL string
-	serverURL   string // "https://foo.bar.ts.net"
-	funnel      bool
-	localTSMode bool
+	lc                        *local.Client
+	loopbackURL               string
+	serverURL                 string // "https://foo.bar.ts.net"
+	funnel                    bool
+	localTSMode               bool
+	rootPath                  string // root path, used for storing state files
+	allowInsecureRegistration bool   // If true, allow OAuth without pre-registered clients
 
 	lazyMux        lazy.SyncValue[*http.ServeMux]
 	lazySigningKey lazy.SyncValue[*signingKey]
@@ -365,19 +426,100 @@ func (ar *authRequest) allowRelyingParty(r *http.Request, lc *local.Client) erro
 }
 
 func (s *idpServer) authorize(w http.ResponseWriter, r *http.Request) {
+
 	// This URL is visited by the user who is being authenticated. If they are
 	// visiting the URL over Funnel, that means they are not part of the
 	// tailnet that they are trying to be authenticated for.
+	// NOTE: Funnel request behavior is the same regardless of secure or insecure mode.
 	if isFunnelRequest(r) {
 		http.Error(w, "tsidp: unauthorized", http.StatusUnauthorized)
 		return
 	}
-
 	uq := r.URL.Query()
 
 	redirectURI := uq.Get("redirect_uri")
 	if redirectURI == "" {
 		http.Error(w, "tsidp: must specify redirect_uri", http.StatusBadRequest)
+		return
+	}
+
+	clientID := uq.Get("client_id")
+	if clientID == "" {
+		http.Error(w, "tsidp: must specify client_id", http.StatusBadRequest)
+		return
+	}
+
+	if !s.allowInsecureRegistration {
+		// When insecure registration is NOT allowed, validate client_id exists but defer client_secret validation to token endpoint
+		// This follows RFC 6749 which specifies client authentication should occur at token endpoint, not authorization endpoint
+
+		s.mu.Lock()
+		c, ok := s.funnelClients[clientID]
+		s.mu.Unlock()
+		if !ok {
+			http.Error(w, "tsidp: invalid client ID", http.StatusBadRequest)
+			return
+		}
+
+		// Validate client_id matches (public identifier validation)
+		clientIDcmp := subtle.ConstantTimeCompare([]byte(clientID), []byte(c.ID))
+		if clientIDcmp != 1 {
+			http.Error(w, "tsidp: invalid client ID", http.StatusBadRequest)
+			return
+		}
+
+		// Validate redirect URI
+		if redirectURI != c.RedirectURI {
+			http.Error(w, "tsidp: redirect_uri mismatch", http.StatusBadRequest)
+			return
+		}
+
+		// Get user information
+		var remoteAddr string
+		if s.localTSMode {
+			remoteAddr = r.Header.Get("X-Forwarded-For")
+		} else {
+			remoteAddr = r.RemoteAddr
+		}
+
+		// Check who is visiting the authorize endpoint.
+		var who *apitype.WhoIsResponse
+		var err error
+		who, err = s.lc.WhoIs(r.Context(), remoteAddr)
+		if err != nil {
+			log.Printf("Error getting WhoIs: %v", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		code := rands.HexString(32)
+		ar := &authRequest{
+			nonce:       uq.Get("nonce"),
+			remoteUser:  who,
+			redirectURI: redirectURI,
+			clientID:    clientID,
+			funnelRP:    c, // Store the validated client
+		}
+
+		s.mu.Lock()
+		mak.Set(&s.code, code, ar)
+		s.mu.Unlock()
+
+		q := make(url.Values)
+		q.Set("code", code)
+		if state := uq.Get("state"); state != "" {
+			q.Set("state", state)
+		}
+		parsedURL, err := url.Parse(redirectURI)
+		if err != nil {
+			http.Error(w, "invalid redirect URI", http.StatusInternalServerError)
+			return
+		}
+		parsedURL.RawQuery = q.Encode()
+		u := parsedURL.String()
+		log.Printf("Redirecting to %q", u)
+
+		http.Redirect(w, r, u, http.StatusFound)
 		return
 	}
 
@@ -402,7 +544,7 @@ func (s *idpServer) authorize(w http.ResponseWriter, r *http.Request) {
 		nonce:       uq.Get("nonce"),
 		remoteUser:  who,
 		redirectURI: redirectURI,
-		clientID:    uq.Get("client_id"),
+		clientID:    clientID,
 	}
 
 	if r.URL.Path == "/authorize/funnel" {
@@ -438,7 +580,13 @@ func (s *idpServer) authorize(w http.ResponseWriter, r *http.Request) {
 	if state := uq.Get("state"); state != "" {
 		q.Set("state", state)
 	}
-	u := redirectURI + "?" + q.Encode()
+	parsedURL, err := url.Parse(redirectURI)
+	if err != nil {
+		http.Error(w, "invalid redirect URI", http.StatusInternalServerError)
+		return
+	}
+	parsedURL.RawQuery = q.Encode()
+	u := parsedURL.String()
 	log.Printf("Redirecting to %q", u)
 
 	http.Redirect(w, r, u, http.StatusFound)
@@ -448,7 +596,13 @@ func (s *idpServer) newMux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc(oidcJWKSPath, s.serveJWKS)
 	mux.HandleFunc(oidcConfigPath, s.serveOpenIDConfig)
-	mux.HandleFunc("/authorize/", s.authorize)
+	if !s.allowInsecureRegistration {
+		// When insecure registration is NOT allowed, use a single /authorize endpoint
+		mux.HandleFunc("/authorize", s.authorize)
+	} else {
+		// When insecure registration is allowed, preserve original behavior with path-based routing
+		mux.HandleFunc("/authorize/", s.authorize)
+	}
 	mux.HandleFunc("/userinfo", s.serveUserInfo)
 	mux.HandleFunc("/token", s.serveToken)
 	mux.HandleFunc("/clients/", s.serveClients)
@@ -485,6 +639,24 @@ func (s *idpServer) serveUserInfo(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		delete(s.accessToken, tk)
 		s.mu.Unlock()
+		return
+	}
+
+	if !s.allowInsecureRegistration {
+		// When insecure registration is NOT allowed, validate that the token was issued to a valid client.
+		if ar.clientID == "" {
+			http.Error(w, "tsidp: no client associated with token", http.StatusBadRequest)
+			return
+		}
+
+		// Validate client still exists
+		s.mu.Lock()
+		_, clientExists := s.funnelClients[ar.clientID]
+		s.mu.Unlock()
+		if !clientExists {
+			http.Error(w, "tsidp: client no longer exists", http.StatusUnauthorized)
+			return
+		}
 	}
 
 	ui := userInfo{}
@@ -501,7 +673,7 @@ func (s *idpServer) serveUserInfo(w http.ResponseWriter, r *http.Request) {
 	// TODO(maisem): not sure if this is the right thing to do
 	ui.UserName, _, _ = strings.Cut(ar.remoteUser.UserProfile.LoginName, "@")
 
-	rules, err := tailcfg.UnmarshalCapJSON[capRule](ar.remoteUser.CapMap, tailcfg.PeerCapabilityTsIDP)
+	rules, err := tailcfg.UnmarshalCapJSON[capRule](ar.remoteUser.CapMap, peercap.TsIDP)
 	if err != nil {
 		http.Error(w, "tsidp: failed to unmarshal capability: %v", http.StatusBadRequest)
 		return
@@ -694,11 +866,58 @@ func (s *idpServer) serveToken(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "tsidp: code not found", http.StatusBadRequest)
 		return
 	}
-	if err := ar.allowRelyingParty(r, s.lc); err != nil {
-		log.Printf("Error allowing relying party: %v", err)
-		http.Error(w, err.Error(), http.StatusForbidden)
-		return
+
+	if !s.allowInsecureRegistration {
+		// When insecure registration is NOT allowed, always validate client credentials regardless of request source
+		clientID := r.FormValue("client_id")
+		clientSecret := r.FormValue("client_secret")
+
+		// Try basic auth if form values are empty
+		if clientID == "" || clientSecret == "" {
+			if basicClientID, basicClientSecret, ok := r.BasicAuth(); ok {
+				if clientID == "" {
+					clientID = basicClientID
+				}
+				if clientSecret == "" {
+					clientSecret = basicClientSecret
+				}
+			}
+		}
+
+		if clientID == "" || clientSecret == "" {
+			http.Error(w, "tsidp: client credentials required in when insecure registration is not allowed", http.StatusUnauthorized)
+			return
+		}
+
+		// Validate against the stored auth request
+		if ar.clientID != clientID {
+			http.Error(w, "tsidp: client_id mismatch", http.StatusBadRequest)
+			return
+		}
+
+		// Validate client credentials against stored clients
+		if ar.funnelRP == nil {
+			http.Error(w, "tsidp: no client information found", http.StatusBadRequest)
+			return
+		}
+
+		clientIDcmp := subtle.ConstantTimeCompare([]byte(clientID), []byte(ar.funnelRP.ID))
+		clientSecretcmp := subtle.ConstantTimeCompare([]byte(clientSecret), []byte(ar.funnelRP.Secret))
+		if clientIDcmp != 1 || clientSecretcmp != 1 {
+			http.Error(w, "tsidp: invalid client credentials", http.StatusUnauthorized)
+			return
+		}
+	} else {
+		// Original behavior when insecure registration is allowed
+		// Only checks ClientID and Client Secret when over funnel.
+		// Local connections are allowed and tailnet connections only check matching nodeIDs.
+		if err := ar.allowRelyingParty(r, s.lc); err != nil {
+			log.Printf("Error allowing relying party: %v", err)
+			http.Error(w, err.Error(), http.StatusForbidden)
+			return
+		}
 	}
+
 	if ar.redirectURI != r.FormValue("redirect_uri") {
 		http.Error(w, "tsidp: redirect_uri mismatch", http.StatusBadRequest)
 		return
@@ -746,7 +965,7 @@ func (s *idpServer) serveToken(w http.ResponseWriter, r *http.Request) {
 		tsClaims.Issuer = s.loopbackURL
 	}
 
-	rules, err := tailcfg.UnmarshalCapJSON[capRule](who.CapMap, tailcfg.PeerCapabilityTsIDP)
+	rules, err := tailcfg.UnmarshalCapJSON[capRule](who.CapMap, peercap.TsIDP)
 	if err != nil {
 		log.Printf("tsidp: failed to unmarshal capability: %v", err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -816,8 +1035,12 @@ func (s *idpServer) oidcSigner() (jose.Signer, error) {
 
 func (s *idpServer) oidcPrivateKey() (*signingKey, error) {
 	return s.lazySigningKey.GetErr(func() (*signingKey, error) {
+		keyPath, err := getConfigFilePath(s.rootPath, oidcKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("could not get OIDC key file path: %w", err)
+		}
 		var sk signingKey
-		b, err := os.ReadFile("oidc-key.json")
+		b, err := os.ReadFile(keyPath)
 		if err == nil {
 			if err := sk.UnmarshalJSON(b); err == nil {
 				return &sk, nil
@@ -832,7 +1055,7 @@ func (s *idpServer) oidcPrivateKey() (*signingKey, error) {
 		if err != nil {
 			log.Fatalf("Error marshaling key: %v", err)
 		}
-		if err := os.WriteFile("oidc-key.json", b, 0600); err != nil {
+		if err := os.WriteFile(keyPath, b, 0600); err != nil {
 			log.Fatalf("Error writing key: %v", err)
 		}
 		return &sk, nil
@@ -866,7 +1089,6 @@ func (s *idpServer) serveJWKS(w http.ResponseWriter, r *http.Request) {
 	}); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
-	return
 }
 
 // openIDProviderMetadata is a partial representation of
@@ -946,24 +1168,38 @@ func (s *idpServer) serveOpenIDConfig(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "tsidp: not found", http.StatusNotFound)
 		return
 	}
-	ap, err := netip.ParseAddrPort(r.RemoteAddr)
-	if err != nil {
-		log.Printf("Error parsing remote addr: %v", err)
-		return
-	}
+
 	var authorizeEndpoint string
 	rpEndpoint := s.serverURL
-	if isFunnelRequest(r) {
-		authorizeEndpoint = fmt.Sprintf("%s/authorize/funnel", s.serverURL)
-	} else if who, err := s.lc.WhoIs(r.Context(), r.RemoteAddr); err == nil {
-		authorizeEndpoint = fmt.Sprintf("%s/authorize/%d", s.serverURL, who.Node.ID)
-	} else if ap.Addr().IsLoopback() {
-		rpEndpoint = s.loopbackURL
-		authorizeEndpoint = fmt.Sprintf("%s/authorize/localhost", s.serverURL)
+
+	if !s.allowInsecureRegistration {
+		// When insecure registration is NOT allowed, use a single authorization endpoint for all request types
+		// This will be the same regardless of if the user is on localhost, tailscale, or funnel.
+		authorizeEndpoint = fmt.Sprintf("%s/authorize", s.serverURL)
+		rpEndpoint = s.serverURL
 	} else {
-		log.Printf("Error getting WhoIs: %v", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		// When insecure registration is allowed TSIDP uses the requestors nodeID
+		// (typically that of the resource server during auto discovery) when on the tailnet
+		// and adds it to the authorize URL as a replacement clientID for when the user authorizes.
+		// The behavior over funnel drops the nodeID & clientID replacement behvaior and does require a
+		// previously created clientID and client secret.
+		ap, err := netip.ParseAddrPort(r.RemoteAddr)
+		if err != nil {
+			log.Printf("Error parsing remote addr: %v", err)
+			return
+		}
+		if isFunnelRequest(r) {
+			authorizeEndpoint = fmt.Sprintf("%s/authorize/funnel", s.serverURL)
+		} else if who, err := s.lc.WhoIs(r.Context(), r.RemoteAddr); err == nil {
+			authorizeEndpoint = fmt.Sprintf("%s/authorize/%d", s.serverURL, who.Node.ID)
+		} else if ap.Addr().IsLoopback() {
+			rpEndpoint = s.loopbackURL
+			authorizeEndpoint = fmt.Sprintf("%s/authorize/localhost", s.serverURL)
+		} else {
+			log.Printf("Error getting WhoIs: %v", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -1117,14 +1353,27 @@ func (s *idpServer) serveDeleteClient(w http.ResponseWriter, r *http.Request, cl
 }
 
 // storeFunnelClientsLocked writes the current mapping of OIDC client ID/secret
-// pairs for RPs that access the IDP over funnel. s.mu must be held while
-// calling this.
+// pairs for RPs that access the IDP. When insecure registration is NOT allowed, uses oauth-clients.json;
+// otherwise uses oidc-funnel-clients.json. s.mu must be held while calling this.
 func (s *idpServer) storeFunnelClientsLocked() error {
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(s.funnelClients); err != nil {
 		return err
 	}
-	return os.WriteFile(funnelClientsFile, buf.Bytes(), 0600)
+
+	var clientsFilePath string
+	var err error
+	if !s.allowInsecureRegistration {
+		clientsFilePath, err = getConfigFilePath(s.rootPath, oauthClientsFile)
+	} else {
+		clientsFilePath, err = getConfigFilePath(s.rootPath, funnelClientsFile)
+	}
+
+	if err != nil {
+		return fmt.Errorf("storeFunnelClientsLocked: %v", err)
+	}
+
+	return os.WriteFile(clientsFilePath, buf.Bytes(), 0600)
 }
 
 const (
@@ -1155,7 +1404,7 @@ func readUint64(r io.Reader) (uint64, error) {
 	}
 }
 
-// rsaPrivateKeyJSONWrapper is the the JSON serialization
+// rsaPrivateKeyJSONWrapper is the JSON serialization
 // format used by RSAPrivateKey.
 type rsaPrivateKeyJSONWrapper struct {
 	Key string
@@ -1236,4 +1485,77 @@ func isFunnelRequest(r *http.Request) bool {
 		return true
 	}
 	return false
+}
+
+// migrateOAuthClients migrates from oidc-funnel-clients.json to oauth-clients.json.
+// If oauth-clients.json already exists, no migration is performed.
+// If both files are missing a new configuration is created.
+// The path to the new configuration file is returned.
+func migrateOAuthClients(rootPath string) (string, error) {
+	// First, check for oauth-clients.json (new file)
+	oauthPath, err := getConfigFilePath(rootPath, oauthClientsFile)
+	if err != nil {
+		return "", fmt.Errorf("could not get oauth clients file path: %w", err)
+	}
+	if _, err := os.Stat(oauthPath); err == nil {
+		// oauth-clients.json already exists, use it
+		return oauthPath, nil
+	}
+
+	// Check for old oidc-funnel-clients.json
+	oldPath, err := getConfigFilePath(rootPath, funnelClientsFile)
+	if err != nil {
+		return "", fmt.Errorf("could not get funnel clients file path: %w", err)
+	}
+	if _, err := os.Stat(oldPath); err == nil {
+		// Old file exists, migrate it
+		log.Printf("Migrating OAuth clients from %s to %s", oldPath, oauthPath)
+
+		// Read the old file
+		data, err := os.ReadFile(oldPath)
+		if err != nil {
+			return "", fmt.Errorf("could not read old funnel clients file: %w", err)
+		}
+
+		// Write to new location
+		if err := os.WriteFile(oauthPath, data, 0600); err != nil {
+			return "", fmt.Errorf("could not write new oauth clients file: %w", err)
+		}
+
+		// Rename old file to deprecated name
+		deprecatedPath, err := getConfigFilePath(rootPath, deprecatedFunnelClientsFile)
+		if err != nil {
+			return "", fmt.Errorf("could not get deprecated file path: %w", err)
+		}
+		if err := os.Rename(oldPath, deprecatedPath); err != nil {
+			log.Printf("Warning: could not rename old file to deprecated name: %v", err)
+		} else {
+			log.Printf("Renamed old file to %s", deprecatedPath)
+		}
+
+		return oauthPath, nil
+	}
+
+	// Neither file exists, create empty oauth-clients.json
+	log.Printf("Creating empty OAuth clients file at %s", oauthPath)
+	if err := os.WriteFile(oauthPath, []byte("{}"), 0600); err != nil {
+		return "", fmt.Errorf("could not create empty oauth clients file: %w", err)
+	}
+
+	return oauthPath, nil
+}
+
+// getConfigFilePath returns the path to the config file for the given file name.
+// The oidc-key.json and funnel-clients.json files were originally opened and written
+// to without paths, and ended up in /root or home directory of the user running
+// the process. To maintain backward compatibility, we return the naked file name if that
+// file exists already, otherwise we return the full path in the rootPath.
+func getConfigFilePath(rootPath string, fileName string) (string, error) {
+	if _, err := os.Stat(fileName); err == nil {
+		return fileName, nil
+	} else if errors.Is(err, os.ErrNotExist) {
+		return filepath.Join(rootPath, fileName), nil
+	} else {
+		return "", err
+	}
 }

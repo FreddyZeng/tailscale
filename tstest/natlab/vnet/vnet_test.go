@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package vnet
@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"path/filepath"
@@ -85,6 +86,37 @@ func TestPacketSideEffects(t *testing.T) {
 					),
 				},
 				{
+					// The secondary DNS server answers its own zone. A test that
+					// routes a domain here and gets this answer has proven the
+					// split-DNS route was honored.
+					name: "split-dns-answers-own-zone",
+					pkt:  mkDNSReqTo(FakeSplitDNSIPv4(), SplitDNSName),
+					check: all(
+						numPkts(1),
+						pktSubstr("IP="+SplitDNSAddr),
+					),
+				},
+				{
+					// Single labels too: the parser produces them with no dots
+					// at all, so they key the zone map like any other name.
+					name: "split-dns-answers-bare-name",
+					pkt:  mkDNSReqTo(FakeSplitDNSIPv4(), SplitDNSBareName),
+					check: all(
+						numPkts(1),
+						pktSubstr("IP="+SplitDNSBareAddr),
+					),
+				},
+				{
+					// The default DNS server must NOT answer the split zone;
+					// that's what makes the answer above meaningful.
+					name: "default-dns-does-not-answer-split-zone",
+					pkt:  mkDNSReqTo(FakeDNSIPv4(), SplitDNSName),
+					check: all(
+						numPkts(1),
+						noPktSubstr("IP="+SplitDNSAddr),
+					),
+				},
+				{
 					name: "syslog-v4",
 					pkt:  mkSyslogPacket(clientIPv4(1), "<6>2024-08-30T10:36:06-07:00 natlabapp tailscaled[1]: 2024/08/30 10:36:06 some-message"),
 					check: all(
@@ -120,7 +152,7 @@ func TestPacketSideEffects(t *testing.T) {
 					check: all(
 						numPkts(2), // DHCP discover broadcast to node2 also, and the DHCP reply from router
 						pktSubstr("SrcMAC=52:cc:cc:cc:cc:01 DstMAC=ff:ff:ff:ff:ff:ff"),
-						pktSubstr("Options=[Option(ServerID:192.168.0.1), Option(MessageType:Offer)]}"),
+						pktSubstr("Option(ServerID:192.168.0.1), Option(MessageType:Offer), Option(LeaseTime:3600)"),
 					),
 				},
 				{
@@ -194,6 +226,10 @@ func TestPacketSideEffects(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			// Silence the periodic unsolicited Router Advertisements
+			// before registering sinks; otherwise a background RA can
+			// race with the synchronous packet-count assertions below.
+			s.StopUnsolicitedRAsForTest()
 			defer s.Close()
 
 			for _, tt := range tt.tests {
@@ -282,6 +318,38 @@ func mkAllNodesPing(srcMAC MAC, srcIP netip.Addr) []byte {
 	}
 	icmp.SetNetworkLayerForChecksum(ip)
 	return mkEth(macAllNodes, srcMAC, ethType6, mustPacket(ip, icmp))
+}
+
+// mkDNSReqTo builds an A-record query for name over IPv4, sent to the given DNS
+// server address. It's like mkDNSReq but lets a test aim at the secondary
+// (split-DNS) server and ask for an arbitrary name.
+func mkDNSReqTo(dst netip.Addr, name string) []byte {
+	eth := &layers.Ethernet{
+		SrcMAC:       nodeMac(1).HWAddr(),
+		DstMAC:       routerMac(1).HWAddr(),
+		EthernetType: layers.EthernetTypeIPv4,
+	}
+	ip := &layers.IPv4{
+		Version:  4,
+		Protocol: layers.IPProtocolUDP,
+		SrcIP:    clientIPv4(1).AsSlice(),
+		TTL:      64,
+		DstIP:    dst.AsSlice(),
+	}
+	udp := &layers.UDP{
+		SrcPort: 12345,
+		DstPort: 53,
+	}
+	udp.SetNetworkLayerForChecksum(ip)
+	dns := &layers.DNS{
+		ID: 790,
+		Questions: []layers.DNSQuestion{{
+			Name:  []byte(name),
+			Type:  layers.DNSTypeA,
+			Class: layers.DNSClassIN,
+		}},
+	}
+	return mustPacket(eth, ip, udp, dns)
 }
 
 // mkDNSReq makes a DNS request to "control.tailscale" using the source IPs as
@@ -471,6 +539,21 @@ func pktSubstr(sub string) func(*sideEffects) error {
 	}
 }
 
+// noPktSubstr returns a side effect checker func that checks that no received
+// packet's summary contains the given substring. It's the counterpart to
+// pktSubstr, for asserting an answer was *not* given.
+func noPktSubstr(sub string) func(*sideEffects) error {
+	return func(se *sideEffects) error {
+		for _, pkt := range se.got {
+			pkt := gopacket.NewPacket(pkt.eth, layers.LayerTypeEthernet, gopacket.Lazy)
+			if got := pkt.String(); strings.Contains(got, sub) {
+				return fmt.Errorf("packet summary unexpectedly contains %q: %s", sub, got)
+			}
+		}
+		return nil
+	}
+}
+
 // numPkts returns a side effect checker func that checks whether
 // the received number of ethernet packets was the given number.
 func numPkts(want int) func(*sideEffects) error {
@@ -558,7 +641,7 @@ func TestProtocolQEMU(t *testing.T) {
 		go s.ServeUnixConn(conn.(*net.UnixConn), ProtocolQEMU)
 	}
 
-	sendBetweenClients(t, clientc, s, mkLenPrefixed)
+	sendBetweenClients(t, clientc, s, ProtocolQEMU)
 }
 
 // TestProtocolUnixDgram tests the protocol that macOS Virtualization.framework
@@ -601,11 +684,11 @@ func TestProtocolUnixDgram(t *testing.T) {
 		clientc[i] = c
 	}
 
-	sendBetweenClients(t, clientc, s, nil)
+	sendBetweenClients(t, clientc, s, ProtocolUnixDGRAM)
 }
 
 // sendBetweenClients is a test helper that tries to send an ethernet frame from
-// one client to another.
+// one client to another using the given vnet wire protocol.
 //
 // It first makes the two clients send a packet to a fictitious node 3, which
 // forces their src MACs to be registered with a networkWriter internally so
@@ -615,12 +698,11 @@ func TestProtocolUnixDgram(t *testing.T) {
 // effect here, so this does it manually.
 //
 // It also then waits for them to be registered.
-//
-// wrap is an optional function that wraps the packet before sending it.
-func sendBetweenClients(t testing.TB, clientc [2]*net.UnixConn, s *Server, wrap func([]byte) []byte) {
+func sendBetweenClients(t testing.TB, clientc [2]*net.UnixConn, s *Server, proto Protocol) {
 	t.Helper()
-	if wrap == nil {
-		wrap = func(b []byte) []byte { return b }
+	wrap := func(b []byte) []byte { return b }
+	if proto == ProtocolQEMU {
+		wrap = mkLenPrefixed
 	}
 	for i, c := range clientc {
 		must.Get(c.Write(wrap(mkEth(nodeMac(3), nodeMac(i+1), testingEthertype, []byte("hello")))))
@@ -637,15 +719,45 @@ func sendBetweenClients(t testing.TB, clientc [2]*net.UnixConn, s *Server, wrap 
 	t.Logf("writing % 02x", pkt)
 	must.Get(clientc[0].Write(pkt))
 
-	buf := make([]byte, len(pkt))
-	clientc[1].SetReadDeadline(time.Now().Add(5 * time.Second))
-	n, err := clientc[1].Read(buf)
-	if err != nil {
-		t.Fatal(err)
+	// vnet sends a Router Advertisement at writer-register time on v6-enabled
+	// networks (and may also send periodic unsolicited RAs). Loop until we
+	// see the test packet, skipping any noise that arrived first.
+	//
+	// For the QEMU stream protocol the kernel is free to coalesce multiple
+	// length-prefixed frames into one Read, so the reader must parse the
+	// framing or it may swallow the test packet alongside an RA.
+	deadline := time.Now().Add(5 * time.Second)
+	clientc[1].SetReadDeadline(deadline)
+	readFrame := func() ([]byte, error) {
+		if proto == ProtocolUnixDGRAM {
+			buf := make([]byte, 2048)
+			n, err := clientc[1].Read(buf)
+			if err != nil {
+				return nil, err
+			}
+			return buf[:n], nil
+		}
+		var hdr [4]byte
+		if _, err := io.ReadFull(clientc[1], hdr[:]); err != nil {
+			return nil, err
+		}
+		n := binary.BigEndian.Uint32(hdr[:])
+		frame := make([]byte, 4+n)
+		copy(frame, hdr[:])
+		if _, err := io.ReadFull(clientc[1], frame[4:]); err != nil {
+			return nil, err
+		}
+		return frame, nil
 	}
-	got := buf[:n]
-	if !bytes.Equal(got, pkt) {
-		t.Errorf("bad packet\n got: % 02x\nwant: % 02x", got, pkt)
+	for {
+		got, err := readFrame()
+		if err != nil {
+			t.Fatalf("did not receive test packet: %v", err)
+		}
+		if bytes.Equal(got, pkt) {
+			return
+		}
+		t.Logf("ignoring unexpected packet (% 02x...)", got[:min(len(got), 16)])
 	}
 }
 

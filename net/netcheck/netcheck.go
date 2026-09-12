@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package netcheck checks the network conditions from the current host.
@@ -23,26 +23,30 @@ import (
 	"syscall"
 	"time"
 
+	"tailscale.com/derp"
 	"tailscale.com/derp/derphttp"
 	"tailscale.com/envknob"
+	"tailscale.com/feature"
+	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/hostinfo"
-	"tailscale.com/net/captivedetection"
 	"tailscale.com/net/dnscache"
 	"tailscale.com/net/neterror"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/netns"
 	"tailscale.com/net/ping"
-	"tailscale.com/net/portmapper"
+	"tailscale.com/net/portmapper/portmappertype"
 	"tailscale.com/net/sockstats"
 	"tailscale.com/net/stun"
 	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
+	"tailscale.com/types/bools"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/nettype"
 	"tailscale.com/types/opt"
 	"tailscale.com/types/views"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/mak"
+	"tailscale.com/util/testenv"
 )
 
 // Debugging and experimentation tweakables.
@@ -108,10 +112,10 @@ type Report struct {
 	// Empty means not checked.
 	PCP opt.Bool
 
-	PreferredDERP   int                   // or 0 for unknown
-	RegionLatency   map[int]time.Duration // keyed by DERP Region ID
-	RegionV4Latency map[int]time.Duration // keyed by DERP Region ID
-	RegionV6Latency map[int]time.Duration // keyed by DERP Region ID
+	PreferredDERP   tailcfg.DERPRegionID // or 0 for unknown
+	RegionLatency   RegionLatency        // keyed by DERP Region ID
+	RegionV4Latency RegionLatency        // keyed by DERP Region ID
+	RegionV6Latency RegionLatency        // keyed by DERP Region ID
 
 	GlobalV4Counters map[netip.AddrPort]int // number of times the endpoint was observed
 	GlobalV6Counters map[netip.AddrPort]int // number of times the endpoint was observed
@@ -181,6 +185,34 @@ func (r *Report) Clone() *Report {
 	return &r2
 }
 
+// RegionLatency is a map of DERP region IDs associated with their measured latencies.
+type RegionLatency map[tailcfg.DERPRegionID]time.Duration
+
+// Compare compares the latency of the regions i and j. It returns
+//
+//	-1 if region i is contained in lat, but region j is missing
+//	+1 if region j is contained in lat, but region i is missing
+//
+// Otherwise, it returns
+//
+//	-1 if the latency of region i is less than the latency of region j
+//	+1 if the latency of region i is greater than the latency of region j
+//
+// If both latency values are equal, then it breaks ties by region ID and returns
+//
+//	-1 if i is less than j
+//	 0 if i equals j
+//	+1 if i is greater than j
+func (lat RegionLatency) Compare(i, j tailcfg.DERPRegionID) int {
+	iLat, iOK := lat[i]
+	jLat, jOK := lat[j]
+	return cmp.Or(
+		bools.Compare(!iOK, !jOK), // defined things sort first
+		cmp.Compare(iLat, jLat),   // sort by latency
+		cmp.Compare(i, j),         // break ties by region ID
+	)
+}
+
 // Client generates Reports describing the result of both passive and active
 // network configuration probing. It provides two different modes of report, a
 // full report (see MakeNextReportFull) and a more lightweight incremental
@@ -214,7 +246,7 @@ type Client struct {
 
 	// PortMapper, if non-nil, is used for portmap queries.
 	// If nil, portmap discovery is not done.
-	PortMapper *portmapper.Client // lazily initialized on first use
+	PortMapper portmappertype.Client
 
 	// UseDNSCache controls whether this client should use a
 	// *dnscache.Resolver to resolve DERP hostnames, when no IP address is
@@ -227,13 +259,12 @@ type Client struct {
 
 	// if non-zero, force this DERP region to be preferred in all reports where
 	// the DERP is found to be reachable.
-	ForcePreferredDERP int
+	ForcePreferredDERP tailcfg.DERPRegionID
 
 	// For tests
-	testEnoughRegions      int
-	testCaptivePortalDelay time.Duration
+	testEnoughRegions int
 
-	mu       sync.Mutex            // guards following
+	mu       syncs.Mutex           // guards following
 	nextFull bool                  // do a full region scan, even if last != nil
 	prev     map[time.Time]*Report // some previous reports
 	last     *Report               // most recent report
@@ -252,14 +283,6 @@ func (c *Client) enoughRegions() int {
 		return 100
 	}
 	return 3
-}
-
-func (c *Client) captivePortalDelay() time.Duration {
-	if c.testCaptivePortalDelay > 0 {
-		return c.testCaptivePortalDelay
-	}
-	// Chosen semi-arbitrarily
-	return 200 * time.Millisecond
 }
 
 func (c *Client) logf(format string, a ...any) {
@@ -385,7 +408,7 @@ type probePlan map[string][]probe
 // sortRegions returns the regions of dm first sorted
 // from fastest to slowest (based on the 'last' report),
 // end in regions that have no data.
-func sortRegions(dm *tailcfg.DERPMap, last *Report, preferredDERP int) (prev []*tailcfg.DERPRegion) {
+func sortRegions(dm *tailcfg.DERPMap, last *Report, preferredDERP tailcfg.DERPRegionID) (prev []*tailcfg.DERPRegion) {
 	prev = make([]*tailcfg.DERPRegion, 0, len(dm.Regions))
 	for _, reg := range dm.Regions {
 		if reg.NoMeasureNoHome {
@@ -429,7 +452,7 @@ const numIncrementalRegions = 3
 // TODO(raggi): change from "preferred DERP" from a historical report to "home
 // DERP" as in what DERP is the current home connection, this would further
 // reduce flap events.
-func makeProbePlan(dm *tailcfg.DERPMap, ifState *netmon.State, last *Report, preferredDERP int) (plan probePlan) {
+func makeProbePlan(dm *tailcfg.DERPMap, ifState *netmon.State, last *Report, preferredDERP tailcfg.DERPRegionID) (plan probePlan) {
 	if last == nil || len(last.RegionLatency) == 0 {
 		return makeProbePlanInitial(dm, ifState)
 	}
@@ -449,7 +472,7 @@ func makeProbePlan(dm *tailcfg.DERPMap, ifState *netmon.State, last *Report, pre
 	// restoration back to the home DERP on the next full netcheck ~5 minutes later
 	// - which is highly disruptive when it causes shifts in geo routed subnet
 	// routers. By always including the home DERP in the incremental netcheck, we
-	// ensure that the home DERP is always probed, even if it observed a recenet
+	// ensure that the home DERP is always probed, even if it observed a recent
 	// poor latency sample. This inclusion enables the latency history checks in
 	// home DERP selection to still take effect.
 	// planContainsHome indicates whether the home DERP has been added to the probePlan,
@@ -543,7 +566,7 @@ func makeProbePlanInitial(dm *tailcfg.DERPMap, ifState *netmon.State) (plan prob
 
 		var p4 []probe
 		var p6 []probe
-		for try := 0; try < 3; try++ {
+		for try := range 3 {
 			n := reg.Nodes[try%len(reg.Nodes)]
 			delay := time.Duration(try) * defaultInitialRetransmitTime
 			if n.IPv4 != "none" && ((ifState.HaveV4 && nodeMight4(n)) || n.IsTestNode()) {
@@ -595,7 +618,7 @@ type reportState struct {
 	stopProbeCh chan struct{}
 	waitPortMap sync.WaitGroup
 
-	mu       sync.Mutex
+	mu       syncs.Mutex
 	report   *Report                            // to be returned by GetReport
 	inFlight map[stun.TxID]func(netip.AddrPort) // called without c.mu held
 	gotEP4   netip.AddrPort
@@ -608,7 +631,7 @@ func (rs *reportState) anyUDP() bool {
 	return rs.report.UDP
 }
 
-func (rs *reportState) haveRegionLatency(regionID int) bool {
+func (rs *reportState) haveRegionLatency(regionID tailcfg.DERPRegionID) bool {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 	_, ok := rs.report.RegionLatency[regionID]
@@ -684,6 +707,9 @@ func (rs *reportState) addNodeLatency(node *tailcfg.DERPNode, ipp netip.AddrPort
 
 	switch {
 	case ipp.Addr().Is6():
+		// Receiving a STUN response proves that the corresponding probe was
+		// sent, even if the response races SendPacket returning in runProbe.
+		ret.IPv6CanSend = true
 		updateLatency(ret.RegionV6Latency, node.RegionID, d)
 		ret.IPv6 = true
 		ret.GlobalV6 = ipp
@@ -691,6 +717,7 @@ func (rs *reportState) addNodeLatency(node *tailcfg.DERPNode, ipp netip.AddrPort
 		// TODO: track MappingVariesByDestIP for IPv6
 		// too? Would be sad if so, but who knows.
 	case ipp.Addr().Is4():
+		ret.IPv4CanSend = true
 		updateLatency(ret.RegionV4Latency, node.RegionID, d)
 		ret.IPv4 = true
 		mak.Set(&ret.GlobalV4Counters, ipp, ret.GlobalV4Counters[ipp]+1)
@@ -729,7 +756,7 @@ func (rs *reportState) probePortMapServices() {
 
 	res, err := rs.c.PortMapper.Probe(context.Background())
 	if err != nil {
-		if !errors.Is(err, portmapper.ErrGatewayRange) {
+		if !errors.Is(err, portmappertype.ErrGatewayRange) {
 			// "skipping portmap; gateway range likely lacks support"
 			// is not very useful, and too spammy on cloud systems.
 			// If there are other errors, we want to log those.
@@ -745,14 +772,15 @@ func (rs *reportState) probePortMapServices() {
 
 func newReport() *Report {
 	return &Report{
-		RegionLatency:   make(map[int]time.Duration),
-		RegionV4Latency: make(map[int]time.Duration),
-		RegionV6Latency: make(map[int]time.Duration),
+		RegionLatency:   make(map[tailcfg.DERPRegionID]time.Duration),
+		RegionV4Latency: make(map[tailcfg.DERPRegionID]time.Duration),
+		RegionV6Latency: make(map[tailcfg.DERPRegionID]time.Duration),
 	}
 }
 
 // GetReportOpts contains options that can be passed to GetReport. Unless
 // specified, all fields are optional and can be left as their zero value.
+// At most one of OnlyTCP443 or OnlySTUN may be set.
 type GetReportOpts struct {
 	// GetLastDERPActivity is a callback that, if provided, should return
 	// the absolute time that the calling code last communicated with a
@@ -761,26 +789,38 @@ type GetReportOpts struct {
 	//
 	// If no communication with that region has occurred, or it occurred
 	// too far in the past, this function should return the zero time.
-	GetLastDERPActivity func(int) time.Time
+	GetLastDERPActivity func(tailcfg.DERPRegionID) time.Time
 	// OnlyTCP443 constrains netcheck reporting to measurements over TCP port
 	// 443.
 	OnlyTCP443 bool
+	// OnlySTUN constrains netcheck reporting to STUN measurements over UDP.
+	OnlySTUN bool
 }
 
 // getLastDERPActivity calls o.GetLastDERPActivity if both o and
 // o.GetLastDERPActivity are non-nil; otherwise it returns the zero time.
-func (o *GetReportOpts) getLastDERPActivity(region int) time.Time {
+func (o *GetReportOpts) getLastDERPActivity(region tailcfg.DERPRegionID) time.Time {
 	if o == nil || o.GetLastDERPActivity == nil {
 		return time.Time{}
 	}
 	return o.GetLastDERPActivity(region)
 }
 
-func (c *Client) SetForcePreferredDERP(region int) {
+func (c *Client) SetForcePreferredDERP(region tailcfg.DERPRegionID) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.ForcePreferredDERP = region
 }
+
+// HookStartCaptivePortalDetection, if set, is called by GetReport to
+// asynchronously start captive portal detection during a full (non-incremental)
+// netcheck. It is set at init time by the optional
+// tailscale.com/feature/captiveportal/netcheckhook package.
+//
+// The returned done channel is closed when detection has finished (and
+// setCaptivePortal has been called with the result, if it ran); the returned
+// stop function cancels a detection that has not yet started.
+var HookStartCaptivePortalDetection feature.Hook[func(ctx context.Context, c *Client, dm *tailcfg.DERPMap, preferredDERP tailcfg.DERPRegionID, setCaptivePortal func(bool)) (done <-chan struct{}, stop func())]
 
 // GetReport gets a report. The 'opts' argument is optional and can be nil.
 // Callers are discouraged from passing a ctx with an arbitrary deadline as this
@@ -790,6 +830,13 @@ func (c *Client) SetForcePreferredDERP(region int) {
 //
 // It may not be called concurrently with itself.
 func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap, opts *GetReportOpts) (_ *Report, reterr error) {
+	onlySTUN := false
+	if opts != nil && opts.OnlySTUN {
+		if opts.OnlyTCP443 {
+			return nil, errors.New("netcheck: only one of OnlySTUN or OnlyTCP443 may be set in opts")
+		}
+		onlySTUN = true
+	}
 	defer func() {
 		if reterr != nil {
 			metricNumGetReportError.Add(1)
@@ -832,13 +879,13 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap, opts *GetRe
 	// in captive portal detection and DERP flapping suppression. Ideally this would
 	// be the current active home DERP rather than the last report preferred DERP,
 	// but only the latter is presently available.
-	var preferredDERP int
+	var preferredDERP tailcfg.DERPRegionID
 	if last != nil {
 		preferredDERP = last.PreferredDERP
 	}
 
 	doFull := false
-	if c.nextFull || now.Sub(c.lastFull) > 5*time.Minute {
+	if c.nextFull || now.Sub(c.lastFull) > fullReportInterval {
 		doFull = true
 	}
 	// If the last report had a captive portal and reported no UDP access,
@@ -865,6 +912,9 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap, opts *GetRe
 	}()
 
 	if runtime.GOOS == "js" || runtime.GOOS == "tamago" || (runtime.GOOS == "plan9" && hostinfo.IsInVM86()) {
+		if onlySTUN {
+			return nil, errors.New("platform is restricted to HTTP, but OnlySTUN is set in opts")
+		}
 		if err := c.runHTTPOnlyChecks(ctx, last, rs, dm); err != nil {
 			return nil, err
 		}
@@ -896,37 +946,11 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap, opts *GetRe
 	// it's unnecessary.
 	captivePortalDone := syncs.ClosedChan()
 	captivePortalStop := func() {}
-	if !rs.incremental {
-		// NOTE(andrew): we can't simply add this goroutine to the
-		// `NewWaitGroupChan` below, since we don't wait for that
-		// waitgroup to finish when exiting this function and thus get
-		// a data race.
-		ch := make(chan struct{})
-		captivePortalDone = ch
-
-		tmr := time.AfterFunc(c.captivePortalDelay(), func() {
-			defer close(ch)
-			d := captivedetection.NewDetector(c.logf)
-			found := d.Detect(ctx, c.NetMon, dm, preferredDERP)
-			rs.report.CaptivePortal.Set(found)
-		})
-
-		captivePortalStop = func() {
-			// Don't cancel our captive portal check if we're
-			// explicitly doing a verbose netcheck.
-			if c.Verbose {
-				return
-			}
-
-			if tmr.Stop() {
-				// Stopped successfully; need to close the
-				// signal channel ourselves.
-				close(ch)
-				return
-			}
-
-			// Did not stop; do nothing and it'll finish by itself
-			// and close the signal channel.
+	if buildfeatures.HasCaptivePortal && !rs.incremental && !onlySTUN {
+		if start, ok := HookStartCaptivePortalDetection.GetOk(); ok {
+			captivePortalDone, captivePortalStop = start(ctx, c, dm, preferredDERP, func(found bool) {
+				rs.report.CaptivePortal.Set(found)
+			})
 		}
 	}
 
@@ -970,13 +994,13 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap, opts *GetRe
 	rs.stopTimers()
 
 	// Try HTTPS and ICMP latency check if all STUN probes failed due to
-	// UDP presumably being blocked.
+	// UDP presumably being blocked, and we are not constrained to only STUN.
 	// TODO: this should be moved into the probePlan, using probeProto probeHTTPS.
-	if !rs.anyUDP() && ctx.Err() == nil {
+	if !rs.anyUDP() && ctx.Err() == nil && !onlySTUN {
 		var wg sync.WaitGroup
 		var need []*tailcfg.DERPRegion
 		for rid, reg := range dm.Regions {
-			if !rs.haveRegionLatency(rid) && regionHasDERPNode(reg) {
+			if !rs.haveRegionLatency(tailcfg.DERPRegionID(rid)) && regionHasDERPNode(reg) && !reg.Avoid && !reg.NoMeasureNoHome {
 				need = append(need, reg)
 			}
 		}
@@ -987,13 +1011,11 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap, opts *GetRe
 				// need to close the underlying Pinger after a timeout
 				// or when all ICMP probes are done, regardless of
 				// whether the HTTPS probes have finished.
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
+				wg.Go(func() {
 					if err := c.measureAllICMPLatency(ctx, rs, need); err != nil {
 						c.logf("[v1] measureAllICMPLatency: %v", err)
 					}
-				}()
+				})
 			}
 			wg.Add(len(need))
 			c.logf("netcheck: UDP is blocked, trying HTTPS")
@@ -1005,9 +1027,9 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap, opts *GetRe
 					c.logf("[v1] netcheck: measuring HTTPS latency of %v (%d): %v", reg.RegionCode, reg.RegionID, err)
 				} else {
 					rs.mu.Lock()
-					if l, ok := rs.report.RegionLatency[reg.RegionID]; !ok {
+					if latency, ok := rs.report.RegionLatency[reg.RegionID]; !ok {
 						mak.Set(&rs.report.RegionLatency, reg.RegionID, d)
-					} else if l >= d {
+					} else if latency >= d {
 						rs.report.RegionLatency[reg.RegionID] = d
 					}
 					// We set these IPv4 and IPv6 but they're not really used
@@ -1039,7 +1061,7 @@ func (c *Client) finishAndStoreReport(rs *reportState, dm *tailcfg.DERPMap) *Rep
 	report := rs.report.Clone()
 	rs.mu.Unlock()
 
-	c.addReportHistoryAndSetPreferredDERP(rs, report, dm.View())
+	c.addReportHistoryAndSetPreferredDERP(rs, report, dm.View(), c.timeNow())
 	c.logConciseReport(report, dm)
 
 	return report
@@ -1084,10 +1106,7 @@ func (c *Client) runHTTPOnlyChecks(ctx context.Context, last *Report, rs *report
 		if len(rg.Nodes) == 0 {
 			continue
 		}
-		wg.Add(1)
-		rg := rg
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			node := rg.Nodes[0]
 			req, _ := http.NewRequestWithContext(ctx, "HEAD", "https://"+node.HostName+"/derp/probe", nil)
 			// One warm-up one to get HTTP connection set
@@ -1112,7 +1131,7 @@ func (c *Client) runHTTPOnlyChecks(ctx context.Context, last *Report, rs *report
 			}
 			d := c.timeNow().Sub(t0)
 			rs.addNodeLatency(node, netip.AddrPort{}, d)
-		}()
+		})
 	}
 	wg.Wait()
 	return nil
@@ -1227,9 +1246,9 @@ func (c *Client) measureAllICMPLatency(ctx context.Context, rs *reportState, nee
 			} else if ok {
 				c.logf("[v1] ICMP latency of %v (%d): %v", reg.RegionCode, reg.RegionID, d)
 				rs.mu.Lock()
-				if l, ok := rs.report.RegionLatency[reg.RegionID]; !ok {
+				if latency, ok := rs.report.RegionLatency[reg.RegionID]; !ok {
 					mak.Set(&rs.report.RegionLatency, reg.RegionID, d)
-				} else if l >= d {
+				} else if latency >= d {
 					rs.report.RegionLatency[reg.RegionID] = d
 				}
 
@@ -1345,6 +1364,12 @@ func (c *Client) timeNow() time.Time {
 }
 
 const (
+	// fullReportInterval is the maximum time between full netcheck reports.
+	// Once this long has elapsed since the last full report, the next GetReport
+	// re-probes every DERP region rather than only the home and fastest regions
+	// (see GetReport). It also informs retention window for report history
+	// (c.prev).
+	fullReportInterval = 5 * time.Minute
 	// preferredDERPAbsoluteDiff specifies the minimum absolute difference
 	// in latencies between two DERP regions that would cause a node to
 	// switch its PreferredDERP ("home DERP"). This ensures that if a node
@@ -1358,46 +1383,56 @@ const (
 	// even without receiving a STUN response.
 	// Note: must remain higher than the derp package frameReceiveRecordRate
 	PreferredDERPFrameTime = 8 * time.Second
+	// PreferredDERPKeepAliveTimeout is 2x the DERP Keep Alive timeout. If there
+	// is no latency data to make judgements from, but we have heard from our
+	// current DERP region inside of 2x the KeepAlive window, don't switch DERP
+	// regions yet, keep the current region. This prevents region flapping /
+	// home DERP removal during short periods of packet loss where the DERP TCP
+	// connection may itself naturally recover.
+	// TODO(raggi): expose shared time bounds from the DERP package rather than
+	// duplicating them here.
+	PreferredDERPKeepAliveTimeout = 2 * derp.KeepAlive
 )
 
-// addReportHistoryAndSetPreferredDERP adds r to the set of recent Reports
-// and mutates r.PreferredDERP to contain the best recent one.
-func (c *Client) addReportHistoryAndSetPreferredDERP(rs *reportState, r *Report, dm tailcfg.DERPMapView) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	var prevDERP int
-	if c.last != nil {
-		prevDERP = c.last.PreferredDERP
-	}
+// addReportAndPruneExpired adds r to the set of recent Reports, and drops
+// reports that are outside of the retention window.
+func (c *Client) addReportAndPruneExpired(now time.Time, r *Report) {
 	if c.prev == nil {
 		c.prev = map[time.Time]*Report{}
 	}
-	now := c.timeNow()
 	r.Now = now.UTC()
 	c.prev[now] = r
 	c.last = r
 
-	const maxAge = 5 * time.Minute
-
-	// region ID => its best recent latency in last maxAge
-	bestRecent := map[int]time.Duration{}
-
-	for t, pr := range c.prev {
+	// maxAge is the retention window for report history, based on fullReportInterval
+	// to make sure that at least one full report is always retained.
+	const maxAge = fullReportInterval + ReportTimeout
+	for t := range c.prev {
 		if now.Sub(t) > maxAge {
 			delete(c.prev, t)
-			continue
-		}
-		for regionID, d := range pr.RegionLatency {
-			if bd, ok := bestRecent[regionID]; !ok || d < bd {
-				bestRecent[regionID] = d
-			}
 		}
 	}
+}
+
+// addReportHistoryAndSetPreferredDERP adds r to the set of recent Reports
+// and mutates r.PreferredDERP to contain the best recent one.
+func (c *Client) addReportHistoryAndSetPreferredDERP(rs *reportState, r *Report, dm tailcfg.DERPMapView, now time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var prevDERP tailcfg.DERPRegionID
+	if c.last != nil {
+		prevDERP = c.last.PreferredDERP
+	}
+
+	// Add report to history, enforce retention window, then take the best (lowest)
+	// latency seen per region across what remains.
+	c.addReportAndPruneExpired(now, r)
+	bestRecent := c.bestRecentLatencyLocked()
 
 	// Scale each region's best latency by any provided scores from the
 	// DERPMap, for use in comparison below.
-	var scores views.Map[int, float64]
+	var scores views.Map[tailcfg.DERPRegionID, float64]
 	if hp := dm.HomeParams(); hp.Valid() {
 		scores = hp.RegionScore()
 	}
@@ -1442,13 +1477,10 @@ func (c *Client) addReportHistoryAndSetPreferredDERP(rs *reportState, r *Report,
 	// the STUN probe) since we started the netcheck, or in the past 2s, as
 	// another signal for "this region is still working".
 	heardFromOldRegionRecently := false
+	prevRegionLastHeard := rs.opts.getLastDERPActivity(prevDERP)
 	if changingPreferred {
-		if lastHeard := rs.opts.getLastDERPActivity(prevDERP); !lastHeard.IsZero() {
-			now := c.timeNow()
-
-			heardFromOldRegionRecently = lastHeard.After(rs.start)
-			heardFromOldRegionRecently = heardFromOldRegionRecently || lastHeard.After(now.Add(-PreferredDERPFrameTime))
-		}
+		heardFromOldRegionRecently = prevRegionLastHeard.After(rs.start)
+		heardFromOldRegionRecently = heardFromOldRegionRecently || prevRegionLastHeard.After(now.Add(-PreferredDERPFrameTime))
 	}
 
 	// The old region is accessible if we've heard from it via a non-STUN
@@ -1475,20 +1507,55 @@ func (c *Client) addReportHistoryAndSetPreferredDERP(rs *reportState, r *Report,
 		// If the forced DERP region probed successfully, or has recent traffic,
 		// use it.
 		_, haveLatencySample := r.RegionLatency[c.ForcePreferredDERP]
-		var recentActivity bool
-		if lastHeard := rs.opts.getLastDERPActivity(c.ForcePreferredDERP); !lastHeard.IsZero() {
-			now := c.timeNow()
-			recentActivity = lastHeard.After(rs.start)
-			recentActivity = recentActivity || lastHeard.After(now.Add(-PreferredDERPFrameTime))
-		}
+		lastHeard := rs.opts.getLastDERPActivity(c.ForcePreferredDERP)
+		recentActivity := lastHeard.After(rs.start)
+		recentActivity = recentActivity || lastHeard.After(now.Add(-PreferredDERPFrameTime))
 
 		if haveLatencySample || recentActivity {
 			r.PreferredDERP = c.ForcePreferredDERP
 		}
 	}
+	// If there was no latency data to make judgements on, but there is an
+	// active DERP connection that has at least been doing KeepAlive recently,
+	// keep it, rather than dropping it.
+	if r.PreferredDERP == 0 && prevRegionLastHeard.After(now.Add(-PreferredDERPKeepAliveTimeout)) {
+		r.PreferredDERP = prevDERP
+	}
 }
 
-func updateLatency(m map[int]time.Duration, regionID int, d time.Duration) {
+// bestRecentLatencyLocked returns the lowest latency seen per DERP region across
+// the reports currently retained in history (c.prev), keyed by region ID. These
+// latencies are used for determining preferred DERP and suggesting an exit node.
+func (c *Client) bestRecentLatencyLocked() map[tailcfg.DERPRegionID]time.Duration {
+	best := make(map[tailcfg.DERPRegionID]time.Duration)
+	for _, pr := range c.prev {
+		for regionID, d := range pr.RegionLatency {
+			if bd, ok := best[regionID]; !ok || d < bd {
+				best[regionID] = d
+			}
+		}
+	}
+	return best
+}
+
+// RecentRegionLatency returns the lowest latency seen per DERP region over the
+// recent history window, keyed by region ID.
+func (c *Client) RecentRegionLatency() map[tailcfg.DERPRegionID]time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.bestRecentLatencyLocked()
+}
+
+// AddReportHistoryForTest records r in the client's recent-report history
+// (prev/last) as if GetReport had produced it at time now, and recomputes
+// r.PreferredDERP from that history.
+func (c *Client) AddReportHistoryForTest(dm *tailcfg.DERPMap, r *Report, now time.Time) {
+	testenv.AssertInTest()
+	rs := &reportState{c: c, start: now}
+	c.addReportHistoryAndSetPreferredDERP(rs, r, dm.View(), now)
+}
+
+func updateLatency(m map[tailcfg.DERPRegionID]time.Duration, regionID tailcfg.DERPRegionID, d time.Duration) {
 	if prev, ok := m[regionID]; !ok || d < prev {
 		m[regionID] = d
 	}
@@ -1688,7 +1755,7 @@ func regionHasDERPNode(r *tailcfg.DERPRegion) bool {
 	return false
 }
 
-func maxDurationValue(m map[int]time.Duration) (max time.Duration) {
+func maxDurationValue(m map[tailcfg.DERPRegionID]time.Duration) (max time.Duration) {
 	for _, v := range m {
 		if v > max {
 			max = v

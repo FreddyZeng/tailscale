@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // This file contains the code for the incubator process.  Tailscaled
@@ -35,13 +35,13 @@ import (
 
 	"github.com/creack/pty"
 	"github.com/pkg/sftp"
+	gliderssh "github.com/tailscale/gliderssh"
 	"github.com/u-root/u-root/pkg/termios"
-	gossh "golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh"
 	"golang.org/x/sys/unix"
 	"tailscale.com/cmd/tailscaled/childproc"
 	"tailscale.com/hostinfo"
-	"tailscale.com/tailcfg"
-	"tailscale.com/tempfork/gliderlabs/ssh"
+	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/types/logger"
 	"tailscale.com/version/distro"
 )
@@ -51,6 +51,7 @@ const (
 	darwin  = "darwin"
 	freebsd = "freebsd"
 	openbsd = "openbsd"
+	windows = "windows"
 )
 
 func init() {
@@ -73,6 +74,9 @@ var maybeStartLoginSession = func(dlogf logger.Logf, ia incubatorArgs) (close fu
 	return nil
 }
 
+// truePaths are the common locations to find the true binary, in likelihood order.
+var truePaths = [...]string{"/usr/bin/true", "/bin/true"}
+
 // tryExecInDir tries to run a command in dir and returns nil if it succeeds.
 // Otherwise, it returns a filesystem error or a timeout error if the command
 // took too long.
@@ -80,20 +84,26 @@ func tryExecInDir(ctx context.Context, dir string) error {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	// Assume that the following executables exist, are executable, and
-	// immediately return.
-	var name string
-	switch runtime.GOOS {
-	case "windows":
-		windir := os.Getenv("windir")
-		name = filepath.Join(windir, "system32", "doskey.exe")
-	default:
-		name = "/bin/true"
+	run := func(path string) error {
+		cmd := exec.CommandContext(ctx, path)
+		cmd.Dir = dir
+		return cmd.Run()
 	}
 
-	cmd := exec.CommandContext(ctx, name)
-	cmd.Dir = dir
-	return cmd.Run()
+	// Assume that the following executables exist, are executable, and
+	// immediately return.
+	if runtime.GOOS == windows {
+		windir := os.Getenv("windir")
+		return run(filepath.Join(windir, "system32", "doskey.exe"))
+	}
+	// Execute the first "true" we find in the list.
+	for _, path := range truePaths {
+		// Note: LookPath does not consult $PATH when passed multi-label paths.
+		if p, err := exec.LookPath(path); err == nil {
+			return run(p)
+		}
+	}
+	return exec.ErrNotFound
 }
 
 // newIncubatorCommand returns a new exec.Cmd configured with
@@ -104,10 +114,16 @@ func tryExecInDir(ctx context.Context, dir string) error {
 // behavior of SSHD when by falling back to the root directory if it cannot run
 // a command in the user’s home directory.
 //
-// The returned Cmd.Env is guaranteed to be nil; the caller populates it.
-func (ss *sshSession) newIncubatorCommand(logf logger.Logf) (cmd *exec.Cmd, err error) {
+// It also returns forwardedEnv, the set of client-forwarded "KEY=VALUE"
+// environment variables accepted by the acceptEnv policy. These may contain
+// secrets, so the caller passes them to the child via an inherited file rather
+// than the command line or environment, where they could leak, or influence
+// the privileged child.
+//
+// The returned Cmd.Env is guaranteed to be nil; the caller must populate it.
+func (ss *sshSession) newIncubatorCommand(logf logger.Logf) (cmd *exec.Cmd, forwardedEnv []string, err error) {
 	defer func() {
-		if cmd.Env != nil {
+		if cmd != nil && cmd.Env != nil {
 			panic("internal error")
 		}
 	}()
@@ -126,7 +142,7 @@ func (ss *sshSession) newIncubatorCommand(logf logger.Logf) (cmd *exec.Cmd, err 
 		if isSFTP {
 			// SFTP relies on the embedded Go-based SFTP server in tailscaled,
 			// so without tailscaled, we can't serve SFTP.
-			return nil, errors.New("no tailscaled found on path, can't serve SFTP")
+			return nil, nil, errors.New("no tailscaled found on path, can't serve SFTP")
 		}
 
 		loginShell := ss.conn.localUser.LoginShell()
@@ -148,19 +164,18 @@ func (ss *sshSession) newIncubatorCommand(logf logger.Logf) (cmd *exec.Cmd, err 
 			cmd.Dir = "/"
 		case errors.Is(err, fs.ErrPermission) || errors.Is(err, fs.ErrNotExist):
 			// Ensure that cmd.Dir is the source of the error.
-			var pathErr *fs.PathError
-			if errors.As(err, &pathErr) && pathErr.Path == cmd.Dir {
+			if pathErr, ok := errors.AsType[*fs.PathError](err); ok && pathErr.Path == cmd.Dir {
 				// If we cannot run loginShell in localUser.HomeDir,
 				// we will try to run this command in the root directory.
 				cmd.Dir = "/"
 			} else {
-				return nil, err
+				return nil, nil, err
 			}
 		case err != nil:
-			return nil, err
+			return nil, nil, err
 		}
 
-		return cmd, nil
+		return cmd, nil, nil
 	}
 
 	lu := ss.conn.localUser
@@ -193,8 +208,8 @@ func (ss *sshSession) newIncubatorCommand(logf logger.Logf) (cmd *exec.Cmd, err 
 		incubatorArgs = append(incubatorArgs, "--is-selinux-enforcing")
 	}
 
-	nm := ss.conn.srv.lb.NetMap()
-	forceV1Behavior := nm.HasCap(tailcfg.NodeAttrSSHBehaviorV1) && !nm.HasCap(tailcfg.NodeAttrSSHBehaviorV2)
+	nm := ss.conn.srv.lb.NetMapNoPeers()
+	forceV1Behavior := nm.HasCap(nodecap.SSHBehaviorV1) && !nm.HasCap(nodecap.SSHBehaviorV2)
 	if forceV1Behavior {
 		incubatorArgs = append(incubatorArgs, "--force-v1-behavior")
 	}
@@ -218,30 +233,31 @@ func (ss *sshSession) newIncubatorCommand(logf logger.Logf) (cmd *exec.Cmd, err 
 		incubatorArgs = append(incubatorArgs, "--cmd="+ss.RawCommand())
 	}
 
-	allowSendEnv := nm.HasCap(tailcfg.NodeAttrSSHEnvironmentVariables)
+	allowSendEnv := nm.HasCap(nodecap.SSHEnvironmentVariables)
 	if allowSendEnv {
 		env, err := filterEnv(ss.conn.acceptEnv, ss.Session.Environ())
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 
 		if len(env) > 0 {
-			encoded, err := json.Marshal(env)
-			if err != nil {
-				return nil, fmt.Errorf("failed to encode environment: %w", err)
-			}
-			incubatorArgs = append(incubatorArgs, fmt.Sprintf("--encoded-env=%q", encoded))
+			// The accepted environment may contain secrets, so it is communicated through a fd
+			// created by the caller, never the argv or the child's environment.
+			incubatorArgs = append(incubatorArgs, fmt.Sprintf("--env-fd=%d", forwardedEnvChildFD))
+			forwardedEnv = env
 		}
 	}
 
 	cmd = exec.CommandContext(ss.ctx, ss.conn.srv.tailscaledPath, incubatorArgs...)
 	// The incubator will chdir into the home directory after it drops privileges.
 	cmd.Dir = "/"
-	return cmd, nil
+	return cmd, forwardedEnv, nil
 }
 
-var debugIncubator bool
-var debugTest atomic.Bool
+var (
+	debugIncubator bool
+	debugTest      atomic.Bool
+)
 
 type stdRWC struct{}
 
@@ -275,7 +291,15 @@ type incubatorArgs struct {
 	forceV1Behavior    bool
 	debugTest          bool
 	isSELinuxEnforcing bool
-	encodedEnv         string
+	// Deprecated: encodedEnv is deprecated and must not be used by new code.
+	// It is parsed only so this child keeps working when exec'd by an
+	// outdated parent tailscaled that still passes it.
+	encodedEnv string
+	// envFD is the file descriptor to read the forwarded environment from
+	// (a JSON array of KEY=VALUE pairs), or -1 if none.
+	envFD int
+	// forwardedEnv holds the pairs loaded by loadForwardedEnv.
+	forwardedEnv []string
 }
 
 func parseIncubatorArgs(args []string) (incubatorArgs, error) {
@@ -299,10 +323,12 @@ func parseIncubatorArgs(args []string) (incubatorArgs, error) {
 	flags.BoolVar(&ia.forceV1Behavior, "force-v1-behavior", false, "allow falling back to the su command if login is unavailable")
 	flags.BoolVar(&ia.debugTest, "debug-test", false, "should debug in test mode")
 	flags.BoolVar(&ia.isSELinuxEnforcing, "is-selinux-enforcing", false, "whether SELinux is in enforcing mode")
-	flags.StringVar(&ia.encodedEnv, "encoded-env", "", "JSON encoded array of environment variables in '['key=value']' format")
+	// DEPRECATED: retained for version-skew compatibility only. DO NOT USE.
+	flags.StringVar(&ia.encodedEnv, "encoded-env", "", "deprecated; do not use")
+	flags.IntVar(&ia.envFD, "env-fd", -1, "file descriptor to read the forwarded environment from (JSON array of KEY=VALUE pairs)")
 	flags.Parse(args)
 
-	for _, g := range strings.Split(groups, ",") {
+	for g := range strings.SplitSeq(groups, ",") {
 		gid, err := strconv.Atoi(g)
 		if err != nil {
 			return ia, fmt.Errorf("unable to parse group id %q: %w", g, err)
@@ -310,47 +336,62 @@ func parseIncubatorArgs(args []string) (incubatorArgs, error) {
 		ia.gids = append(ia.gids, gid)
 	}
 
+	// envFD comes from an ExtraFiles entry, so it must never name stdin/out/err
+	if ia.envFD >= 0 && ia.envFD < 3 {
+		return ia, fmt.Errorf("invalid --env-fd %d: must be >= 3", ia.envFD)
+	}
+
 	return ia, nil
 }
 
-// forwardedEnviron returns the concatenation of the current environment with
-// any environment variables specified in ia.encodedEnv.
-//
-// It also returns allowedExtraKeys, containing the env keys that were passed in
-// to ia.encodedEnv.
-func (ia incubatorArgs) forwardedEnviron() (env, allowedExtraKeys []string, err error) {
-	environ := os.Environ()
-
-	// pass through SSH_AUTH_SOCK environment variable to support ssh agent forwarding
-	// TODO(bradfitz,percy): why is this listed specially? If the parent wanted to included
-	// it, couldn't it have just passed it to the incubator in encodedEnv?
-	// If it didn't, no reason for us to pass it to "su -w ..." if it's not in our env
-	// anyway? (Surely we don't want to inherit the tailscaled parent SSH_AUTH_SOCK, if any)
-	allowedExtraKeys = []string{"SSH_AUTH_SOCK"}
-
-	if ia.encodedEnv != "" {
-		unquoted, err := strconv.Unquote(ia.encodedEnv)
-		if err != nil {
-			return nil, nil, fmt.Errorf("unable to parse encodedEnv %q: %w", ia.encodedEnv, err)
+// loadForwardedEnv reads the client-forwarded environment pairs into ia.forwardedEnv, from the
+// inherited file named by --env-fd. The pairs only enter the su/login/shell environment,
+// never this process's own environment.
+func (ia *incubatorArgs) loadForwardedEnv() error {
+	var pairs []string
+	switch {
+	case ia.envFD >= 0:
+		if ia.envFD < 3 {
+			return fmt.Errorf("invalid --env-fd=%d: must be >= 3", ia.envFD)
 		}
-
-		var extraEnviron []string
-
-		err = json.Unmarshal([]byte(unquoted), &extraEnviron)
-		if err != nil {
-			return nil, nil, fmt.Errorf("unable to parse encodedEnv %q: %w", ia.encodedEnv, err)
+		f := os.NewFile(uintptr(ia.envFD), "forwarded-env")
+		defer f.Close()
+		if err := json.NewDecoder(f).Decode(&pairs); err != nil {
+			return fmt.Errorf("unable to read forwarded environment: %w", err)
 		}
-
-		environ = append(environ, extraEnviron...)
-
-		for _, kv := range extraEnviron {
-			if k, _, ok := strings.Cut(kv, "="); ok {
-				allowedExtraKeys = append(allowedExtraKeys, k)
-			}
+	case ia.encodedEnv != "": // Legacy path to support an outdated parent tailscaled
+		if unquoted, err := strconv.Unquote(ia.encodedEnv); err != nil {
+			return fmt.Errorf("unable to parse encodedEnv %q: %w", ia.encodedEnv, err)
+		} else if err := json.Unmarshal([]byte(unquoted), &pairs); err != nil {
+			return fmt.Errorf("unable to parse encodedEnv %q: %w", ia.encodedEnv, err)
 		}
 	}
+	// Enforce "su -w" integrity child-side: old parents may not have filtered these
+	pairs = slices.DeleteFunc(pairs, func(kv string) bool {
+		k, _, ok := strings.Cut(kv, "=")
+		return !ok || forbiddenEnvKey(k) || strings.Contains(kv, "\x00")
+	})
+	ia.forwardedEnv = pairs
+	return nil
+}
 
-	return environ, allowedExtraKeys, nil
+// forwardedEnviron returns the environment to hand to the user's process. This includes the
+// current environment plus the client-forwarded pairs. It also returns allowedExtraKeys for
+// the "su -w" allowlist, the forwarded key names, plus SSH_AUTH_SOCK.
+func (ia *incubatorArgs) forwardedEnviron() (env, allowedExtraKeys []string) {
+	// SSH_AUTH_SOCK is allowlisted here rather than forwarded because old
+	// parents set it without forwarding any keys. It can only be present if
+	// the parent enabled agent forwarding: the child's environment is built
+	// by incubatorEnv, never from the parent's os.Environ.
+	allowedExtraKeys = []string{"SSH_AUTH_SOCK"}
+
+	env = append(os.Environ(), ia.forwardedEnv...)
+	for _, kv := range ia.forwardedEnv {
+		if k, _, ok := strings.Cut(kv, "="); ok {
+			allowedExtraKeys = append(allowedExtraKeys, k)
+		}
+	}
+	return env, allowedExtraKeys
 }
 
 // beIncubator is the entrypoint to the `tailscaled be-child ssh` subcommand.
@@ -374,6 +415,13 @@ func beIncubator(args []string) error {
 	if err != nil {
 		return err
 	}
+	if ia.encodedEnv != "" {
+		log.Printf("WARNING: tailscaled be-child: accepted SSH environment variables were passed via the deprecated --encoded-env flag; " +
+			"the running tailscaled is outdated. Update tailscaled to the latest version and restart for the latest security fixes.")
+	}
+	if err := ia.loadForwardedEnv(); err != nil {
+		return err
+	}
 	if ia.isSFTP && ia.isShell {
 		return fmt.Errorf("--sftp and --shell are mutually exclusive")
 	}
@@ -386,7 +434,7 @@ func beIncubator(args []string) error {
 		}
 	} else if ia.debugTest {
 		// In testing, we don't always have syslog, so log to a temp file.
-		if logFile, err := os.OpenFile("/tmp/tailscalessh.log", os.O_APPEND|os.O_WRONLY, 0666); err == nil {
+		if logFile, err := os.OpenFile("/tmp/tailscalessh.log", os.O_APPEND|os.O_WRONLY, 0o666); err == nil {
 			lf := log.New(logFile, "", 0)
 			dlogf = func(msg string, args ...any) {
 				lf.Printf(msg, args...)
@@ -530,10 +578,7 @@ func tryExecLogin(dlogf logger.Logf, ia incubatorArgs) error {
 	loginArgs := ia.loginArgs(loginCmdPath)
 	dlogf("logging in with %+v", loginArgs)
 
-	environ, _, err := ia.forwardedEnviron()
-	if err != nil {
-		return err
-	}
+	environ, _ := ia.forwardedEnviron()
 
 	// If Exec works, the Go code will not proceed past this:
 	err = unix.Exec(loginCmdPath, loginArgs, environ)
@@ -569,10 +614,7 @@ func trySU(dlogf logger.Logf, ia incubatorArgs) (handled bool, err error) {
 		defer sessionCloser()
 	}
 
-	environ, allowListEnvKeys, err := ia.forwardedEnviron()
-	if err != nil {
-		return false, err
-	}
+	environ, allowListEnvKeys := ia.forwardedEnviron()
 
 	loginArgs := []string{
 		su,
@@ -617,10 +659,7 @@ func findSU(dlogf logger.Logf, ia incubatorArgs) string {
 		return ""
 	}
 
-	_, allowListEnvKeys, err := ia.forwardedEnviron()
-	if err != nil {
-		return ""
-	}
+	_, allowListEnvKeys := ia.forwardedEnviron()
 
 	// First try to execute su -w <allow listed env> -l <user> -c true
 	// to make sure su supports the necessary arguments.
@@ -653,15 +692,12 @@ func handleSSHInProcess(dlogf logger.Logf, ia incubatorArgs) error {
 		return err
 	}
 
-	environ, _, err := ia.forwardedEnviron()
-	if err != nil {
-		return err
-	}
+	environ, _ := ia.forwardedEnviron()
 
 	args := shellArgs(ia.isShell, ia.cmd)
 	dlogf("running %s %q", ia.loginShell, args)
 	cmd := newCommand(ia.hasTTY, ia.loginShell, environ, args)
-	err = cmd.Run()
+	err := cmd.Run()
 	if ee, ok := err.(*exec.ExitError); ok {
 		ps := ee.ProcessState
 		code := ps.ExitCode()
@@ -823,6 +859,32 @@ func doDropPrivileges(dlogf logger.Logf, wantUid, wantGid int, supplementaryGrou
 	return nil
 }
 
+// incubatorEnv builds the environment (cmd.Env) for the incubator child:
+// the user's login environment, the client's TERM/LANG/LC_* (matching
+// OpenSSH's default AcceptEnv), the connection metadata, and the optional
+// agent socket. acceptEnv-forwarded variables are not included; they travel
+// via an inherited file instead (see forwardedEnvFile).
+func (ss *sshSession) incubatorEnv() []string {
+	env := envForUser(ss.conn.localUser)
+	for _, kv := range ss.Environ() {
+		if acceptEnvPair(kv) {
+			env = append(env, kv)
+		}
+	}
+
+	ci := ss.conn.info
+	env = append(env,
+		fmt.Sprintf("SSH_CLIENT=%s %d %d", ci.src.Addr(), ci.src.Port(), ci.dst.Port()),
+		fmt.Sprintf("SSH_CONNECTION=%s %d %s %d", ci.src.Addr(), ci.src.Port(), ci.dst.Addr(), ci.dst.Port()),
+	)
+
+	if ss.agentListener != nil {
+		env = append(env, fmt.Sprintf("SSH_AUTH_SOCK=%s", ss.agentListener.Addr()))
+	}
+
+	return env
+}
+
 // launchProcess launches an incubator process for the provided session.
 // It is responsible for configuring the process execution environment.
 // The caller can wait for the process to exit by calling cmd.Wait().
@@ -830,27 +892,25 @@ func doDropPrivileges(dlogf logger.Logf, wantUid, wantGid int, supplementaryGrou
 // It sets ss.cmd, stdin, stdout, and stderr.
 func (ss *sshSession) launchProcess() error {
 	var err error
-	ss.cmd, err = ss.newIncubatorCommand(ss.logf)
+	var forwardedEnv []string
+	ss.cmd, forwardedEnv, err = ss.newIncubatorCommand(ss.logf)
 	if err != nil {
 		return err
 	}
 
 	cmd := ss.cmd
-	cmd.Env = envForUser(ss.conn.localUser)
-	for _, kv := range ss.Environ() {
-		if acceptEnvPair(kv) {
-			cmd.Env = append(cmd.Env, kv)
+	cmd.Env = ss.incubatorEnv()
+
+	if len(forwardedEnv) > 0 {
+		// The accepted environment may contain secrets, so it is passed to the child via an
+		// inherited file, never the argv or the environment. Closing after Start is safe: the
+		// child has its own copy by then.
+		envFile, err := forwardedEnvFile(forwardedEnv)
+		if err != nil {
+			return err
 		}
-	}
-
-	ci := ss.conn.info
-	cmd.Env = append(cmd.Env,
-		fmt.Sprintf("SSH_CLIENT=%s %d %d", ci.src.Addr(), ci.src.Port(), ci.dst.Port()),
-		fmt.Sprintf("SSH_CONNECTION=%s %d %s %d", ci.src.Addr(), ci.src.Port(), ci.dst.Addr(), ci.dst.Port()),
-	)
-
-	if ss.agentListener != nil {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("SSH_AUTH_SOCK=%s", ss.agentListener.Addr()))
+		defer envFile.Close()
+		cmd.ExtraFiles = []*os.File{envFile}
 	}
 
 	ptyReq, winCh, isPty := ss.Pty()
@@ -888,7 +948,7 @@ func (ss *sshSession) launchProcess() error {
 	return nil
 }
 
-func resizeWindow(fd int, winCh <-chan ssh.Window) {
+func resizeWindow(fd int, winCh <-chan gliderssh.Window) {
 	for win := range winCh {
 		unix.IoctlSetWinsize(fd, syscall.TIOCSWINSZ, &unix.Winsize{
 			Row:    uint16(win.Height),
@@ -903,62 +963,62 @@ func resizeWindow(fd int, winCh <-chan ssh.Window) {
 // to mnemonic names expected by the termios package.
 // These are meant to be platform independent.
 var opcodeShortName = map[uint8]string{
-	gossh.VINTR:         "intr",
-	gossh.VQUIT:         "quit",
-	gossh.VERASE:        "erase",
-	gossh.VKILL:         "kill",
-	gossh.VEOF:          "eof",
-	gossh.VEOL:          "eol",
-	gossh.VEOL2:         "eol2",
-	gossh.VSTART:        "start",
-	gossh.VSTOP:         "stop",
-	gossh.VSUSP:         "susp",
-	gossh.VDSUSP:        "dsusp",
-	gossh.VREPRINT:      "rprnt",
-	gossh.VWERASE:       "werase",
-	gossh.VLNEXT:        "lnext",
-	gossh.VFLUSH:        "flush",
-	gossh.VSWTCH:        "swtch",
-	gossh.VSTATUS:       "status",
-	gossh.VDISCARD:      "discard",
-	gossh.IGNPAR:        "ignpar",
-	gossh.PARMRK:        "parmrk",
-	gossh.INPCK:         "inpck",
-	gossh.ISTRIP:        "istrip",
-	gossh.INLCR:         "inlcr",
-	gossh.IGNCR:         "igncr",
-	gossh.ICRNL:         "icrnl",
-	gossh.IUCLC:         "iuclc",
-	gossh.IXON:          "ixon",
-	gossh.IXANY:         "ixany",
-	gossh.IXOFF:         "ixoff",
-	gossh.IMAXBEL:       "imaxbel",
-	gossh.IUTF8:         "iutf8",
-	gossh.ISIG:          "isig",
-	gossh.ICANON:        "icanon",
-	gossh.XCASE:         "xcase",
-	gossh.ECHO:          "echo",
-	gossh.ECHOE:         "echoe",
-	gossh.ECHOK:         "echok",
-	gossh.ECHONL:        "echonl",
-	gossh.NOFLSH:        "noflsh",
-	gossh.TOSTOP:        "tostop",
-	gossh.IEXTEN:        "iexten",
-	gossh.ECHOCTL:       "echoctl",
-	gossh.ECHOKE:        "echoke",
-	gossh.PENDIN:        "pendin",
-	gossh.OPOST:         "opost",
-	gossh.OLCUC:         "olcuc",
-	gossh.ONLCR:         "onlcr",
-	gossh.OCRNL:         "ocrnl",
-	gossh.ONOCR:         "onocr",
-	gossh.ONLRET:        "onlret",
-	gossh.CS7:           "cs7",
-	gossh.CS8:           "cs8",
-	gossh.PARENB:        "parenb",
-	gossh.PARODD:        "parodd",
-	gossh.TTY_OP_ISPEED: "tty_op_ispeed",
-	gossh.TTY_OP_OSPEED: "tty_op_ospeed",
+	ssh.VINTR:         "intr",
+	ssh.VQUIT:         "quit",
+	ssh.VERASE:        "erase",
+	ssh.VKILL:         "kill",
+	ssh.VEOF:          "eof",
+	ssh.VEOL:          "eol",
+	ssh.VEOL2:         "eol2",
+	ssh.VSTART:        "start",
+	ssh.VSTOP:         "stop",
+	ssh.VSUSP:         "susp",
+	ssh.VDSUSP:        "dsusp",
+	ssh.VREPRINT:      "rprnt",
+	ssh.VWERASE:       "werase",
+	ssh.VLNEXT:        "lnext",
+	ssh.VFLUSH:        "flush",
+	ssh.VSWTCH:        "swtch",
+	ssh.VSTATUS:       "status",
+	ssh.VDISCARD:      "discard",
+	ssh.IGNPAR:        "ignpar",
+	ssh.PARMRK:        "parmrk",
+	ssh.INPCK:         "inpck",
+	ssh.ISTRIP:        "istrip",
+	ssh.INLCR:         "inlcr",
+	ssh.IGNCR:         "igncr",
+	ssh.ICRNL:         "icrnl",
+	ssh.IUCLC:         "iuclc",
+	ssh.IXON:          "ixon",
+	ssh.IXANY:         "ixany",
+	ssh.IXOFF:         "ixoff",
+	ssh.IMAXBEL:       "imaxbel",
+	ssh.IUTF8:         "iutf8",
+	ssh.ISIG:          "isig",
+	ssh.ICANON:        "icanon",
+	ssh.XCASE:         "xcase",
+	ssh.ECHO:          "echo",
+	ssh.ECHOE:         "echoe",
+	ssh.ECHOK:         "echok",
+	ssh.ECHONL:        "echonl",
+	ssh.NOFLSH:        "noflsh",
+	ssh.TOSTOP:        "tostop",
+	ssh.IEXTEN:        "iexten",
+	ssh.ECHOCTL:       "echoctl",
+	ssh.ECHOKE:        "echoke",
+	ssh.PENDIN:        "pendin",
+	ssh.OPOST:         "opost",
+	ssh.OLCUC:         "olcuc",
+	ssh.ONLCR:         "onlcr",
+	ssh.OCRNL:         "ocrnl",
+	ssh.ONOCR:         "onocr",
+	ssh.ONLRET:        "onlret",
+	ssh.CS7:           "cs7",
+	ssh.CS8:           "cs8",
+	ssh.PARENB:        "parenb",
+	ssh.PARODD:        "parodd",
+	ssh.TTY_OP_ISPEED: "tty_op_ispeed",
+	ssh.TTY_OP_OSPEED: "tty_op_ospeed",
 }
 
 // startWithPTY starts cmd with a pseudo-terminal attached to Stdin, Stdout and Stderr.
@@ -1002,11 +1062,11 @@ func (ss *sshSession) startWithPTY() (ptyFile, tty *os.File, err error) {
 		tios.Col = int(ptyReq.Window.Width)
 
 		for c, v := range ptyReq.Modes {
-			if c == gossh.TTY_OP_ISPEED {
+			if c == ssh.TTY_OP_ISPEED {
 				tios.Ispeed = int(v)
 				continue
 			}
-			if c == gossh.TTY_OP_OSPEED {
+			if c == ssh.TTY_OP_OSPEED {
 				tios.Ospeed = int(v)
 				continue
 			}
@@ -1114,7 +1174,7 @@ func updateStringInSlice(ss []string, a, b string) {
 // AcceptEnv.
 func acceptEnvPair(kv string) bool {
 	k, _, ok := strings.Cut(kv, "=")
-	if !ok {
+	if !ok || isDangerousEnvVar(k) || forbiddenEnvKey(k) {
 		return false
 	}
 	return k == "TERM" || k == "LANG" || strings.HasPrefix(k, "LC_")

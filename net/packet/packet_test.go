@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package packet
@@ -232,6 +232,165 @@ var udp6RequestDecode = Parsed{
 	Dst:       mustIPPort("[2607:f8b0:400a:809::200e]:443"),
 }
 
+// First fragment of a source-fragmented UDP datagram over IPv6.
+//
+// The base header's next-header is 44 (IPv6 Fragment extension header),
+// which carries the real upper-layer protocol (UDP) and the fragment
+// offset (0 here, with the More-Fragments flag set). Like decode4's
+// first-fragment handling, decode6 should reach past the 8-byte fragment
+// header and parse the transport ports.
+var udp6FirstFragmentBuffer = []byte{
+	// IPv6 header up to hop limit. Next header = 44 (Fragment), payload len = 24.
+	0x60, 0x00, 0x00, 0x00, 0x00, 0x18, 0x2c, 0x40,
+	// Src addr
+	0x20, 0x01, 0x05, 0x59, 0xbc, 0x13, 0x54, 0x00, 0x17, 0x49, 0x46, 0x28, 0x39, 0x34, 0x0e, 0x1b,
+	// Dst addr
+	0x26, 0x07, 0xf8, 0xb0, 0x40, 0x0a, 0x08, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x0e,
+	// Fragment extension header (8 bytes):
+	// NextHeader=UDP(0x11), Reserved, FragmentOffset=0 + M flag, Identification.
+	0x11, 0x00, 0x00, 0x01, 0xde, 0xad, 0xbe, 0xef,
+	// UDP header
+	0xd4, 0x04, 0x01, 0xbb, 0x00, 0x29, 0x96, 0x84,
+	// Payload (start of the datagram, carried by the first fragment)
+	0x5c, 0x06, 0xae, 0x85, 0x02, 0xf5, 0xdb, 0x90,
+}
+
+var udp6FirstFragmentDecode = Parsed{
+	b:       udp6FirstFragmentBuffer,
+	subofs:  48, // 40-byte IPv6 header + 8-byte fragment extension header
+	dataofs: 56, // subofs + 8-byte UDP header
+	length:  len(udp6FirstFragmentBuffer),
+
+	IPVersion: 6,
+	IPProto:   UDP,
+	Src:       mustIPPort("[2001:559:bc13:5400:1749:4628:3934:e1b]:54276"),
+	Dst:       mustIPPort("[2607:f8b0:400a:809::200e]:443"),
+}
+
+// A non-first fragment over IPv6: it carries a fragment header at a
+// nonzero offset and no transport header, so its ports are unknown. Like
+// decode4, decode6 should classify it as ipproto.Fragment so the filter's
+// pre() pass-through path accepts it.
+var udp6NonFirstFragmentBuffer = []byte{
+	// IPv6 header up to hop limit. Next header = 44 (Fragment), payload len = 16.
+	0x60, 0x00, 0x00, 0x00, 0x00, 0x10, 0x2c, 0x40,
+	// Src addr
+	0x20, 0x01, 0x05, 0x59, 0xbc, 0x13, 0x54, 0x00, 0x17, 0x49, 0x46, 0x28, 0x39, 0x34, 0x0e, 0x1b,
+	// Dst addr
+	0x26, 0x07, 0xf8, 0xb0, 0x40, 0x0a, 0x08, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x0e,
+	// Fragment extension header (8 bytes):
+	// NextHeader=UDP(0x11), Reserved, FragmentOffset=185 (0x05c8>>3) + M=0, Identification.
+	0x11, 0x00, 0x05, 0xc8, 0xde, 0xad, 0xbe, 0xef,
+	// Payload continuation (no transport header in a non-first fragment)
+	0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
+}
+
+var udp6NonFirstFragmentDecode = Parsed{
+	b:       udp6NonFirstFragmentBuffer,
+	subofs:  48, // past the fragment extension header, at the continued payload
+	dataofs: 0,  // no sub-protocol header present
+	length:  len(udp6NonFirstFragmentBuffer),
+
+	IPVersion: 6,
+	IPProto:   Fragment,
+	Src:       mustIPPort("[2001:559:bc13:5400:1749:4628:3934:e1b]:0"),
+	Dst:       mustIPPort("[2607:f8b0:400a:809::200e]:0"),
+}
+
+// A first fragment (offset 0) truncated before the full transport header,
+// so the ports can't be read. Like decode4's tcp4ShortFragment case, this
+// must be rejected as Unknown rather than guessed at: a stateless filter
+// that trusted such a fragment could be bypassed by a follow-up fragment
+// that supplies the rest of the header (RFC 1858).
+var udp6ShortFirstFragmentBuffer = []byte{
+	// IPv6 header. Next header = 44 (Fragment), payload len = 12.
+	0x60, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x2c, 0x40,
+	// Src addr
+	0x20, 0x01, 0x05, 0x59, 0xbc, 0x13, 0x54, 0x00, 0x17, 0x49, 0x46, 0x28, 0x39, 0x34, 0x0e, 0x1b,
+	// Dst addr
+	0x26, 0x07, 0xf8, 0xb0, 0x40, 0x0a, 0x08, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x0e,
+	// Fragment extension header: NextHeader=UDP, Reserved, Offset=0 + M=1, Identification.
+	0x11, 0x00, 0x00, 0x01, 0xde, 0xad, 0xbe, 0xef,
+	// Truncated UDP header: only 4 of the required 8 bytes.
+	0xd4, 0x04, 0x01, 0xbb,
+}
+
+var udp6ShortFirstFragmentDecode = Parsed{
+	b:       udp6ShortFirstFragmentBuffer,
+	subofs:  48, // header walk reaches past the fragment header...
+	dataofs: 0,  // ...but the transport header is incomplete, so it's unknown
+	length:  len(udp6ShortFirstFragmentBuffer),
+
+	IPVersion: 6,
+	IPProto:   Unknown,
+	Src:       mustIPPort("[2001:559:bc13:5400:1749:4628:3934:e1b]:0"),
+	Dst:       mustIPPort("[2607:f8b0:400a:809::200e]:0"),
+}
+
+// A non-first fragment whose offset is small enough that its bytes could
+// overlap the transport header on reassembly. Mirrors decode4's
+// ipv4SmallOffsetFragment: reject as Unknown to prevent overlapping-fragment
+// firewall bypass (RFC 1858), rather than passing it through as Fragment.
+var udp6SmallOffsetFragmentBuffer = []byte{
+	// IPv6 header. Next header = 44 (Fragment), payload len = 16.
+	0x60, 0x00, 0x00, 0x00, 0x00, 0x10, 0x2c, 0x40,
+	// Src addr
+	0x20, 0x01, 0x05, 0x59, 0xbc, 0x13, 0x54, 0x00, 0x17, 0x49, 0x46, 0x28, 0x39, 0x34, 0x0e, 0x1b,
+	// Dst addr
+	0x26, 0x07, 0xf8, 0xb0, 0x40, 0x0a, 0x08, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x0e,
+	// Fragment extension header: NextHeader=UDP, Reserved,
+	// Offset=1 block (8 bytes, below the safe minimum) + M=0, Identification.
+	0x11, 0x00, 0x00, 0x08, 0xde, 0xad, 0xbe, 0xef,
+	// Payload continuation that could overlap the transport header.
+	0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
+}
+
+var udp6SmallOffsetFragmentDecode = Parsed{
+	b:       udp6SmallOffsetFragmentBuffer,
+	subofs:  48,
+	dataofs: 0,
+	length:  len(udp6SmallOffsetFragmentBuffer),
+
+	IPVersion: 6,
+	IPProto:   Unknown,
+	Src:       mustIPPort("[2001:559:bc13:5400:1749:4628:3934:e1b]:0"),
+	Dst:       mustIPPort("[2607:f8b0:400a:809::200e]:0"),
+}
+
+// A first fragment reachable only through a chained extension header: the base
+// header's Next Header is Hop-by-Hop Options (0), which then chains to the
+// Fragment header. decode6 only parses the Fragment header when it is the
+// base header's immediate Next Header, so it must classify this as Unknown
+// rather than walking the chain. This locks in that scoping decision so a
+// future change can't silently start (mis)parsing chained headers.
+var udp6ChainedFragmentBuffer = []byte{
+	// IPv6 header. Next header = 0 (Hop-by-Hop Options), payload len = 24.
+	0x60, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00, 0x40,
+	// Src addr
+	0x20, 0x01, 0x05, 0x59, 0xbc, 0x13, 0x54, 0x00, 0x17, 0x49, 0x46, 0x28, 0x39, 0x34, 0x0e, 0x1b,
+	// Dst addr
+	0x26, 0x07, 0xf8, 0xb0, 0x40, 0x0a, 0x08, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x0e,
+	// Hop-by-Hop Options header (8 bytes): NextHeader=44 (Fragment),
+	// HdrExtLen=0, followed by PadN option padding.
+	0x2c, 0x00, 0x01, 0x04, 0x00, 0x00, 0x00, 0x00,
+	// Fragment extension header: NextHeader=UDP, Reserved, Offset=0 + M=1, Identification.
+	0x11, 0x00, 0x00, 0x01, 0xde, 0xad, 0xbe, 0xef,
+	// UDP header (unreachable: decoder stops at the unhandled Hop-by-Hop header).
+	0xd4, 0x04, 0x01, 0xbb, 0x00, 0x18, 0x00, 0x00,
+}
+
+var udp6ChainedFragmentDecode = Parsed{
+	b:       udp6ChainedFragmentBuffer,
+	subofs:  40, // base header only; the Hop-by-Hop header is not parsed
+	dataofs: 0,
+	length:  len(udp6ChainedFragmentBuffer),
+
+	IPVersion: 6,
+	IPProto:   Unknown,
+	Src:       mustIPPort("[2001:559:bc13:5400:1749:4628:3934:e1b]:0"),
+	Dst:       mustIPPort("[2607:f8b0:400a:809::200e]:0"),
+}
+
 var udp4ReplyBuffer = []byte{
 	// IP header up to checksum
 	0x45, 0x00, 0x00, 0x29, 0x21, 0x52, 0x00, 0x00, 0x40, 0x11, 0x49, 0x5f,
@@ -385,6 +544,124 @@ var sctpDecode = Parsed{
 	Dst:       mustIPPort("100.74.70.3:456"),
 }
 
+var ipv4ShortFirstFragmentBuffer = []byte{
+	// IP header (20 bytes)
+	0x45, 0x00, 0x00, 0x4f, // Total length 79 bytes
+	0x00, 0x01, 0x20, 0x00, // ID, Flags (MoreFragments set, offset 0)
+	0x40, 0x06, 0x00, 0x00, // TTL, Protocol (TCP), Checksum
+	0x01, 0x02, 0x03, 0x04, // Source IP
+	0x05, 0x06, 0x07, 0x08, // Destination IP
+	// TCP header (20 bytes), but packet is truncated to 59 bytes of TCP data
+	// (total 79 bytes, 20 for IP)
+	0x00, 0x7b, 0x02, 0x37, 0x00, 0x00, 0x12, 0x34, 0x00, 0x00, 0x00, 0x00,
+	0x50, 0x12, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+	// Payload (39 bytes)
+	0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
+	0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
+	0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
+}
+
+var ipv4ShortFirstFragmentDecode = Parsed{
+	b:         ipv4ShortFirstFragmentBuffer,
+	subofs:    20,
+	dataofs:   40,
+	length:    len(ipv4ShortFirstFragmentBuffer),
+	IPVersion: 4,
+	IPProto:   ipproto.TCP,
+	Src:       mustIPPort("1.2.3.4:123"),
+	Dst:       mustIPPort("5.6.7.8:567"),
+	TCPFlags:  0x12, // SYN + ACK
+}
+
+var ipv4SmallOffsetFragmentBuffer = []byte{
+	// IP header (20 bytes)
+	0x45, 0x00, 0x00, 0x28, // Total length 40 bytes
+	0x00, 0x01, 0x20, 0x08, // ID, Flags (MoreFragments set, offset 8 bytes (0x08 / 8 = 1))
+	0x40, 0x06, 0x00, 0x00, // TTL, Protocol (TCP), Checksum
+	0x01, 0x02, 0x03, 0x04, // Source IP
+	0x05, 0x06, 0x07, 0x08, // Destination IP
+	// Payload (20 bytes) - this would be part of the TCP header in a real scenario
+	0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
+	0x61, 0x61, 0x61, 0x61,
+}
+
+var ipv4SmallOffsetFragmentDecode = Parsed{
+	b:         ipv4SmallOffsetFragmentBuffer,
+	subofs:    20, // subofs will still be set based on IHL
+	dataofs:   0,  // It's unknown, so dataofs should be 0
+	length:    len(ipv4SmallOffsetFragmentBuffer),
+	IPVersion: 4,
+	IPProto:   ipproto.Unknown, // Expected to be Unknown
+	Src:       mustIPPort("1.2.3.4:0"),
+	Dst:       mustIPPort("5.6.7.8:0"),
+}
+
+// First fragment packet missing exactly one byte of the TCP header
+var ipv4OneByteShortTCPHeaderBuffer = []byte{
+	// IP header (20 bytes)
+	0x45, 0x00, 0x00, 0x27, // Total length 51 bytes (20 IP + 19 TCP)
+	0x00, 0x01, 0x20, 0x00, // ID, Flags (MoreFragments set, offset 0)
+	0x40, 0x06, 0x00, 0x00, // TTL, Protocol (TCP), Checksum
+	0x01, 0x02, 0x03, 0x04, // Source IP
+	0x05, 0x06, 0x07, 0x08, // Destination IP
+	// TCP header - only 19 bytes (one byte short of the required 20)
+	0x00, 0x7b, 0x02, 0x37, // Source port, Destination port
+	0x00, 0x00, 0x12, 0x34, // Sequence number
+	0x00, 0x00, 0x00, 0x00, // Acknowledgment number
+	0x50, 0x12, 0x01, 0x00, // Data offset, flags, window size
+	0x00, 0x00, 0x00, // Checksum (missing the last byte of urgent pointer)
+}
+
+// IPv4 packet with maximum header length (60 bytes = 15 words) and a TCP header that's
+// one byte short of being complete
+var ipv4MaxHeaderShortTCPBuffer = []byte{
+	// IP header with max options (60 bytes)
+	0x4F, 0x00, 0x00, 0x4F, // Version (4) + IHL (15), ToS, Total length 79 bytes (60 IP + 19 TCP)
+	0x00, 0x01, 0x20, 0x00, // ID, Flags (MoreFragments set, offset 0)
+	0x40, 0x06, 0x00, 0x00, // TTL, Protocol (TCP), Checksum
+	0x01, 0x02, 0x03, 0x04, // Source IP
+	0x05, 0x06, 0x07, 0x08, // Destination IP
+	// IPv4 options (40 bytes)
+	0x01, 0x01, 0x01, 0x01, // 4 NOP options (padding)
+	0x01, 0x01, 0x01, 0x01, // 4 NOP options (padding)
+	0x01, 0x01, 0x01, 0x01, // 4 NOP options (padding)
+	0x01, 0x01, 0x01, 0x01, // 4 NOP options (padding)
+	0x01, 0x01, 0x01, 0x01, // 4 NOP options (padding)
+	0x01, 0x01, 0x01, 0x01, // 4 NOP options (padding)
+	0x01, 0x01, 0x01, 0x01, // 4 NOP options (padding)
+	0x01, 0x01, 0x01, 0x01, // 4 NOP options (padding)
+	0x01, 0x01, 0x01, 0x01, // 4 NOP options (padding)
+	0x01, 0x01, 0x01, 0x01, // 4 NOP options (padding)
+	// TCP header - only 19 bytes (one byte short of the required 20)
+	0x00, 0x7b, 0x02, 0x37, // Source port, Destination port
+	0x00, 0x00, 0x12, 0x34, // Sequence number
+	0x00, 0x00, 0x00, 0x00, // Acknowledgment number
+	0x50, 0x12, 0x01, 0x00, // Data offset, flags, window size
+	0x00, 0x00, 0x00, // Checksum (missing the last byte of urgent pointer)
+}
+
+var ipv4MaxHeaderShortTCPDecode = Parsed{
+	b:         ipv4MaxHeaderShortTCPBuffer,
+	subofs:    60, // 60 bytes for full IPv4 header with max options
+	dataofs:   0,  // It's unknown, so dataofs should be 0
+	length:    len(ipv4MaxHeaderShortTCPBuffer),
+	IPVersion: 4,
+	IPProto:   ipproto.Unknown, // Expected to be Unknown
+	Src:       mustIPPort("1.2.3.4:0"),
+	Dst:       mustIPPort("5.6.7.8:0"),
+}
+
+var ipv4OneByteShortTCPHeaderDecode = Parsed{
+	b:         ipv4OneByteShortTCPHeaderBuffer,
+	subofs:    20,
+	dataofs:   0, // It's unknown, so dataofs should be 0
+	length:    len(ipv4OneByteShortTCPHeaderBuffer),
+	IPVersion: 4,
+	IPProto:   ipproto.Unknown, // Expected to be Unknown
+	Src:       mustIPPort("1.2.3.4:0"),
+	Dst:       mustIPPort("5.6.7.8:0"),
+}
+
 func TestParsedString(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -449,7 +726,16 @@ func TestDecode(t *testing.T) {
 		{"ipv4_tsmp", ipv4TSMPBuffer, ipv4TSMPDecode},
 		{"ipv4_sctp", sctpBuffer, sctpDecode},
 		{"ipv4_frag", tcp4MediumFragmentBuffer, tcp4MediumFragmentDecode},
+		{"ipv6_frag_first", udp6FirstFragmentBuffer, udp6FirstFragmentDecode},
+		{"ipv6_frag_nonfirst", udp6NonFirstFragmentBuffer, udp6NonFirstFragmentDecode},
+		{"ipv6_frag_short_first", udp6ShortFirstFragmentBuffer, udp6ShortFirstFragmentDecode},
+		{"ipv6_frag_small_offset", udp6SmallOffsetFragmentBuffer, udp6SmallOffsetFragmentDecode},
+		{"ipv6_frag_chained", udp6ChainedFragmentBuffer, udp6ChainedFragmentDecode},
 		{"ipv4_fragtooshort", tcp4ShortFragmentBuffer, tcp4ShortFragmentDecode},
+		{"ipv4_short_first_fragment", ipv4ShortFirstFragmentBuffer, ipv4ShortFirstFragmentDecode},
+		{"ipv4_small_offset_fragment", ipv4SmallOffsetFragmentBuffer, ipv4SmallOffsetFragmentDecode},
+		{"ipv4_one_byte_short_tcp_header", ipv4OneByteShortTCPHeaderBuffer, ipv4OneByteShortTCPHeaderDecode},
+		{"ipv4_max_header_short_tcp", ipv4MaxHeaderShortTCPBuffer, ipv4MaxHeaderShortTCPDecode},
 
 		{"ip97", mustHexDecode("4500 0019 d186 4000 4061 751d 644a 4603 6449 e549 6865 6c6c 6f"), Parsed{
 			IPVersion: 4,

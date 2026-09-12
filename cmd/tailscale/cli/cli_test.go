@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package cli
@@ -6,11 +6,14 @@ package cli
 import (
 	"bytes"
 	stdcmp "cmp"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -20,12 +23,14 @@ import (
 	"github.com/peterbourgon/ff/v3/ffcli"
 	"tailscale.com/envknob"
 	"tailscale.com/health/healthmsg"
+	"tailscale.com/internal/client/tailscale"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tka"
 	"tailscale.com/tstest"
 	"tailscale.com/tstest/deptest"
+	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/opt"
 	"tailscale.com/types/persist"
@@ -174,6 +179,7 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 		curUser       string // os.Getenv("USER") on the client side
 		goos          string // empty means "linux"
 		distro        distro.Distro
+		backendState  string // empty means "Running"
 
 		want string
 	}{
@@ -187,6 +193,28 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 				NoStatefulFiltering: opt.NewBool(true),
 			},
 			want: "",
+		},
+		{
+			name:         "bare_up_needs_login_default_prefs",
+			flags:        []string{},
+			curPrefs:     ipn.NewPrefs(),
+			backendState: ipn.NeedsLogin.String(),
+			want:         "",
+		},
+		{
+			name:  "bare_up_needs_login_losing_prefs",
+			flags: []string{},
+			curPrefs: &ipn.Prefs{
+				// defaults:
+				ControlURL:          ipn.DefaultControlURL,
+				WantRunning:         false,
+				NetfilterMode:       preftype.NetfilterOn,
+				NoStatefulFiltering: opt.NewBool(true),
+				// non-default:
+				CorpDNS: false,
+			},
+			backendState: ipn.NeedsLogin.String(),
+			want:         accidentalUpPrefix + " --accept-dns=false",
 		},
 		{
 			name:  "losing_hostname",
@@ -620,9 +648,13 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			goos := "linux"
-			if tt.goos != "" {
-				goos = tt.goos
+			goos := stdcmp.Or(tt.goos, "linux")
+			backendState := stdcmp.Or(tt.backendState, ipn.Running.String())
+			// Needs to match the other conditions in checkForAccidentalSettingReverts
+			tt.curPrefs.Persist = &persist.Persist{
+				UserProfile: tailcfg.UserProfile{
+					LoginName: "janet",
+				},
 			}
 			var upArgs upArgsT
 			flagSet := newUpFlagSet(goos, &upArgs, "up")
@@ -638,10 +670,11 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 				curExitNodeIP: tt.curExitNodeIP,
 				distro:        tt.distro,
 				user:          tt.curUser,
+				backendState:  backendState,
 			}
 			applyImplicitPrefs(newPrefs, tt.curPrefs, upEnv)
 			var got string
-			if err := checkForAccidentalSettingReverts(newPrefs, tt.curPrefs, upEnv); err != nil {
+			if _, err := checkForAccidentalSettingReverts(newPrefs, tt.curPrefs, upEnv); err != nil {
 				got = err.Error()
 			}
 			if strings.TrimSpace(got) != tt.want {
@@ -737,7 +770,22 @@ func TestPrefsFromUpArgs(t *testing.T) {
 			args: upArgsT{
 				exitNodeIP: "foo",
 			},
-			wantErr: `invalid value "foo" for --exit-node; must be IP or unique node name`,
+			st: &ipnstate.Status{
+				Peer: map[key.NodePublic]*ipnstate.PeerStatus{
+					key.NewNode().Public(): {
+						DNSName:      "example.com.",
+						TailscaleIPs: []netip.Addr{netip.MustParseAddr("1.0.0.2")},
+					},
+				},
+			},
+			wantErr: `invalid value "foo" for --exit-node; must be IP or peer hostname`,
+		},
+		{
+			name: "error_exit_node_not_started",
+			args: upArgsT{
+				exitNodeIP: "foo",
+			},
+			wantErr: `cannot resolve exit node by hostname while Tailscale is starting up; please use its Tailscale IP address instead`,
 		},
 		{
 			name: "error_exit_node_allow_lan_without_exit_node",
@@ -747,11 +795,43 @@ func TestPrefsFromUpArgs(t *testing.T) {
 			wantErr: `--exit-node-allow-lan-access can only be used with --exit-node`,
 		},
 		{
-			name: "error_tag_prefix",
+			name: "error_tag_bad_prefix",
 			args: upArgsT{
-				advertiseTags: "foo",
+				advertiseTags: "notatag:foo",
 			},
-			wantErr: `tag: "foo": tags must start with 'tag:'`,
+			wantErr: `tag: "notatag:foo": tags must start with 'tag:'`,
+		},
+		{
+			name: "tag_auto_prefix",
+			args: upArgsFromOSArgs("linux", "--advertise-tags=foo,bar"),
+			want: &ipn.Prefs{
+				ControlURL:          ipn.DefaultControlURL,
+				WantRunning:         true,
+				CorpDNS:             true,
+				AdvertiseTags:       []string{"tag:foo", "tag:bar"},
+				NoSNAT:              false,
+				NoStatefulFiltering: "true",
+				NetfilterMode:       preftype.NetfilterOn,
+				AutoUpdate: ipn.AutoUpdatePrefs{
+					Check: true,
+				},
+			},
+		},
+		{
+			name: "tag_mixed_prefix",
+			args: upArgsFromOSArgs("linux", "--advertise-tags=tag:foo,bar"),
+			want: &ipn.Prefs{
+				ControlURL:          ipn.DefaultControlURL,
+				WantRunning:         true,
+				CorpDNS:             true,
+				AdvertiseTags:       []string{"tag:foo", "tag:bar"},
+				NoSNAT:              false,
+				NoStatefulFiltering: "true",
+				NetfilterMode:       preftype.NetfilterOn,
+				AutoUpdate: ipn.AutoUpdatePrefs{
+					Check: true,
+				},
+			},
 		},
 		{
 			name: "error_long_hostname",
@@ -930,15 +1010,12 @@ func TestPrefFlagMapping(t *testing.T) {
 	}
 
 	prefType := reflect.TypeFor[ipn.Prefs]()
-	for i := range prefType.NumField() {
-		prefName := prefType.Field(i).Name
+	for field := range prefType.Fields() {
+		prefName := field.Name
 		if prefHasFlag[prefName] {
 			continue
 		}
 		switch prefName {
-		case "AllowSingleHosts":
-			// Fake pref for downgrade compat. See #12058.
-			continue
 		case "WantRunning", "Persist", "LoggedOut":
 			// All explicitly handled (ignored) by checkForAccidentalSettingReverts.
 			continue
@@ -964,12 +1041,15 @@ func TestPrefFlagMapping(t *testing.T) {
 			// flag for this.
 			continue
 		case "AdvertiseServices":
-			// Handled by the tailscale advertise subcommand, we don't want a
+			// Handled by the tailscale serve subcommand, we don't want a
 			// CLI flag for this.
 			continue
 		case "InternalExitNodePrior":
 			// Used internally by LocalBackend as part of exit node usage toggling.
 			// No CLI flag for this.
+			continue
+		case "AutoExitNode":
+			// Handled by tailscale {set,up} --exit-node=auto:any.
 			continue
 		}
 		t.Errorf("unexpected new ipn.Pref field %q is not handled by up.go (see addPrefFlagMapping and checkForAccidentalSettingReverts)", prefName)
@@ -1008,13 +1088,10 @@ func TestUpdatePrefs(t *testing.T) {
 		wantErrSubtr   string
 	}{
 		{
-			name:  "bare_up_means_up",
-			flags: []string{},
-			curPrefs: &ipn.Prefs{
-				ControlURL:  ipn.DefaultControlURL,
-				WantRunning: false,
-				Hostname:    "foo",
-			},
+			name:         "bare_up_means_up",
+			flags:        []string{},
+			curPrefs:     ipn.NewPrefs(),
+			wantSimpleUp: false, // user profile not set, so no simple up
 		},
 		{
 			name:  "just_up",
@@ -1027,6 +1104,32 @@ func TestUpdatePrefs(t *testing.T) {
 				backendState: "Stopped",
 			},
 			wantSimpleUp: true,
+		},
+		{
+			name:     "just_up_needs_login_default_prefs",
+			flags:    []string{},
+			curPrefs: ipn.NewPrefs(),
+			env: upCheckEnv{
+				backendState: "NeedsLogin",
+			},
+			wantSimpleUp: false,
+		},
+		{
+			name:  "just_up_needs_login_losing_prefs",
+			flags: []string{},
+			curPrefs: &ipn.Prefs{
+				// defaults:
+				ControlURL:    ipn.DefaultControlURL,
+				WantRunning:   false,
+				NetfilterMode: preftype.NetfilterOn,
+				// non-default:
+				CorpDNS: false,
+			},
+			env: upCheckEnv{
+				backendState: "NeedsLogin",
+			},
+			wantSimpleUp: false,
+			wantErrSubtr: "tailscale up --accept-dns=false",
 		},
 		{
 			name:  "just_edit",
@@ -1334,6 +1437,27 @@ func TestUpdatePrefs(t *testing.T) {
 				}
 			},
 		},
+		{
+			name:  "auto_exit_node",
+			flags: []string{"--exit-node=auto:any"},
+			curPrefs: &ipn.Prefs{
+				ControlURL:    ipn.DefaultControlURL,
+				CorpDNS:       true,                 // enabled by [ipn.NewPrefs] by default
+				NetfilterMode: preftype.NetfilterOn, // enabled by [ipn.NewPrefs] by default
+			},
+			wantJustEditMP: &ipn.MaskedPrefs{
+				WantRunningSet:  true, // enabled by default for tailscale up
+				AutoExitNodeSet: true,
+				ExitNodeIDSet:   true, // we want ExitNodeID cleared
+				ExitNodeIPSet:   true, // same for ExitNodeIP
+			},
+			env: upCheckEnv{backendState: "Running"},
+			checkUpdatePrefsMutations: func(t *testing.T, newPrefs *ipn.Prefs) {
+				if newPrefs.AutoExitNode != ipn.AnyExitNode {
+					t.Errorf("AutoExitNode: got %q; want %q", newPrefs.AutoExitNode, ipn.AnyExitNode)
+				}
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1454,13 +1578,13 @@ func TestParseNLArgs(t *testing.T) {
 			parseDisablements: true,
 		},
 		{
-			name:      "key no votes",
+			name:      "key-no-votes",
 			input:     []string{"nlpub:" + strings.Repeat("00", 32)},
 			parseKeys: true,
 			wantKeys:  []tka.Key{{Kind: tka.Key25519, Votes: 1, Public: bytes.Repeat([]byte{0}, 32)}},
 		},
 		{
-			name:      "key with votes",
+			name:      "key-with-votes",
 			input:     []string{"nlpub:" + strings.Repeat("01", 32) + "?5"},
 			parseKeys: true,
 			wantKeys:  []tka.Key{{Kind: tka.Key25519, Votes: 5, Public: bytes.Repeat([]byte{1}, 32)}},
@@ -1472,13 +1596,13 @@ func TestParseNLArgs(t *testing.T) {
 			wantDisablements:  [][]byte{bytes.Repeat([]byte{2}, 32), bytes.Repeat([]byte{3}, 32)},
 		},
 		{
-			name:      "disablements not allowed",
+			name:      "disablements-not-allowed",
 			input:     []string{"disablement:" + strings.Repeat("02", 32)},
 			parseKeys: true,
 			wantErr:   fmt.Errorf("parsing key 1: key hex string doesn't have expected type prefix tlpub:"),
 		},
 		{
-			name:              "keys not allowed",
+			name:              "keys-not-allowed",
 			input:             []string{"nlpub:" + strings.Repeat("02", 32)},
 			parseDisablements: true,
 			wantErr:           fmt.Errorf("parsing argument 1: expected value with \"disablement:\" or \"disablement-secret:\" prefix, got %q", "nlpub:0202020202020202020202020202020202020202020202020202020202020202"),
@@ -1487,7 +1611,7 @@ func TestParseNLArgs(t *testing.T) {
 
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {
-			keys, disablements, err := parseNLArgs(tc.input, tc.parseKeys, tc.parseDisablements)
+			keys, disablements, err := parseTLArgs(tc.input, tc.parseKeys, tc.parseDisablements)
 			if (tc.wantErr == nil && err != nil) ||
 				(tc.wantErr != nil && err == nil) ||
 				(tc.wantErr != nil && err != nil && tc.wantErr.Error() != err.Error()) {
@@ -1539,7 +1663,7 @@ func TestNoDups(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cmd := newRootCmd()
+			cmd := newRootCmd(t)
 			makeQuietContinueOnError(cmd)
 			err := cmd.Parse(tt.args)
 			if got := fmt.Sprint(err); got != tt.want {
@@ -1621,6 +1745,78 @@ func TestDocs(t *testing.T) {
 	walk(t, root)
 }
 
+func TestUpResolves(t *testing.T) {
+	const testARN = "arn:aws:ssm:us-east-1:123456789012:parameter/my-parameter"
+	undo := tailscale.HookResolveValueFromParameterStore.SetForTest(func(_ context.Context, valueOrARN string) (string, error) {
+		if valueOrARN == testARN {
+			return "resolved-value", nil
+		}
+		return valueOrARN, nil
+	})
+	defer undo()
+
+	const content = "file-content"
+	fpath := filepath.Join(t.TempDir(), "testfile")
+	if err := os.WriteFile(fpath, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	testCases := []struct {
+		name string
+		arg  string
+		want string
+	}{
+		{"parameter_store", testARN, "resolved-value"},
+		{"file", "file:" + fpath, "file-content"},
+	}
+
+	for _, tt := range testCases {
+		t.Run(tt.name+"_auth_key", func(t *testing.T) {
+			args := upArgsT{authKeyOrFile: tt.arg}
+			got, err := args.getAuthKey(t.Context())
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+
+		t.Run(tt.name+"_client_secret", func(t *testing.T) {
+			args := upArgsT{clientSecretOrFile: tt.arg}
+			got, err := args.getClientSecret(t.Context())
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+
+		t.Run(tt.name+"_id_token", func(t *testing.T) {
+			args := upArgsT{idTokenOrFile: tt.arg}
+			got, err := args.getIDToken(t.Context())
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+
+	t.Run("passthrough", func(t *testing.T) {
+		args := upArgsT{authKeyOrFile: "tskey-abcd1234"}
+		got, err := args.getAuthKey(t.Context())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != "tskey-abcd1234" {
+			t.Errorf("got %q, want %q", got, "tskey-abcd1234")
+		}
+	})
+}
+
 func TestDeps(t *testing.T) {
 	deptest.DepChecker{
 		GOOS:   "linux",
@@ -1647,4 +1843,22 @@ func TestDepsNoCapture(t *testing.T) {
 		},
 	}.Check(t)
 
+}
+
+func TestSanitizeWriter(t *testing.T) {
+	buf := new(bytes.Buffer)
+	w := sanitizeOutput(buf)
+
+	in := []byte(`my auth key is tskey-auth-abc123-def456 and tskey-foo, what's yours?`)
+	want := []byte(`my auth key is tskey-XXXXXXXXXXXXXXXXXX and tskey-XXX, what's yours?`)
+	n, err := w.Write(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != len(in) {
+		t.Errorf("unexpected write length %d, want %d", n, len(in))
+	}
+	if got := buf.Bytes(); !bytes.Equal(got, want) {
+		t.Errorf("unexpected sanitized content\ngot: %q\nwant: %q", got, want)
+	}
 }

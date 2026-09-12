@@ -1,14 +1,17 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package source
 
 import (
 	"cmp"
+	"sync"
 	"testing"
 	"time"
 
 	"tailscale.com/util/must"
+	"tailscale.com/util/syspolicy/pkey"
+	"tailscale.com/util/syspolicy/ptype"
 	"tailscale.com/util/syspolicy/setting"
 )
 
@@ -72,7 +75,7 @@ func TestReaderLifecycle(t *testing.T) {
 			initWant:       setting.NewSnapshot(nil, setting.NewNamedOrigin("Test", setting.DeviceScope)),
 			addStrings:     []TestSetting[string]{TestSettingOf("StringValue", "S1")},
 			addStringLists: []TestSetting[[]string]{TestSettingOf("StringListValue", []string{"S1", "S2", "S3"})},
-			newWant: setting.NewSnapshot(map[setting.Key]setting.RawItem{
+			newWant: setting.NewSnapshot(map[pkey.Key]setting.RawItem{
 				"StringValue":     setting.RawItemWith("S1", nil, setting.NewNamedOrigin("Test", setting.DeviceScope)),
 				"StringListValue": setting.RawItemWith([]string{"S1", "S2", "S3"}, nil, setting.NewNamedOrigin("Test", setting.DeviceScope)),
 			}, setting.NewNamedOrigin("Test", setting.DeviceScope)),
@@ -136,10 +139,10 @@ func TestReaderLifecycle(t *testing.T) {
 				TestSettingOf("PreferenceOptionValue", "always"),
 				TestSettingOf("VisibilityValue", "show"),
 			},
-			initWant: setting.NewSnapshot(map[setting.Key]setting.RawItem{
+			initWant: setting.NewSnapshot(map[pkey.Key]setting.RawItem{
 				"DurationValue":         setting.RawItemWith(must.Get(time.ParseDuration("2h30m")), nil, setting.NewNamedOrigin("Test", setting.DeviceScope)),
-				"PreferenceOptionValue": setting.RawItemWith(setting.AlwaysByPolicy, nil, setting.NewNamedOrigin("Test", setting.DeviceScope)),
-				"VisibilityValue":       setting.RawItemWith(setting.VisibleByPolicy, nil, setting.NewNamedOrigin("Test", setting.DeviceScope)),
+				"PreferenceOptionValue": setting.RawItemWith(ptype.AlwaysByPolicy, nil, setting.NewNamedOrigin("Test", setting.DeviceScope)),
+				"VisibilityValue":       setting.RawItemWith(ptype.VisibleByPolicy, nil, setting.NewNamedOrigin("Test", setting.DeviceScope)),
 			}, setting.NewNamedOrigin("Test", setting.DeviceScope)),
 		},
 		{
@@ -165,11 +168,11 @@ func TestReaderLifecycle(t *testing.T) {
 			initUInt64s: []TestSetting[uint64]{
 				TestSettingOf[uint64]("VisibilityValue", 42), // type mismatch
 			},
-			initWant: setting.NewSnapshot(map[setting.Key]setting.RawItem{
+			initWant: setting.NewSnapshot(map[pkey.Key]setting.RawItem{
 				"DurationValue1":        setting.RawItemWith(nil, setting.NewErrorText("time: invalid duration \"soon\""), setting.NewNamedOrigin("Test", setting.CurrentUserScope)),
 				"DurationValue2":        setting.RawItemWith(nil, setting.NewErrorText("bang!"), setting.NewNamedOrigin("Test", setting.CurrentUserScope)),
-				"PreferenceOptionValue": setting.RawItemWith(setting.ShowChoiceByPolicy, nil, setting.NewNamedOrigin("Test", setting.CurrentUserScope)),
-				"VisibilityValue":       setting.RawItemWith(setting.VisibleByPolicy, setting.NewErrorText("type mismatch in ReadString: got uint64"), setting.NewNamedOrigin("Test", setting.CurrentUserScope)),
+				"PreferenceOptionValue": setting.RawItemWith(ptype.ShowChoiceByPolicy, nil, setting.NewNamedOrigin("Test", setting.CurrentUserScope)),
+				"VisibilityValue":       setting.RawItemWith(ptype.VisibleByPolicy, setting.NewErrorText("type mismatch in ReadString: got uint64"), setting.NewNamedOrigin("Test", setting.CurrentUserScope)),
 			}, setting.NewNamedOrigin("Test", setting.CurrentUserScope)),
 		},
 	}
@@ -242,6 +245,39 @@ func TestReaderLifecycle(t *testing.T) {
 	}
 }
 
+// TestReaderCloseReloadRace is a regression test for tailscale/corp#45548,
+// where [Reader.Close] set r.store to nil without holding r.mu while a
+// concurrent [Reader.reload] read r.store under r.mu, causing a data race
+// and a potential nil interface method call panic.
+func TestReaderCloseReloadRace(t *testing.T) {
+	setting.SetDefinitionsForTest(t, setting.NewDefinition("StringValue", setting.DeviceSetting, setting.StringValue))
+	origin := setting.NewNamedOrigin("Test", setting.DeviceScope)
+	for range 100 {
+		store := NewTestStoreOf(t, TestSettingOf("StringValue", "S1"))
+		reader, err := newReader(store, origin)
+		if err != nil {
+			t.Fatalf("newReader failed: %v", err)
+		}
+
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		for range 4 {
+			wg.Go(func() {
+				<-start
+				for range 10 {
+					reader.ReadSettings()
+				}
+			})
+		}
+		wg.Go(func() {
+			<-start
+			reader.Close()
+		})
+		close(start)
+		wg.Wait()
+	}
+}
+
 func TestReadingSession(t *testing.T) {
 	setting.SetDefinitionsForTest(t, setting.NewDefinition("StringValue", setting.DeviceSetting, setting.StringValue))
 	store := NewTestStore(t)
@@ -277,7 +313,7 @@ func TestReadingSession(t *testing.T) {
 		t.Fatalf("the session was closed prematurely")
 	}
 
-	want := setting.NewSnapshot(map[setting.Key]setting.RawItem{
+	want := setting.NewSnapshot(map[pkey.Key]setting.RawItem{
 		"StringValue": setting.RawItemWith("S1", nil, origin),
 	}, origin)
 	if got := session.GetSettings(); !got.Equal(want) {

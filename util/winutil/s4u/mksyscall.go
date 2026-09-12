@@ -1,5 +1,7 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
+
+//lint:file-ignore ST1000 see s4u_windows.go
 
 package s4u
 

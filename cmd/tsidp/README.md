@@ -1,6 +1,9 @@
+> [!CAUTION]
+> Development of tsidp has been moved to [https://github.com/tailscale/tsidp](https://github.com/tailscale/tsidp) and it is no longer maintained here. Please visit the new repository to see the latest updates, file an issue, or contribute.
+ 
 # `tsidp` - Tailscale OpenID Connect (OIDC) Identity Provider
 
-[![status: experimental](https://img.shields.io/badge/status-experimental-blue)](https://tailscale.com/kb/1167/release-stages/#experimental)
+[![status: community project](https://img.shields.io/badge/status-community_project-blue)](https://tailscale.com/kb/1531/community-projects)
 
 `tsidp` is an OIDC Identity Provider (IdP) server that integrates with your Tailscale network. It allows you to use Tailscale identities for authentication in applications that support OpenID Connect, enabling single sign-on (SSO) capabilities within your tailnet.
 
@@ -12,43 +15,42 @@
 
 ## Installation using Docker
 
-1. **Build the Docker Image**
+### Pre-built image
 
-   The Dockerfile uses a multi-stage build process to:
-   - Build the `tsidp` binary from source
-   - Create a minimal Alpine-based image with just the necessary components
+A pre-built tsidp image exists at `tailscale/tsidp:unstable`.
 
-   ```bash
-   # Clone the Tailscale repository
-   git clone https://github.com/tailscale/tailscale.git
-   cd tailscale
-   ```
+### Building from Source
 
-   ```bash
-   # Build the Docker image
-   docker build -t tsidp:latest -f cmd/tsidp/Dockerfile .
-   ```
+```bash
+# Clone the Tailscale repository
+git clone https://github.com/tailscale/tailscale.git
+cd tailscale
 
-2. **Run the Container**
+# Build and publish to your own registry
+make publishdevtsidp REPO=ghcr.io/yourusername/tsidp TAGS=v0.0.1 PUSH=true
+```
 
-   Replace `YOUR_TAILSCALE_AUTHKEY` with your Tailscale authentication key.
+### Running the Container
 
-   ```bash
-   docker run -d \
-     --name tsidp \
-     -p 443:443 \
-     -e TS_AUTHKEY=YOUR_TAILSCALE_AUTHKEY \
-     -e TS_HOSTNAME=idp \
-     -v tsidp-data:/var/lib/tsidp \
-     tsidp:latest
-   ```
+Replace `YOUR_TAILSCALE_AUTHKEY` with your Tailscale authentication key:
 
-3. **Verify Installation**
-   ```bash
-   docker logs tsidp
-   ```
+```bash
+docker run -d \
+  --name tsidp \
+  -p 443:443 \
+  -e TS_AUTHKEY=YOUR_TAILSCALE_AUTHKEY \
+  -e TAILSCALE_USE_WIP_CODE=1 \
+  -v tsidp-data:/var/lib/tsidp \
+  ghcr.io/yourusername/tsidp:v0.0.1 \
+  tsidp --hostname=idp --dir=/var/lib/tsidp
+```
 
-   Visit `https://idp.tailnet.ts.net` to confirm the service is running.
+### Verify Installation
+```bash
+docker logs tsidp
+```
+
+Visit `https://idp.tailnet.ts.net` to confirm the service is running.
 
 ## Usage Example: Proxmox Integration
 
@@ -94,7 +96,7 @@ The `tsidp` server supports several command-line flags:
 
 ## Support
 
-This is an [experimental](https://tailscale.com/kb/1167/release-stages#experimental), work in progress feature. For issues or questions, file issues on the [GitHub repository](https://github.com/tailscale/tailscale)
+This is an experimental, work in progress, [community project](https://tailscale.com/kb/1531/community-projects). For issues or questions, file issues on the [GitHub repository](https://github.com/tailscale/tailscale).
 
 ## License
 

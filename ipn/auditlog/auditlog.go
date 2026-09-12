@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package auditlog provides a mechanism for logging audit events.
@@ -69,8 +69,11 @@ type Opts struct {
 // IsRetryableError returns true if the given error is retryable
 // See [controlclient.apiResponseError].  Potentially retryable errors implement the Retryable() method.
 func IsRetryableError(err error) bool {
-	var retryable interface{ Retryable() bool }
-	return errors.As(err, &retryable) && retryable.Retryable()
+	retryable, ok := errors.AsType[interface {
+		error
+		Retryable() bool
+	}](err)
+	return ok && retryable.Retryable()
 }
 
 type backoffOpts struct {

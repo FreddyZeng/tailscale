@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package key
@@ -79,5 +79,23 @@ func TestDiscoShared(t *testing.T) {
 	s1, s2 := k1.Shared(k2.Public()), k2.Shared(k1.Public())
 	if !s1.Equal(s2) {
 		t.Error("k1.Shared(k2) != k2.Shared(k1)")
+	}
+}
+
+func TestSortedPairOfDiscoPublic(t *testing.T) {
+	pubA := DiscoPublic{}
+	pubA.k[0] = 0x01
+	pubB := DiscoPublic{}
+	pubB.k[0] = 0x02
+	sortedInput := NewSortedPairOfDiscoPublic(pubA, pubB)
+	unsortedInput := NewSortedPairOfDiscoPublic(pubB, pubA)
+	if sortedInput.Get() != unsortedInput.Get() {
+		t.Fatal("sortedInput.Get() != unsortedInput.Get()")
+	}
+	if unsortedInput.Get()[0] != pubA {
+		t.Fatal("unsortedInput.Get()[0] != pubA")
+	}
+	if unsortedInput.Get()[1] != pubB {
+		t.Fatal("unsortedInput.Get()[1] != pubB")
 	}
 }

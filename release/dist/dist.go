@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package dist is a release artifact builder library.
@@ -20,7 +20,6 @@ import (
 	"sync"
 	"time"
 
-	"tailscale.com/util/multierr"
 	"tailscale.com/version/mkversion"
 )
 
@@ -176,7 +175,7 @@ func (b *Build) Build(targets []Target) (files []string, err error) {
 	}
 	sort.Strings(files)
 
-	return files, multierr.New(errs...)
+	return files, errors.Join(errs...)
 }
 
 // Once runs fn if Once hasn't been called with name before.

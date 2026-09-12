@@ -1,5 +1,7 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
+
+//go:build !ts_omit_serve
 
 package cli
 
@@ -23,18 +25,24 @@ import (
 	"strings"
 
 	"github.com/peterbourgon/ff/v3/ffcli"
-	"tailscale.com/client/tailscale"
+	"tailscale.com/client/local"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
+	"tailscale.com/tailcfg/peercap"
 	"tailscale.com/util/slicesx"
 	"tailscale.com/version"
 )
 
+func init() {
+	maybeServeCmd = serveCmd
+}
+
 var serveCmd = func() *ffcli.Command {
 	se := &serveEnv{lc: &localClient}
 	// previously used to serve legacy newFunnelCommand unless useWIPCode is true
-	// change is limited to make a revert easier and full cleanup to come after the relase.
+	// change is limited to make a revert easier and full cleanup to come after the release.
 	// TODO(tylersmalley): cleanup and removal of newServeLegacyCommand as of 2023-10-16
 	return newServeV2Command(se, serve)
 }
@@ -139,8 +147,11 @@ type localServeClient interface {
 	GetServeConfig(context.Context) (*ipn.ServeConfig, error)
 	SetServeConfig(context.Context, *ipn.ServeConfig) error
 	QueryFeature(ctx context.Context, feature string) (*tailcfg.QueryFeatureResponse, error)
-	WatchIPNBus(ctx context.Context, mask ipn.NotifyWatchOpt) (*tailscale.IPNBusWatcher, error)
+	WatchIPNBus(ctx context.Context, mask ipn.NotifyWatchOpt) (*local.IPNBusWatcher, error)
 	IncrementCounter(ctx context.Context, name string, delta int) error
+	GetPrefs(ctx context.Context) (*ipn.Prefs, error)
+	EditPrefs(ctx context.Context, mp *ipn.MaskedPrefs) (*ipn.Prefs, error)
+	CheckSOMarkInUse(ctx context.Context) (bool, error)
 }
 
 // serveEnv is the environment the serve command runs within. All I/O should be
@@ -154,17 +165,21 @@ type serveEnv struct {
 	json bool // output JSON (status only for now)
 
 	// v2 specific flags
-	bg               bool      // background mode
-	setPath          string    // serve path
-	https            uint      // HTTP port
-	http             uint      // HTTP port
-	tcp              uint      // TCP port
-	tlsTerminatedTCP uint      // a TLS terminated TCP port
-	subcmd           serveMode // subcommand
-	yes              bool      // update without prompt
+	bg               bgBoolFlag          // background mode
+	setPath          string              // serve path
+	https            uint                // HTTP port
+	http             uint                // HTTP port
+	tcp              uint                // TCP port
+	tlsTerminatedTCP uint                // a TLS terminated TCP port
+	proxyProtocol    uint                // PROXY protocol version (1 or 2)
+	subcmd           serveMode           // subcommand
+	yes              bool                // update without prompt
+	service          tailcfg.ServiceName // service name
+	tun              bool                // redirect traffic to OS for service
+	allServices      bool                // apply config file to all services
+	acceptAppCaps    []peercap.Cap       // app capabilities to forward
 
 	lc localServeClient // localClient interface, specific to serve
-
 	// optional stuff for tests:
 	testFlagOut io.Writer
 	testStdout  io.Writer
@@ -263,7 +278,7 @@ func (e *serveEnv) runServe(ctx context.Context, args []string) error {
 		// on, enableFeatureInteractive will error. For now, we hide that
 		// error and maintain the previous behavior (prior to 2023-08-15)
 		// of letting them edit the serve config before enabling certs.
-		e.enableFeatureInteractive(ctx, "serve", tailcfg.CapabilityHTTPS)
+		e.enableFeatureInteractive(ctx, "serve", nodecap.HTTPS)
 	}
 
 	srcPort, err := parseServePort(srcPortStr)
@@ -354,12 +369,12 @@ func (e *serveEnv) handleWebServe(ctx context.Context, srvPort uint16, useTLS bo
 	if err != nil {
 		return err
 	}
-	if sc.IsTCPForwardingOnPort(srvPort) {
+	if sc.IsTCPForwardingOnPort(srvPort, noService) {
 		fmt.Fprintf(Stderr, "error: cannot serve web; already serving TCP\n")
 		return errHelp
 	}
 
-	sc.SetWebHandler(h, dnsName, srvPort, mount, useTLS)
+	sc.SetWebHandler(h, dnsName, srvPort, mount, useTLS, noService.String())
 
 	if !reflect.DeepEqual(cursc, sc) {
 		if err := e.lc.SetServeConfig(ctx, sc); err != nil {
@@ -411,11 +426,11 @@ func (e *serveEnv) handleWebServeRemove(ctx context.Context, srvPort uint16, mou
 	if err != nil {
 		return err
 	}
-	if sc.IsTCPForwardingOnPort(srvPort) {
+	if sc.IsTCPForwardingOnPort(srvPort, noService) {
 		return errors.New("cannot remove web handler; currently serving TCP")
 	}
 	hp := ipn.HostPort(net.JoinHostPort(dnsName, strconv.Itoa(int(srvPort))))
-	if !sc.WebHandlerExists(hp, mount) {
+	if !sc.WebHandlerExists(noService, hp, mount) {
 		return errors.New("error: handler does not exist")
 	}
 	sc.RemoveWebHandler(dnsName, srvPort, []string{mount}, false)
@@ -484,13 +499,12 @@ func expandProxyTarget(source string) (string, error) {
 	switch host {
 	case "localhost", "127.0.0.1":
 		host = "127.0.0.1"
+	case "::1":
+		// ok
 	default:
-		return "", fmt.Errorf("only localhost or 127.0.0.1 proxies are currently supported")
+		return "", fmt.Errorf("only localhost, 127.0.0.1, or ::1 proxies are currently supported")
 	}
-	url := u.Scheme + "://" + host
-	if u.Port() != "" {
-		url += ":" + u.Port()
-	}
+	url := u.Scheme + "://" + net.JoinHostPort(host, u.Port())
 	url += u.Path
 	return url, nil
 }
@@ -526,11 +540,11 @@ func (e *serveEnv) handleTCPServe(ctx context.Context, srcType string, srcPort u
 	}
 
 	switch host {
-	case "localhost", "127.0.0.1":
+	case "localhost", "127.0.0.1", "::1":
 		// ok
 	default:
 		fmt.Fprintf(Stderr, "error: invalid TCP source %q\n", dest)
-		fmt.Fprint(Stderr, "must be one of: localhost or 127.0.0.1\n\n", dest)
+		fmt.Fprint(Stderr, "must be one of: localhost, 127.0.0.1, or ::1\n\n", dest)
 		return errHelp
 	}
 
@@ -548,18 +562,21 @@ func (e *serveEnv) handleTCPServe(ctx context.Context, srcType string, srcPort u
 		sc = new(ipn.ServeConfig)
 	}
 
-	fwdAddr := "127.0.0.1:" + dstPortStr
-
-	if sc.IsServingWeb(srcPort) {
-		return fmt.Errorf("cannot serve TCP; already serving web on %d", srcPort)
+	if host == "localhost" {
+		host = "127.0.0.1"
 	}
+	fwdAddr := net.JoinHostPort(host, dstPortStr)
 
 	dnsName, err := e.getSelfDNSName(ctx)
 	if err != nil {
 		return err
 	}
 
-	sc.SetTCPForwarding(srcPort, fwdAddr, terminateTLS, dnsName)
+	if sc.IsServingWeb(srcPort, noService) {
+		return fmt.Errorf("cannot serve TCP; already serving web on %d", srcPort)
+	}
+
+	sc.SetTCPForwarding(srcPort, fwdAddr, terminateTLS, 0 /* proxy proto */, dnsName)
 
 	if !reflect.DeepEqual(cursc, sc) {
 		if err := e.lc.SetServeConfig(ctx, sc); err != nil {
@@ -581,11 +598,11 @@ func (e *serveEnv) handleTCPServeRemove(ctx context.Context, src uint16) error {
 	if sc == nil {
 		sc = new(ipn.ServeConfig)
 	}
-	if sc.IsServingWeb(src) {
+	if sc.IsServingWeb(src, noService) {
 		return fmt.Errorf("unable to remove; serving web, not TCP forwarding on serve port %d", src)
 	}
-	if ph := sc.GetTCPPortHandler(src); ph != nil {
-		sc.RemoveTCPForwarding(src)
+	if ph := sc.GetTCPPortHandler(src, noService); ph != nil {
+		sc.RemoveTCPForwarding(noService, src)
 		return e.lc.SetServeConfig(ctx, sc)
 	}
 	return errors.New("error: serve config does not exist")
@@ -615,7 +632,7 @@ func (e *serveEnv) runServeStatus(ctx context.Context, args []string) error {
 		return nil
 	}
 	printFunnelStatus(ctx)
-	if sc == nil || (len(sc.TCP) == 0 && len(sc.Web) == 0 && len(sc.AllowFunnel) == 0) {
+	if isServeConfigEmpty(sc) {
 		printf("No serve config\n")
 		return nil
 	}
@@ -623,18 +640,8 @@ func (e *serveEnv) runServeStatus(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if sc.IsTCPForwardingAny() {
-		if err := printTCPStatusTree(ctx, sc, st); err != nil {
-			return err
-		}
-		printf("\n")
-	}
-	for hp := range sc.Web {
-		err := e.printWebStatusTree(sc, hp)
-		if err != nil {
-			return err
-		}
-		printf("\n")
+	if err := printServeStatusTrees(sc, st); err != nil {
+		return err
 	}
 	printFunnelWarning(sc)
 	return nil
@@ -647,80 +654,95 @@ func printTCPStatusTree(ctx context.Context, sc *ipn.ServeConfig, st *ipnstate.S
 			continue
 		}
 		hp := ipn.HostPort(net.JoinHostPort(dnsName, strconv.Itoa(int(p))))
-		tlsStatus := "TLS over TCP"
-		if h.TerminateTLS != "" {
-			tlsStatus = "TLS terminated"
-		}
 		fStatus := "tailnet only"
 		if sc.AllowFunnel[hp] {
 			fStatus = "Funnel on"
 		}
-		printf("|-- tcp://%s (%s, %s)\n", hp, tlsStatus, fStatus)
+		if h.TerminateTLS != "" {
+			printf("|-- tcp://%s (TLS-terminated TCP, %s)\n", hp, fStatus)
+		} else {
+			printf("|-- tcp://%s (%s)\n", hp, fStatus)
+		}
 		for _, a := range st.TailscaleIPs {
 			ipp := net.JoinHostPort(a.String(), strconv.Itoa(int(p)))
 			printf("|-- tcp://%s\n", ipp)
 		}
-		printf("|--> tcp://%s\n", h.TCPForward)
+		if strings.HasPrefix(h.TCPForward, "unix:") {
+			printf("|--> %s\n", h.TCPForward)
+		} else {
+			printf("|--> tcp://%s\n", h.TCPForward)
+		}
 	}
 	return nil
 }
 
-func (e *serveEnv) printWebStatusTree(sc *ipn.ServeConfig, hp ipn.HostPort) error {
-	// No-op if no serve config
-	if sc == nil {
+// printWebStatusTree renders one Web entry (the URL line plus its handler
+// tree) for either a node-level serve or a service-level serve. When
+// svcName is the empty string, the entry is treated as node-level. Service
+// entries include the service name in the URL annotation.
+//
+// funnel and https are computed by the caller from the parent ServeConfig
+// so this function does not need a reference to it.
+func printWebStatusTree(wsc *ipn.WebServerConfig, hp ipn.HostPort, funnel, https bool, svcName tailcfg.ServiceName) error {
+	if wsc == nil {
 		return nil
 	}
-	fStatus := "tailnet only"
-	if sc.AllowFunnel[hp] {
-		fStatus = "Funnel on"
-	}
 	host, portStr, _ := net.SplitHostPort(string(hp))
-
-	port, err := parseServePort(portStr)
-	if err != nil {
-		return fmt.Errorf("invalid port %q: %w", portStr, err)
-	}
-
 	scheme := "https"
-	if sc.IsServingHTTP(port) {
+	if !https {
 		scheme = "http"
 	}
-
 	portPart := ":" + portStr
 	if scheme == "http" && portStr == "80" ||
 		scheme == "https" && portStr == "443" {
 		portPart = ""
 	}
-	if scheme == "http" {
-		hostname, _, _ := strings.Cut(host, ".")
-		printf("%s://%s%s (%s)\n", scheme, hostname, portPart, fStatus)
+
+	fStatus := "tailnet only"
+	if funnel {
+		fStatus = "Funnel on"
 	}
-	printf("%s://%s%s (%s)\n", scheme, host, portPart, fStatus)
-	srvTypeAndDesc := func(h *ipn.HTTPHandler) (string, string) {
-		switch {
-		case h.Path != "":
-			return "path", h.Path
-		case h.Proxy != "":
-			return "proxy", h.Proxy
-		case h.Text != "":
-			return "text", "\"" + elipticallyTruncate(h.Text, 20) + "\""
+	if svcName != "" {
+		printf("%s://%s%s (%s) (%s)\n", scheme, host, portPart, fStatus, svcName)
+	} else {
+		if scheme == "http" {
+			hostname, _, _ := strings.Cut(host, ".")
+			printf("%s://%s%s (%s)\n", scheme, hostname, portPart, fStatus)
 		}
-		return "", ""
+		printf("%s://%s%s (%s)\n", scheme, host, portPart, fStatus)
 	}
 
-	mounts := slicesx.MapKeys(sc.Web[hp].Handlers)
+	mounts := slicesx.MapKeys(wsc.Handlers)
+	if len(mounts) == 0 {
+		return nil
+	}
 	sort.Slice(mounts, func(i, j int) bool {
 		return len(mounts[i]) < len(mounts[j])
 	})
 	maxLen := len(mounts[len(mounts)-1])
 
 	for _, m := range mounts {
-		h := sc.Web[hp].Handlers[m]
-		t, d := srvTypeAndDesc(h)
+		h := wsc.Handlers[m]
+		t, d := serveHandlerDesc(h)
 		printf("%s %s%s %-5s %s\n", "|--", m, strings.Repeat(" ", maxLen-len(m)), t, d)
 	}
 
 	return nil
+}
+
+// serveHandlerDesc returns the type label and description for an
+// HTTPHandler, matching the format used by the Web tree printer for
+// node-level and service-level serves.
+func serveHandlerDesc(h *ipn.HTTPHandler) (string, string) {
+	switch {
+	case h.Path != "":
+		return "path", h.Path
+	case h.Proxy != "":
+		return "proxy", h.Proxy
+	case h.Text != "":
+		return "text", "\"" + elipticallyTruncate(h.Text, 20) + "\""
+	}
+	return "", ""
 }
 
 func elipticallyTruncate(s string, max int) string {
@@ -772,7 +794,7 @@ func parseServePort(s string) (uint16, error) {
 //
 // 2023-08-09: The only valid feature values are "serve" and "funnel".
 // This can be moved to some CLI lib when expanded past serve/funnel.
-func (e *serveEnv) enableFeatureInteractive(ctx context.Context, feature string, caps ...tailcfg.NodeCapability) (err error) {
+func (e *serveEnv) enableFeatureInteractive(ctx context.Context, feature string, caps ...nodecap.Cap) (err error) {
 	st, err := e.getLocalClientStatusWithoutPeers(ctx)
 	if err != nil {
 		return fmt.Errorf("getting client status: %w", err)
@@ -835,10 +857,10 @@ func (e *serveEnv) enableFeatureInteractive(ctx context.Context, feature string,
 			e.lc.IncrementCounter(ctx, fmt.Sprintf("%s_enablement_lost_connection", feature), 1)
 			return err
 		}
-		if nm := n.NetMap; nm != nil && nm.SelfNode.Valid() {
+		if self := n.SelfChange; self != nil {
 			gotAll := true
 			for _, c := range caps {
-				if !nm.SelfNode.HasCap(c) {
+				if _, has := self.CapMap[c]; !has {
 					// The feature is not yet enabled.
 					// Continue blocking until it is.
 					gotAll = false

@@ -1,10 +1,11 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package tka
 
 import (
 	"crypto/ed25519"
+	"maps"
 	"sort"
 	"testing"
 )
@@ -36,9 +37,7 @@ func (s *scenarioTest) mkNode(name string) *scenarioNode {
 	}
 
 	aums := make(map[string]AUM, len(s.initial.AUMs))
-	for k, v := range s.initial.AUMs {
-		aums[k] = v
-	}
+	maps.Copy(aums, s.initial.AUMs)
 
 	n := &scenarioNode{
 		A:       authority,
@@ -148,10 +147,7 @@ func testScenario(t *testing.T, sharedChain string, sharedOptions ...testchainOp
 	pub, priv := testingKey25519(t, 1)
 	key := Key{Kind: Key25519, Public: pub, Votes: 1}
 	sharedOptions = append(sharedOptions,
-		optTemplate("genesis", AUM{MessageKind: AUMCheckpoint, State: &State{
-			Keys:               []Key{key},
-			DisablementSecrets: [][]byte{DisablementKDF([]byte{1, 2, 3})},
-		}}),
+		genesisTemplate(key),
 		optKey("key", key, priv),
 		optSignAllUsing("key"))
 
@@ -204,7 +200,7 @@ func TestNormalPropagation(t *testing.T) {
     `)
 	control := s.mkNode("control")
 
-	// Lets say theres a node with some updates!
+	// Let's say there's a node with some updates!
 	n1 := s.mkNodeWithForks("n1", true, map[string]*testChain{
 		"L2": newTestchain(t, `L3 -> L4`),
 	})

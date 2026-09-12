@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package cli
@@ -10,21 +10,35 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
+	"math"
 	"net/http"
-	"sort"
+	"net/netip"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/peterbourgon/ff/v3/ffcli"
 	"tailscale.com/envknob"
+	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/ipn"
 	"tailscale.com/net/netcheck"
 	"tailscale.com/net/netmon"
-	"tailscale.com/net/portmapper"
+	"tailscale.com/net/portmapper/portmappertype"
 	"tailscale.com/net/tlsdial"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tstime"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/eventbus"
+	"tailscale.com/util/set"
+
+	// The "netcheck" command also wants the portmapper linked.
+	//
+	// TODO: make that subcommand either hit LocalAPI for that info, or use a
+	// tailscaled subcommand, to avoid making the CLI also link in the portmapper.
+	// For now (2025-09-15), keep doing what we've done for the past five years and
+	// keep linking it here.
+	_ "tailscale.com/feature/condregister/portmapper"
 )
 
 var netcheckCmd = &ffcli.Command{
@@ -32,19 +46,25 @@ var netcheckCmd = &ffcli.Command{
 	ShortUsage: "tailscale netcheck",
 	ShortHelp:  "Print an analysis of local network conditions",
 	Exec:       runNetcheck,
-	FlagSet: (func() *flag.FlagSet {
-		fs := newFlagSet("netcheck")
-		fs.StringVar(&netcheckArgs.format, "format", "", `output format; empty (for human-readable), "json" or "json-line"`)
-		fs.DurationVar(&netcheckArgs.every, "every", 0, "if non-zero, do an incremental report with the given frequency")
-		fs.BoolVar(&netcheckArgs.verbose, "verbose", false, "verbose logs")
-		return fs
-	})(),
+	FlagSet:    netcheckFlagSet,
 }
 
+var netcheckFlagSet = func() *flag.FlagSet {
+	fs := newFlagSet("netcheck")
+	fs.StringVar(&netcheckArgs.format, "format", "", `output format; empty (for human-readable), "json" or "json-line"`)
+	fs.DurationVar(&netcheckArgs.every, "every", 0, "if non-zero, do an incremental report with the given frequency")
+	fs.BoolVar(&netcheckArgs.verbose, "verbose", false, "verbose logs")
+	fs.StringVar(&netcheckArgs.bindAddress, "bind-address", "", "send and receive connectivity probes using this locally bound IP address; default: OS-assigned")
+	fs.IntVar(&netcheckArgs.bindPort, "bind-port", 0, "send and receive connectivity probes using this UDP port; default: OS-assigned")
+	return fs
+}()
+
 var netcheckArgs struct {
-	format  string
-	every   time.Duration
-	verbose bool
+	format      string
+	every       time.Duration
+	verbose     bool
+	bindAddress string
+	bindPort    int
 }
 
 func runNetcheck(ctx context.Context, args []string) error {
@@ -56,13 +76,18 @@ func runNetcheck(ctx context.Context, args []string) error {
 		return err
 	}
 
-	// Ensure that we close the portmapper after running a netcheck; this
-	// will release any port mappings created.
-	pm := portmapper.NewClient(portmapper.Config{
-		Logf:   logf,
-		NetMon: netMon,
+	var pm portmappertype.Client
+	if buildfeatures.HasPortMapper {
+		// Ensure that we close the portmapper after running a netcheck; this
+		// will release any port mappings created.
+		pm = portmappertype.HookNewPortMapper.Get()(logf, bus, netMon, nil, nil)
+		defer pm.Close()
+	}
+
+	flagsProvided := set.Set[string]{}
+	netcheckFlagSet.Visit(func(f *flag.Flag) {
+		flagsProvided.Add(f.Name)
 	})
-	defer pm.Close()
 
 	c := &netcheck.Client{
 		NetMon:      netMon,
@@ -80,7 +105,17 @@ func runNetcheck(ctx context.Context, args []string) error {
 		fmt.Fprintln(Stderr, "# Warning: this JSON format is not yet considered a stable interface")
 	}
 
-	if err := c.Standalone(ctx, envknob.String("TS_DEBUG_NETCHECK_UDP_BIND")); err != nil {
+	bind, err := createNetcheckBindString(
+		netcheckArgs.bindAddress,
+		flagsProvided.Contains("bind-address"),
+		netcheckArgs.bindPort,
+		flagsProvided.Contains("bind-port"),
+		envknob.String("TS_DEBUG_NETCHECK_UDP_BIND"))
+	if err != nil {
+		return err
+	}
+
+	if err := c.Standalone(ctx, bind); err != nil {
 		fmt.Fprintln(Stderr, "netcheck: UDP test failure:", err)
 	}
 
@@ -110,7 +145,7 @@ func runNetcheck(ctx context.Context, args []string) error {
 		if err != nil {
 			return fmt.Errorf("netcheck: %w", err)
 		}
-		if err := printReport(dm, report); err != nil {
+		if err := printNetCheckReport(dm, report); err != nil {
 			return err
 		}
 		if netcheckArgs.every == 0 {
@@ -120,7 +155,7 @@ func runNetcheck(ctx context.Context, args []string) error {
 	}
 }
 
-func printReport(dm *tailcfg.DERPMap, report *netcheck.Report) error {
+func printNetCheckReport(dm *tailcfg.DERPMap, report *netcheck.Report) error {
 	var j []byte
 	var err error
 	switch netcheckArgs.format {
@@ -142,7 +177,7 @@ func printReport(dm *tailcfg.DERPMap, report *netcheck.Report) error {
 	}
 
 	printf("\nReport:\n")
-	printf("\t* Time: %v\n", report.Now.Format(time.RFC3339Nano))
+	printf("\t* Time: %v\n", report.Now.Local().Format(tstime.DateSpTimeNanoZ))
 	printf("\t* UDP: %v\n", report.UDP)
 	if report.GlobalV4.IsValid() {
 		printf("\t* IPv4: yes, %s\n", report.GlobalV4)
@@ -171,26 +206,16 @@ func printReport(dm *tailcfg.DERPMap, report *netcheck.Report) error {
 		printf("\t* Nearest DERP: unknown (no response to latency probes)\n")
 	} else {
 		if report.PreferredDERP != 0 {
-			printf("\t* Nearest DERP: %v\n", dm.Regions[report.PreferredDERP].RegionName)
+			if region, ok := dm.Regions[report.PreferredDERP]; ok {
+				printf("\t* Nearest DERP: %v\n", region.RegionName)
+			} else {
+				printf("\t* Nearest DERP: %v (region not found in map)\n", report.PreferredDERP)
+			}
 		} else {
 			printf("\t* Nearest DERP: [none]\n")
 		}
 		printf("\t* DERP latency:\n")
-		var rids []int
-		for rid := range dm.Regions {
-			rids = append(rids, rid)
-		}
-		sort.Slice(rids, func(i, j int) bool {
-			l1, ok1 := report.RegionLatency[rids[i]]
-			l2, ok2 := report.RegionLatency[rids[j]]
-			if ok1 != ok2 {
-				return ok1 // defined things sort first
-			}
-			if !ok1 {
-				return rids[i] < rids[j]
-			}
-			return l1 < l2
-		})
+		rids := slices.SortedFunc(maps.Keys(dm.Regions), report.RegionLatency.Compare)
 		for _, rid := range rids {
 			d, ok := report.RegionLatency[rid]
 			var latency string
@@ -209,6 +234,9 @@ func printReport(dm *tailcfg.DERPMap, report *netcheck.Report) error {
 }
 
 func portMapping(r *netcheck.Report) string {
+	if !buildfeatures.HasPortMapper {
+		return "binary built without portmapper support"
+	}
 	if !r.AnyPortMappingChecked() {
 		return "not checked"
 	}
@@ -248,4 +276,45 @@ func prodDERPMap(ctx context.Context, httpc *http.Client) (*tailcfg.DERPMap, err
 		return nil, fmt.Errorf("fetch prodDERPMap: %w", err)
 	}
 	return &derpMap, nil
+}
+
+// createNetcheckBindString determines the netcheck socket bind "address:port" string based
+// on the CLI args and environment variable values used to invoke the netcheck CLI.
+// Arguments cliAddressIsSet and cliPortIsSet explicitly indicate whether the
+// corresponding cliAddress and cliPort were set in CLI args, instead of relying
+// on in-band sentinel values.
+func createNetcheckBindString(cliAddress string, cliAddressIsSet bool, cliPort int, cliPortIsSet bool, envBind string) (string, error) {
+	// Default to port number 0 but overwrite with a valid CLI value, if set.
+	var port uint16 = 0
+	if cliPortIsSet {
+		// 0 is valid, results in OS picking port.
+		if cliPort >= 0 && cliPort <= math.MaxUint16 {
+			port = uint16(cliPort)
+		} else {
+			return "", fmt.Errorf("invalid bind port number: %d", cliPort)
+		}
+	}
+
+	// Use CLI address, if set.
+	if cliAddressIsSet {
+		addr, err := netip.ParseAddr(cliAddress)
+		if err != nil {
+			return "", fmt.Errorf("invalid bind address: %q", cliAddress)
+		}
+		return netip.AddrPortFrom(addr, port).String(), nil
+	} else {
+		// No CLI address set, but port is set.
+		if cliPortIsSet {
+			return fmt.Sprintf(":%d", port), nil
+		}
+	}
+
+	// Fall back to the environment variable.
+	// Intentionally skipping input validation here to avoid breaking legacy usage method.
+	if envBind != "" {
+		return envBind, nil
+	}
+
+	// OS picks both address and port.
+	return ":0", nil
 }

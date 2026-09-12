@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !plan9
@@ -25,6 +25,7 @@ func New(conn io.WriteCloser, clock tstime.Clock, start time.Time, failOpen bool
 		clock:    clock,
 		conn:     conn,
 		failOpen: failOpen,
+		logger:   logger,
 	}
 }
 

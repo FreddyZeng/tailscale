@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package ipnauth
@@ -12,6 +12,11 @@ import (
 // Self is a caller identity that represents the tailscaled itself and therefore
 // has unlimited access.
 var Self Actor = unrestricted{}
+
+// TODO is a caller identity used when the operation is performed on behalf of a user,
+// rather than by tailscaled itself, but the surrounding function is not yet extended
+// to accept an [Actor] parameter. It grants the same unrestricted access as [Self].
+var TODO Actor = unrestricted{}
 
 // unrestricted is an [Actor] that has unlimited access to the currently running
 // tailscaled instance. It's typically used for operations performed by tailscaled
@@ -49,3 +54,10 @@ func (unrestricted) IsLocalSystem() bool { return false }
 // Deprecated: this method exists for compatibility with the current (as of 2025-01-28)
 // permission model and will be removed as we progress on tailscale/corp#18342.
 func (unrestricted) IsLocalAdmin(operatorUID string) bool { return false }
+
+// IsTailscaled reports whether the given Actor represents Tailscaled itself,
+// such as [Self] or a [TODO] placeholder actor.
+func IsTailscaled(a Actor) bool {
+	_, ok := a.(unrestricted)
+	return ok
+}

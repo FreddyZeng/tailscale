@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package dnstype
@@ -17,7 +17,7 @@ func TestResolverEqual(t *testing.T) {
 		fieldNames = append(fieldNames, field.Name)
 	}
 	sort.Strings(fieldNames)
-	if !slices.Equal(fieldNames, []string{"Addr", "BootstrapResolution"}) {
+	if !slices.Equal(fieldNames, []string{"Addr", "BootstrapResolution", "UseWithExitNode"}) {
 		t.Errorf("Resolver fields changed; update test")
 	}
 
@@ -33,13 +33,13 @@ func TestResolverEqual(t *testing.T) {
 			want: true,
 		},
 		{
-			name: "nil vs non-nil",
+			name: "nil-vs-non-nil",
 			a:    nil,
 			b:    &Resolver{},
 			want: false,
 		},
 		{
-			name: "non-nil vs nil",
+			name: "non-nil-vs-nil",
 			a:    &Resolver{},
 			b:    nil,
 			want: false,
@@ -51,13 +51,13 @@ func TestResolverEqual(t *testing.T) {
 			want: true,
 		},
 		{
-			name: "not equal addrs",
+			name: "not-equal-addrs",
 			a:    &Resolver{Addr: "dns.example.com"},
 			b:    &Resolver{Addr: "dns2.example.com"},
 			want: false,
 		},
 		{
-			name: "not equal bootstrap",
+			name: "not-equal-bootstrap",
 			a: &Resolver{
 				Addr:                "dns.example.com",
 				BootstrapResolution: []netip.Addr{netip.MustParseAddr("8.8.8.8")},
@@ -66,6 +66,18 @@ func TestResolverEqual(t *testing.T) {
 				Addr:                "dns.example.com",
 				BootstrapResolution: []netip.Addr{netip.MustParseAddr("8.8.4.4")},
 			},
+			want: false,
+		},
+		{
+			name: "equal-UseWithExitNode",
+			a:    &Resolver{Addr: "dns.example.com", UseWithExitNode: true},
+			b:    &Resolver{Addr: "dns.example.com", UseWithExitNode: true},
+			want: true,
+		},
+		{
+			name: "not-equal-UseWithExitNode",
+			a:    &Resolver{Addr: "dns.example.com", UseWithExitNode: true},
+			b:    &Resolver{Addr: "dns.example.com", UseWithExitNode: false},
 			want: false,
 		},
 	}

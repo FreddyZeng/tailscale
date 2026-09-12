@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package prefs
@@ -9,7 +9,6 @@ import (
 	jsonv2 "github.com/go-json-experiment/json"
 	"github.com/go-json-experiment/json/jsontext"
 	"tailscale.com/types/opt"
-	"tailscale.com/types/ptr"
 	"tailscale.com/types/views"
 )
 
@@ -31,19 +30,19 @@ func StructMapWithOpts[K MapKeyType, V views.Cloner[V]](opts ...Options) StructM
 // SetValue configures the preference with the specified value.
 // It fails and returns [ErrManaged] if p is a managed preference,
 // and [ErrReadOnly] if p is a read-only preference.
-func (l *StructMap[K, V]) SetValue(val map[K]V) error {
-	return l.preference.SetValue(deepCloneMap(val))
+func (m *StructMap[K, V]) SetValue(val map[K]V) error {
+	return m.preference.SetValue(deepCloneMap(val))
 }
 
 // SetManagedValue configures the preference with the specified value
 // and marks the preference as managed.
-func (l *StructMap[K, V]) SetManagedValue(val map[K]V) {
-	l.preference.SetManagedValue(deepCloneMap(val))
+func (m *StructMap[K, V]) SetManagedValue(val map[K]V) {
+	m.preference.SetManagedValue(deepCloneMap(val))
 }
 
 // Clone returns a copy of m that aliases no memory with m.
 func (m StructMap[K, V]) Clone() *StructMap[K, V] {
-	res := ptr.To(m)
+	res := new(m)
 	if v, ok := m.s.Value.GetOk(); ok {
 		res.s.Value.Set(deepCloneMap(v))
 	}

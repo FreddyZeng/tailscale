@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package lapitest
@@ -33,7 +33,7 @@ func newBackend(opts *options) *ipnlocal.LocalBackend {
 		sys.Set(&mem.Store{})
 	}
 
-	e, err := wgengine.NewFakeUserspaceEngine(opts.Logf(), sys.Set, sys.HealthTracker(), sys.UserMetricsRegistry(), sys.Bus.Get())
+	e, err := wgengine.NewFakeUserspaceEngine(opts.Logf(), sys.Set, sys.HealthTracker.Get(), sys.UserMetricsRegistry(), sys.Bus.Get())
 	if err != nil {
 		opts.tb.Fatalf("NewFakeUserspaceEngine: %v", err)
 	}
@@ -45,8 +45,7 @@ func newBackend(opts *options) *ipnlocal.LocalBackend {
 		tb.Fatalf("NewLocalBackend: %v", err)
 	}
 	tb.Cleanup(b.Shutdown)
-	b.DisablePortMapperForTest()
-	b.SetControlClientGetterForTesting(opts.MakeControlClient)
+	b.ForTest().SetControlClientGetter(opts.MakeControlClient)
 	return b
 }
 

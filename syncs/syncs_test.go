@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package syncs
@@ -6,7 +6,9 @@ package syncs
 import (
 	"context"
 	"io"
+	"maps"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -64,6 +66,23 @@ func TestAtomicValue(t *testing.T) {
 			t.Fatalf("LoadOk = (%v, %v), want (nil, true)", got, gotOk)
 		}
 	}
+
+	{
+		c1, c2, c3 := make(chan struct{}), make(chan struct{}), make(chan struct{})
+		var v AtomicValue[chan struct{}]
+		if v.CompareAndSwap(c1, c2) != false {
+			t.Fatalf("CompareAndSwap = true, want false")
+		}
+		if v.CompareAndSwap(nil, c1) != true {
+			t.Fatalf("CompareAndSwap = false, want true")
+		}
+		if v.CompareAndSwap(c2, c3) != false {
+			t.Fatalf("CompareAndSwap = true, want false")
+		}
+		if v.CompareAndSwap(c1, c2) != true {
+			t.Fatalf("CompareAndSwap = false, want true")
+		}
+	}
 }
 
 func TestMutexValue(t *testing.T) {
@@ -81,7 +100,7 @@ func TestMutexValue(t *testing.T) {
 		t.Errorf("Load = %v, want %v", v.Load(), now)
 	}
 
-	var group WaitGroup
+	var group sync.WaitGroup
 	var v2 MutexValue[int]
 	var sum int
 	for i := range 10 {
@@ -144,10 +163,20 @@ func TestClosedChan(t *testing.T) {
 
 func TestSemaphore(t *testing.T) {
 	s := NewSemaphore(2)
+	assertLen := func(want int) {
+		t.Helper()
+		if got := s.Len(); got != want {
+			t.Fatalf("Len = %d, want %d", got, want)
+		}
+	}
+
+	assertLen(0)
 	s.Acquire()
+	assertLen(1)
 	if !s.TryAcquire() {
 		t.Fatal("want true")
 	}
+	assertLen(2)
 	if s.TryAcquire() {
 		t.Fatal("want false")
 	}
@@ -157,11 +186,15 @@ func TestSemaphore(t *testing.T) {
 		t.Fatal("want false")
 	}
 	s.Release()
+	assertLen(1)
 	if !s.AcquireContext(context.Background()) {
 		t.Fatal("want true")
 	}
+	assertLen(2)
 	s.Release()
+	assertLen(1)
 	s.Release()
+	assertLen(0)
 }
 
 func TestMap(t *testing.T) {
@@ -194,9 +227,7 @@ func TestMap(t *testing.T) {
 	}
 	got := map[string]int{}
 	want := map[string]int{"one": 1, "two": 2, "three": 3}
-	for k, v := range m.All() {
-		got[k] = v
-	}
+	maps.Insert(got, m.All())
 	if d := cmp.Diff(got, want); d != "" {
 		t.Errorf("Range mismatch (-got +want):\n%s", d)
 	}
@@ -211,16 +242,14 @@ func TestMap(t *testing.T) {
 	m.Delete("noexist")
 	got = map[string]int{}
 	want = map[string]int{}
-	for k, v := range m.All() {
-		got[k] = v
-	}
+	maps.Insert(got, m.All())
 	if d := cmp.Diff(got, want); d != "" {
 		t.Errorf("Range mismatch (-got +want):\n%s", d)
 	}
 
 	t.Run("LoadOrStore", func(t *testing.T) {
 		var m Map[string, string]
-		var wg WaitGroup
+		var wg sync.WaitGroup
 		var ok1, ok2 bool
 		wg.Go(func() { _, ok1 = m.LoadOrStore("", "") })
 		wg.Go(func() { _, ok2 = m.LoadOrStore("", "") })

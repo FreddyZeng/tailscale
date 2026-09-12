@@ -1,10 +1,10 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !wasm && !tamago && !aix && !solaris && !illumos
 
-// Package tun creates a tuntap device, working around OS-specific
-// quirks if necessary.
+// Package tstun creates a tuntap device, working around OS-specific quirks if
+// necessary.
 package tstun
 
 import (
@@ -18,11 +18,18 @@ import (
 
 	"github.com/tailscale/wireguard-go/tun"
 	"tailscale.com/feature"
+	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/types/logger"
 )
 
-// CrateTAP is the hook set by feature/tap.
+// CreateTAP is the hook maybe set by feature/tap.
 var CreateTAP feature.Hook[func(logf logger.Logf, tapName, bridgeName string) (tun.Device, error)]
+
+// HookSetLinkAttrs is the hook maybe set by feature/linkspeed.
+var HookSetLinkAttrs feature.Hook[func(tun.Device) error]
+
+// modprobeTunHook is a Linux-specific hook to run "/sbin/modprobe tun".
+var modprobeTunHook feature.Hook[func() error]
 
 // New returns a tun.Device for the requested device name, along with
 // the OS-dependent name that was allocated to the device.
@@ -51,7 +58,22 @@ func New(logf logger.Logf, tunName string) (tun.Device, string, error) {
 		if runtime.GOOS == "plan9" {
 			cleanUpPlan9Interfaces()
 		}
-		dev, err = tun.CreateTUN(tunName, int(DefaultTUNMTU()))
+		// Try to create the TUN device up to two times. If it fails
+		// the first time and we're on Linux, try a desperate
+		// "modprobe tun" to load the tun module and try again.
+		for try := range 2 {
+			dev, err = tun.CreateTUN(tunName, int(DefaultTUNMTU()))
+			if err == nil || !modprobeTunHook.IsSet() {
+				if try > 0 {
+					logf("created TUN device %q after doing `modprobe tun`", tunName)
+				}
+				break
+			}
+			if modprobeTunHook.Get()() != nil {
+				// modprobe failed; no point trying again.
+				break
+			}
+		}
 	}
 	if err != nil {
 		return nil, "", err
@@ -60,8 +82,12 @@ func New(logf logger.Logf, tunName string) (tun.Device, string, error) {
 		dev.Close()
 		return nil, "", err
 	}
-	if err := setLinkAttrs(dev); err != nil {
-		logf("setting link attributes: %v", err)
+	if buildfeatures.HasLinkSpeed {
+		if f, ok := HookSetLinkAttrs.GetOk(); ok {
+			if err := f(dev); err != nil {
+				logf("setting link attributes: %v", err)
+			}
+		}
 	}
 	name, err := interfaceName(dev)
 	if err != nil {

@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build linux
@@ -6,31 +6,22 @@
 package linuxfw
 
 import (
-	"bytes"
-	"errors"
 	"fmt"
 	"log"
 	"net/netip"
-	"os"
 	"os/exec"
 	"slices"
 	"strconv"
 	"strings"
 
-	"github.com/coreos/go-iptables/iptables"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/types/logger"
-	"tailscale.com/util/multierr"
-	"tailscale.com/version/distro"
 )
 
 // isNotExistError needs to be overridden in tests that rely on distinguishing
 // this error, because we don't have a good way how to create a new
 // iptables.Error of that type.
-var isNotExistError = func(err error) bool {
-	var e *iptables.Error
-	return errors.As(err, &e) && e.IsNotExist()
-}
+var isNotExistError = func(err error) bool { return false }
 
 type iptablesInterface interface {
 	// Adding this interface for testing purposes so we can mock out
@@ -60,98 +51,6 @@ func checkIP6TablesExists() error {
 		return fmt.Errorf("path not found: %w", err)
 	}
 	return nil
-}
-
-// newIPTablesRunner constructs a NetfilterRunner that programs iptables rules.
-// If the underlying iptables library fails to initialize, that error is
-// returned. The runner probes for IPv6 support once at initialization time and
-// if not found, no IPv6 rules will be modified for the lifetime of the runner.
-func newIPTablesRunner(logf logger.Logf) (*iptablesRunner, error) {
-	ipt4, err := iptables.NewWithProtocol(iptables.ProtocolIPv4)
-	if err != nil {
-		return nil, err
-	}
-
-	supportsV6, supportsV6NAT, supportsV6Filter := false, false, false
-	v6err := CheckIPv6(logf)
-	ip6terr := checkIP6TablesExists()
-	var ipt6 *iptables.IPTables
-	switch {
-	case v6err != nil:
-		logf("disabling tunneled IPv6 due to system IPv6 config: %v", v6err)
-	case ip6terr != nil:
-		logf("disabling tunneled IPv6 due to missing ip6tables: %v", ip6terr)
-	default:
-		supportsV6 = true
-		ipt6, err = iptables.NewWithProtocol(iptables.ProtocolIPv6)
-		if err != nil {
-			return nil, err
-		}
-		supportsV6Filter = checkSupportsV6Filter(ipt6, logf)
-		supportsV6NAT = checkSupportsV6NAT(ipt6, logf)
-		logf("netfilter running in iptables mode v6 = %v, v6filter = %v, v6nat = %v", supportsV6, supportsV6Filter, supportsV6NAT)
-	}
-	return &iptablesRunner{
-		ipt4:              ipt4,
-		ipt6:              ipt6,
-		v6Available:       supportsV6,
-		v6NATAvailable:    supportsV6NAT,
-		v6FilterAvailable: supportsV6Filter}, nil
-}
-
-// checkSupportsV6Filter returns whether the system has a "filter" table in the
-// IPv6 tables. Some container environments such as GitHub codespaces have
-// limited local IPv6 support, and containers containing ip6tables, but do not
-// have kernel support for IPv6 filtering.
-// We will not set ip6tables rules in these instances.
-func checkSupportsV6Filter(ipt *iptables.IPTables, logf logger.Logf) bool {
-	if ipt == nil {
-		return false
-	}
-	_, filterListErr := ipt.ListChains("filter")
-	if filterListErr == nil {
-		return true
-	}
-	logf("ip6tables filtering is not supported on this host: %v", filterListErr)
-	return false
-}
-
-// checkSupportsV6NAT returns whether the system has a "nat" table in the
-// IPv6 netfilter stack.
-//
-// The nat table was added after the initial release of ipv6
-// netfilter, so some older distros ship a kernel that can't NAT IPv6
-// traffic.
-// ipt must be initialized for IPv6.
-func checkSupportsV6NAT(ipt *iptables.IPTables, logf logger.Logf) bool {
-	if ipt == nil || ipt.Proto() != iptables.ProtocolIPv6 {
-		return false
-	}
-	_, natListErr := ipt.ListChains("nat")
-	if natListErr == nil {
-		return true
-	}
-
-	// TODO (irbekrm): the following two checks were added before the check
-	// above that verifies that nat chains can be listed. It is a
-	// container-friendly check (see
-	// https://github.com/tailscale/tailscale/issues/11344), but also should
-	// be good enough on its own in other environments. If we never observe
-	// it falsely succeed, let's remove the other two checks.
-
-	bs, err := os.ReadFile("/proc/net/ip6_tables_names")
-	if err != nil {
-		return false
-	}
-	if bytes.Contains(bs, []byte("nat\n")) {
-		logf("[unexpected] listing nat chains failed, but /proc/net/ip6_tables_name reports a nat table existing")
-		return true
-	}
-	if exec.Command("modprobe", "ip6table_nat").Run() == nil {
-		logf("[unexpected] listing nat chains failed, but modprobe ip6table_nat succeeded")
-		return true
-	}
-	return false
 }
 
 // HasIPV6 reports true if the system supports IPv6.
@@ -196,9 +95,21 @@ func tsChain(chain string) string {
 }
 
 // DelLoopbackRule removes the iptables rule permitting loopback
-// traffic to a Tailscale IP.
+// traffic to a Tailscale IP. A missing rule is not an error: an address
+// left on the interface by a previous tailscaled instance never went
+// through AddLoopbackRule in this one, so removing it must not be
+// blocked by the absence of its loopback rule.
 func (i *iptablesRunner) DelLoopbackRule(addr netip.Addr) error {
-	if err := i.getIPTByAddr(addr).Delete("filter", "ts-input", "-i", "lo", "-s", addr.String(), "-j", "ACCEPT"); err != nil {
+	ipt := i.getIPTByAddr(addr)
+	args := []string{"-i", "lo", "-s", addr.String(), "-j", "ACCEPT"}
+	exists, err := ipt.Exists("filter", "ts-input", args...)
+	if err != nil {
+		return fmt.Errorf("checking loopback allow rule for %q: %w", addr, err)
+	}
+	if !exists {
+		return nil
+	}
+	if err := ipt.Delete("filter", "ts-input", args...); err != nil {
 		return fmt.Errorf("deleting loopback allow rule for %q: %w", addr, err)
 	}
 
@@ -315,23 +226,8 @@ func (i *iptablesRunner) AddBase(tunname string) error {
 // addBase4 adds some basic IPv4 processing rules to be
 // supplemented by later calls to other helpers.
 func (i *iptablesRunner) addBase4(tunname string) error {
-	// Only allow CGNAT range traffic to come from tailscale0. There
-	// is an exception carved out for ranges used by ChromeOS, for
-	// which we fall out of the Tailscale chain.
-	//
-	// Note, this will definitely break nodes that end up using the
-	// CGNAT range for other purposes :(.
-	args := []string{"!", "-i", tunname, "-s", tsaddr.ChromeOSVMRange().String(), "-j", "RETURN"}
-	if err := i.ipt4.Append("filter", "ts-input", args...); err != nil {
-		return fmt.Errorf("adding %v in v4/filter/ts-input: %w", args, err)
-	}
-	args = []string{"!", "-i", tunname, "-s", tsaddr.CGNATRange().String(), "-j", "DROP"}
-	if err := i.ipt4.Append("filter", "ts-input", args...); err != nil {
-		return fmt.Errorf("adding %v in v4/filter/ts-input: %w", args, err)
-	}
-
-	// Explicitly allow all other inbound traffic to the tun interface
-	args = []string{"-i", tunname, "-j", "ACCEPT"}
+	// Explicitly allow all inbound traffic to the tun interface
+	args := []string{"-i", tunname, "-j", "ACCEPT"}
 	if err := i.ipt4.Append("filter", "ts-input", args...); err != nil {
 		return fmt.Errorf("adding %v in v4/filter/ts-input: %w", args, err)
 	}
@@ -347,11 +243,11 @@ func (i *iptablesRunner) addBase4(tunname string) error {
 	// POSTROUTING. So instead, we match on the inbound interface in
 	// filter/FORWARD, and set a packet mark that nat/POSTROUTING can
 	// use to effectively run that same test again.
-	args = []string{"-i", tunname, "-j", "MARK", "--set-mark", TailscaleSubnetRouteMark + "/" + TailscaleFwmarkMask}
+	args = []string{"-i", tunname, "-j", "MARK", "--set-mark", subnetRouteMark + "/" + fwmarkMask}
 	if err := i.ipt4.Append("filter", "ts-forward", args...); err != nil {
 		return fmt.Errorf("adding %v in v4/filter/ts-forward: %w", args, err)
 	}
-	args = []string{"-m", "mark", "--mark", TailscaleSubnetRouteMark + "/" + TailscaleFwmarkMask, "-j", "ACCEPT"}
+	args = []string{"-m", "mark", "--mark", subnetRouteMark + "/" + fwmarkMask, "-j", "ACCEPT"}
 	if err := i.ipt4.Append("filter", "ts-forward", args...); err != nil {
 		return fmt.Errorf("adding %v in v4/filter/ts-forward: %w", args, err)
 	}
@@ -438,7 +334,16 @@ func (i *iptablesRunner) DNATWithLoadBalancer(origDst netip.Addr, dsts []netip.A
 
 func (i *iptablesRunner) ClampMSSToPMTU(tun string, addr netip.Addr) error {
 	table := i.getIPTByAddr(addr)
-	return table.Append("mangle", "FORWARD", "-o", tun, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu")
+	// Clamp MSS on forwarded TCP handshakes in both directions: the SYN
+	// leaving via tun towards the tailnet peer, and the SYN-ACK arriving on
+	// tun and being forwarded back out towards the originating endpoint. A
+	// single -o tun rule only clamps one side of the handshake, leaving the
+	// endpoint on the other side advertising an MSS that is too large for the
+	// tun MTU, which black-holes large segments when PMTU discovery is broken.
+	if err := table.Append("mangle", "FORWARD", "-o", tun, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"); err != nil {
+		return err
+	}
+	return table.Append("mangle", "FORWARD", "-i", tun, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu")
 }
 
 // addBase6 adds some basic IPv6 processing rules to be
@@ -453,11 +358,11 @@ func (i *iptablesRunner) addBase6(tunname string) error {
 		return fmt.Errorf("adding %v in v6/filter/ts-input: %w", args, err)
 	}
 
-	args = []string{"-i", tunname, "-j", "MARK", "--set-mark", TailscaleSubnetRouteMark + "/" + TailscaleFwmarkMask}
+	args = []string{"-i", tunname, "-j", "MARK", "--set-mark", subnetRouteMark + "/" + fwmarkMask}
 	if err := i.ipt6.Append("filter", "ts-forward", args...); err != nil {
 		return fmt.Errorf("adding %v in v6/filter/ts-forward: %w", args, err)
 	}
-	args = []string{"-m", "mark", "--mark", TailscaleSubnetRouteMark + "/" + TailscaleFwmarkMask, "-j", "ACCEPT"}
+	args = []string{"-m", "mark", "--mark", subnetRouteMark + "/" + fwmarkMask, "-j", "ACCEPT"}
 	if err := i.ipt6.Append("filter", "ts-forward", args...); err != nil {
 		return fmt.Errorf("adding %v in v6/filter/ts-forward: %w", args, err)
 	}
@@ -546,7 +451,7 @@ func (i *iptablesRunner) DelHooks(logf logger.Logf) error {
 // AddSNATRule adds a netfilter rule to SNAT traffic destined for
 // local subnets.
 func (i *iptablesRunner) AddSNATRule() error {
-	args := []string{"-m", "mark", "--mark", TailscaleSubnetRouteMark + "/" + TailscaleFwmarkMask, "-j", "MASQUERADE"}
+	args := []string{"-m", "mark", "--mark", subnetRouteMark + "/" + fwmarkMask, "-j", "MASQUERADE"}
 	for _, ipt := range i.getNATTables() {
 		if err := ipt.Append("nat", "ts-postrouting", args...); err != nil {
 			return fmt.Errorf("adding %v in nat/ts-postrouting: %w", args, err)
@@ -558,7 +463,7 @@ func (i *iptablesRunner) AddSNATRule() error {
 // DelSNATRule removes the netfilter rule to SNAT traffic destined for
 // local subnets. An error is returned if the rule does not exist.
 func (i *iptablesRunner) DelSNATRule() error {
-	args := []string{"-m", "mark", "--mark", TailscaleSubnetRouteMark + "/" + TailscaleFwmarkMask, "-j", "MASQUERADE"}
+	args := []string{"-m", "mark", "--mark", subnetRouteMark + "/" + fwmarkMask, "-j", "MASQUERADE"}
 	for _, ipt := range i.getNATTables() {
 		if err := ipt.Delete("nat", "ts-postrouting", args...); err != nil {
 			return fmt.Errorf("deleting %v in nat/ts-postrouting: %w", args, err)
@@ -628,6 +533,110 @@ func (i *iptablesRunner) DelStatefulRule(tunname string) error {
 	return nil
 }
 
+// AddConnmarkSaveRule adds conntrack marking rules to save and restore marks.
+// These rules run in mangle/PREROUTING (to restore marks from conntrack) and
+// mangle/OUTPUT (to save marks to conntrack) before rp_filter checks, enabling
+// proper routing table lookups for exit nodes and subnet routers.
+func (i *iptablesRunner) AddConnmarkSaveRule() error {
+	// Check if rules already exist (idempotency)
+	for _, ipt := range i.getTables() {
+		rules, err := ipt.List("mangle", "PREROUTING")
+		if err != nil {
+			continue
+		}
+		// Look for existing connmark restore rule
+		for _, rule := range rules {
+			if strings.Contains(rule, "CONNMARK") &&
+				strings.Contains(rule, "restore-mark") &&
+				strings.Contains(rule, "ctmask 0xff0000") {
+				// Rules already exist, skip adding
+				return nil
+			}
+		}
+	}
+
+	// mangle/PREROUTING: Restore mark from conntrack for ESTABLISHED/RELATED connections
+	// This runs BEFORE routing decision and rp_filter check
+	// The connmark check ensures we only restore when Tailscale has marked the connection,
+	// preventing us from wiping mark bits set by other systems when ct mark is zero.
+	for _, ipt := range i.getTables() {
+		args := []string{
+			"-m", "conntrack",
+			"--ctstate", "ESTABLISHED,RELATED",
+			"-m", "connmark",
+			"!", "--mark", "0x0/" + fwmarkMask, // Only restore if ct mark has Tailscale bits set
+			"-j", "CONNMARK",
+			"--restore-mark",
+			"--nfmask", fwmarkMask,
+			"--ctmask", fwmarkMask,
+		}
+		if err := ipt.Insert("mangle", "PREROUTING", 1, args...); err != nil {
+			return fmt.Errorf("adding %v in mangle/PREROUTING: %w", args, err)
+		}
+	}
+
+	// mangle/OUTPUT: Save mark to conntrack for NEW connections with non-zero marks
+	for _, ipt := range i.getTables() {
+		args := []string{
+			"-m", "conntrack",
+			"--ctstate", "NEW",
+			"-m", "mark",
+			"!", "--mark", "0x0/" + fwmarkMask,
+			"-j", "CONNMARK",
+			"--save-mark",
+			"--nfmask", fwmarkMask,
+			"--ctmask", fwmarkMask,
+		}
+		if err := ipt.Insert("mangle", "OUTPUT", 1, args...); err != nil {
+			return fmt.Errorf("adding %v in mangle/OUTPUT: %w", args, err)
+		}
+	}
+
+	return nil
+}
+
+// DelConnmarkSaveRule removes conntrack marking rules added by AddConnmarkSaveRule.
+func (i *iptablesRunner) DelConnmarkSaveRule() error {
+	for _, ipt := range i.getTables() {
+		// Delete PREROUTING rule
+		args := []string{
+			"-m", "conntrack",
+			"--ctstate", "ESTABLISHED,RELATED",
+			"-m", "connmark",
+			"!", "--mark", "0x0/" + fwmarkMask,
+			"-j", "CONNMARK",
+			"--restore-mark",
+			"--nfmask", fwmarkMask,
+			"--ctmask", fwmarkMask,
+		}
+		if err := ipt.Delete("mangle", "PREROUTING", args...); err != nil {
+			if !isNotExistError(err) {
+				return fmt.Errorf("deleting connmark rule in mangle/PREROUTING: %w", err)
+			}
+			// Rule doesn't exist - this is fine for idempotency
+		}
+
+		// Delete OUTPUT rule
+		args = []string{
+			"-m", "conntrack",
+			"--ctstate", "NEW",
+			"-m", "mark",
+			"!", "--mark", "0x0/" + fwmarkMask,
+			"-j", "CONNMARK",
+			"--save-mark",
+			"--nfmask", fwmarkMask,
+			"--ctmask", fwmarkMask,
+		}
+		if err := ipt.Delete("mangle", "OUTPUT", args...); err != nil {
+			if !isNotExistError(err) {
+				return fmt.Errorf("deleting connmark rule in mangle/OUTPUT: %w", err)
+			}
+			// Rule doesn't exist - this is fine for idempotency
+		}
+	}
+	return nil
+}
+
 // buildMagicsockPortRule generates the string slice containing the arguments
 // to describe a rule accepting traffic on a particular port to iptables. It is
 // separated out here to avoid repetition in AddMagicsockPortRule and
@@ -685,23 +694,65 @@ func (i *iptablesRunner) DelMagicsockPortRule(port uint16, network string) error
 	return nil
 }
 
-// IPTablesCleanUp removes all Tailscale added iptables rules.
-// Any errors that occur are logged to the provided logf.
-func IPTablesCleanUp(logf logger.Logf) {
-	if distro.Get() == distro.Gokrazy {
-		// Gokrazy uses nftables and doesn't have the "iptables" command.
-		// Avoid log spam on cleanup. (#12277)
-		return
+// buildExternalCGNATRules abstracts out logic for constructing firewall rules
+// for handling non-Tailscale CGNAT traffic, since these rules need to be
+// identical across [AddExternalCGNATRules] and [DelExternalCGNATRules].
+func buildExternalCGNATRules(mode CGNATMode, tunname string) ([][]string, error) {
+	switch mode {
+	case CGNATModeDrop:
+		// Only allow CGNAT range traffic to come from the Tailscale interface.
+		// There is an exception carved out for ranges used by ChromeOS, for
+		// which we fall out of the Tailscale chain.
+		return [][]string{
+			{"!", "-i", tunname, "-s", tsaddr.ChromeOSVMRange().String(), "-j", "RETURN"},
+			{"!", "-i", tunname, "-s", tsaddr.CGNATRange().String(), "-j", "DROP"},
+		}, nil
+	case CGNATModeReturn:
+		// Fall out of the Tailscale chain for CGNAT traffic that doesn't
+		// originate from the Tailscale interface.
+		return [][]string{
+			{"!", "-i", tunname, "-s", tsaddr.CGNATRange().String(), "-j", "RETURN"},
+		}, nil
+	default:
+		return nil, fmt.Errorf("unsupported mode %q", mode)
 	}
-	err := clearRules(iptables.ProtocolIPv4, logf)
-	if err != nil {
-		logf("linuxfw: clear iptables: %v", err)
-	}
+}
 
-	err = clearRules(iptables.ProtocolIPv6, logf)
+// AddExternalCGNATRules adds rules to the ts-input chain to deal with
+// traffic from the CGNAT range that arrives on non-Tailscale network
+// interfaces.
+func (i *iptablesRunner) AddExternalCGNATRules(mode CGNATMode, tunname string) error {
+	rules, err := buildExternalCGNATRules(mode, tunname)
 	if err != nil {
-		logf("linuxfw: clear ip6tables: %v", err)
+		return fmt.Errorf("build cgnat mode rule: %v", err)
 	}
+	for _, rule := range rules {
+		if err := i.ipt4.Append("filter", "ts-input", rule...); err != nil {
+			return fmt.Errorf("adding %v in v4/filter/ts-input: %w", rule, err)
+		}
+	}
+	return nil
+}
+
+// DelExternalCGNATRules removes the rules created by AddExternalCGNATRules,
+// if they exist.
+func (i *iptablesRunner) DelExternalCGNATRules(mode CGNATMode, tunname string) error {
+	rules, err := buildExternalCGNATRules(mode, tunname)
+	if err != nil {
+		return fmt.Errorf("build cgnat mode rule: %v", err)
+	}
+	for _, rule := range rules {
+		if found, err := i.ipt4.Exists("filter", "ts-input", rule...); err != nil {
+			return fmt.Errorf("checking for %v in v4/filter/ts-input: %w", rule, err)
+		} else if !found {
+			// Don't need to delete a rule that isn't there.
+			continue
+		}
+		if err := i.ipt4.Delete("filter", "ts-input", rule...); err != nil {
+			return fmt.Errorf("deleting %v in v4/filter/ts-input: %w", rule, err)
+		}
+	}
+	return nil
 }
 
 // delTSHook deletes hook in a chain that jumps to a ts-chain. If the hook does not
@@ -730,40 +781,6 @@ func delChain(ipt iptablesInterface, table, chain string) error {
 		return fmt.Errorf("deleting %s/%s: %w", table, chain, err)
 	}
 	return nil
-}
-
-// clearRules clears all the iptables rules created by Tailscale
-// for the given protocol. If error occurs, it's logged but not returned.
-func clearRules(proto iptables.Protocol, logf logger.Logf) error {
-	ipt, err := iptables.NewWithProtocol(proto)
-	if err != nil {
-		return err
-	}
-
-	var errs []error
-
-	if err := delTSHook(ipt, "filter", "INPUT", logf); err != nil {
-		errs = append(errs, err)
-	}
-	if err := delTSHook(ipt, "filter", "FORWARD", logf); err != nil {
-		errs = append(errs, err)
-	}
-	if err := delTSHook(ipt, "nat", "POSTROUTING", logf); err != nil {
-		errs = append(errs, err)
-	}
-
-	if err := delChain(ipt, "filter", "ts-input"); err != nil {
-		errs = append(errs, err)
-	}
-	if err := delChain(ipt, "filter", "ts-forward"); err != nil {
-		errs = append(errs, err)
-	}
-
-	if err := delChain(ipt, "nat", "ts-postrouting"); err != nil {
-		errs = append(errs, err)
-	}
-
-	return multierr.New(errs...)
 }
 
 // argsFromPostRoutingRule accepts a rule as returned by iptables.List and, if it is a rule from POSTROUTING chain,

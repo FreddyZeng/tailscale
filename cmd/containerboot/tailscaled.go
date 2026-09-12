@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build linux
@@ -69,7 +69,7 @@ func startTailscaled(ctx context.Context, cfg *settings) (*local.Client, *os.Pro
 func tailscaledArgs(cfg *settings) []string {
 	args := []string{"--socket=" + cfg.Socket}
 	switch {
-	case cfg.InKubernetes && cfg.KubeSecret != "":
+	case cfg.KubeSecret != "":
 		args = append(args, "--state=kube:"+cfg.KubeSecret)
 		if cfg.StateDir == "" {
 			cfg.StateDir = "/tmp"
@@ -120,6 +120,18 @@ func tailscaleUp(ctx context.Context, cfg *settings) error {
 	if cfg.AuthKey != "" {
 		args = append(args, "--authkey="+cfg.AuthKey)
 	}
+	if cfg.ClientID != "" {
+		args = append(args, "--client-id="+cfg.ClientID)
+	}
+	if cfg.ClientSecret != "" {
+		args = append(args, "--client-secret="+cfg.ClientSecret)
+	}
+	if cfg.IDToken != "" {
+		args = append(args, "--id-token="+cfg.IDToken)
+	}
+	if cfg.Audience != "" {
+		args = append(args, "--audience="+cfg.Audience)
+	}
 	// --advertise-routes can be passed an empty string to configure a
 	// device (that might have previously advertised subnet routes) to not
 	// advertise any routes. Respect an empty string passed by a user and
@@ -138,7 +150,15 @@ func tailscaleUp(ctx context.Context, cfg *settings) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("tailscale up failed: %v", err)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			// A canceled context kills the command, and cmd.Run can
+			// report the subprocess's death ("signal: killed") rather
+			// than the context error that caused it. Return the
+			// context error so that callers (and ultimately main) can
+			// recognize a graceful shutdown with errors.Is.
+			return fmt.Errorf("tailscale up failed: %w", ctxErr)
+		}
+		return fmt.Errorf("tailscale up failed: %w", err)
 	}
 	return nil
 }
@@ -168,7 +188,11 @@ func tailscaleSet(ctx context.Context, cfg *settings) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("tailscale set failed: %v", err)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			// See the equivalent check in tailscaleUp.
+			return fmt.Errorf("tailscale set failed: %w", ctxErr)
+		}
+		return fmt.Errorf("tailscale set failed: %w", err)
 	}
 	return nil
 }

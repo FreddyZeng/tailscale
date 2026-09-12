@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package ipnserver runs the LocalAPI HTTP server that communicates
@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"os/user"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,15 +24,17 @@ import (
 
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/envknob"
+	"tailscale.com/feature"
+	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/ipn/ipnauth"
 	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/ipn/localapi"
 	"tailscale.com/net/netmon"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/logid"
+	"tailscale.com/util/eventbus"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/set"
-	"tailscale.com/util/systemd"
 	"tailscale.com/util/testenv"
 )
 
@@ -40,6 +43,7 @@ import (
 type Server struct {
 	lb           atomic.Pointer[ipnlocal.LocalBackend]
 	logf         logger.Logf
+	bus          *eventbus.Bus
 	netMon       *netmon.Monitor // must be non-nil
 	backendLogID logid.PublicID
 
@@ -118,6 +122,10 @@ func (s *Server) awaitBackend(ctx context.Context) (_ *ipnlocal.LocalBackend, ok
 // This is primarily for the Windows GUI, because wintun can take awhile to
 // come up. See https://github.com/tailscale/tailscale/issues/6522.
 func (s *Server) serveServerStatus(w http.ResponseWriter, r *http.Request) {
+	if !buildfeatures.HasDebug && runtime.GOOS != "windows" {
+		http.Error(w, feature.ErrUnavailable.Error(), http.StatusNotFound)
+		return
+	}
 	ctx := r.Context()
 
 	w.Header().Set("Content-Type", "application/json")
@@ -199,7 +207,13 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			ci = actorWithAccessOverride(actor, string(reason))
 		}
 
-		lah := localapi.NewHandler(ci, lb, s.logf, s.backendLogID)
+		lah := localapi.NewHandler(localapi.HandlerConfig{
+			Actor:    ci,
+			Backend:  lb,
+			Logf:     s.logf,
+			LogID:    s.backendLogID,
+			EventBus: lb.Sys().Bus.Get(),
+		})
 		if actor, ok := ci.(*actor); ok {
 			lah.PermitRead, lah.PermitWrite = actor.Permissions(lb.OperatorUserID())
 			lah.PermitCert = actor.CanFetchCerts()
@@ -374,6 +388,9 @@ func isAllDigit(s string) bool {
 // connection. It's intended to give your non-root webserver access
 // (www-data, caddy, nginx, etc) to certs.
 func (a *actor) CanFetchCerts() bool {
+	if !buildfeatures.HasACME {
+		return false
+	}
 	if a.ci.IsUnixSock() && a.ci.Creds() != nil {
 		connUID, ok := a.ci.Creds().UserID()
 		if ok && connUID == userIDFromString(envknob.String("TS_PERMIT_CERT_UID")) {
@@ -390,6 +407,10 @@ func (a *actor) CanFetchCerts() bool {
 //
 // onDone must be called when the HTTP request is done.
 func (s *Server) addActiveHTTPRequest(req *http.Request, actor ipnauth.Actor) (onDone func(), err error) {
+	if runtime.GOOS != "windows" && !buildfeatures.HasUnixSocketIdentity {
+		return func() {}, nil
+	}
+
 	if actor == nil {
 		return nil, errors.New("internal error: nil actor")
 	}
@@ -408,7 +429,7 @@ func (s *Server) addActiveHTTPRequest(req *http.Request, actor ipnauth.Actor) (o
 	if len(s.activeReqs) == 1 {
 		if envknob.GOOS() == "windows" && !actor.IsLocalSystem() {
 			// Tell the LocalBackend about the identity we're now running as,
-			// unless its the SYSTEM user. That user is not a real account and
+			// unless it's the SYSTEM user. That user is not a real account and
 			// doesn't have a home directory.
 			lb.SetCurrentUser(actor)
 		}
@@ -440,13 +461,14 @@ func (s *Server) addActiveHTTPRequest(req *http.Request, actor ipnauth.Actor) (o
 //
 // At some point, either before or after Run, the Server's SetLocalBackend
 // method must also be called before Server can do anything useful.
-func New(logf logger.Logf, logID logid.PublicID, netMon *netmon.Monitor) *Server {
+func New(logf logger.Logf, logID logid.PublicID, bus *eventbus.Bus, netMon *netmon.Monitor) *Server {
 	if netMon == nil {
 		panic("nil netMon")
 	}
 	return &Server{
 		backendLogID: logID,
 		logf:         logf,
+		bus:          bus,
 		netMon:       netMon,
 	}
 }
@@ -488,17 +510,25 @@ func (s *Server) Run(ctx context.Context, ln net.Listener) error {
 	runDone := make(chan struct{})
 	defer close(runDone)
 
-	// When the context is closed or when we return, whichever is first, close our listener
+	ec := s.bus.Client("ipnserver.Server")
+	defer ec.Close()
+	shutdownSub := eventbus.Subscribe[localapi.Shutdown](ec)
+
+	// When the context is closed, a [localapi.Shutdown] event is received,
+	// or when we return, whichever is first, close our listener
 	// and all open connections.
 	go func() {
 		select {
+		case <-shutdownSub.Events():
 		case <-ctx.Done():
 		case <-runDone:
 		}
 		ln.Close()
 	}()
 
-	systemd.Ready()
+	if ready, ok := feature.HookSystemdReady.GetOk(); ok {
+		ready()
+	}
 
 	hs := &http.Server{
 		Handler:     http.HandlerFunc(s.serveHTTP),
@@ -521,6 +551,10 @@ func (s *Server) Run(ctx context.Context, ln net.Listener) error {
 // Windows and via $DEBUG_LISTENER/debug/ipn when tailscaled's --debug flag
 // is used to run a debug server.
 func (s *Server) ServeHTMLStatus(w http.ResponseWriter, r *http.Request) {
+	if !buildfeatures.HasDebug {
+		http.Error(w, feature.ErrUnavailable.Error(), http.StatusNotFound)
+		return
+	}
 	lb := s.lb.Load()
 	if lb == nil {
 		http.Error(w, "no LocalBackend", http.StatusServiceUnavailable)

@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package source
@@ -16,6 +16,8 @@ import (
 	"tailscale.com/util/set"
 	"tailscale.com/util/syspolicy/internal/loggerx"
 	"tailscale.com/util/syspolicy/internal/metrics"
+	"tailscale.com/util/syspolicy/pkey"
+	"tailscale.com/util/syspolicy/ptype"
 	"tailscale.com/util/syspolicy/setting"
 )
 
@@ -89,7 +91,7 @@ func newReader(store Store, origin *setting.Origin) (*Reader, error) {
 }
 
 // GetSettings returns the current [*setting.Snapshot],
-// re-reading it from from the underlying [Store] only if the policy
+// re-reading it from the underlying [Store] only if the policy
 // has changed since it was read last. It never fails and returns
 // the previous version of the policy settings if a read attempt fails.
 func (r *Reader) GetSettings() *setting.Snapshot {
@@ -123,6 +125,11 @@ func (r *Reader) ReadSettings() (*setting.Snapshot, error) {
 func (r *Reader) reload(force bool) (*setting.Snapshot, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.closing {
+		// The reader is closing (or already closed) and r.store may be nil.
+		// Return the last known policy instead of reading from the store.
+		return r.lastPolicy, nil
+	}
 	if r.upToDate && !force {
 		return r.lastPolicy, nil
 	}
@@ -138,9 +145,9 @@ func (r *Reader) reload(force bool) (*setting.Snapshot, error) {
 
 	metrics.Reset(r.origin)
 
-	var m map[setting.Key]setting.RawItem
+	var m map[pkey.Key]setting.RawItem
 	if lastPolicyCount := r.lastPolicy.Len(); lastPolicyCount > 0 {
-		m = make(map[setting.Key]setting.RawItem, lastPolicyCount)
+		m = make(map[pkey.Key]setting.RawItem, lastPolicyCount)
 	}
 	for _, s := range r.settings {
 		if !r.origin.Scope().IsConfigurableSetting(s) {
@@ -265,12 +272,13 @@ func (r *Reader) Close() error {
 			return err
 		}
 	}
-	r.store = nil
-
 	close(r.doneCh)
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	// Nil out the store only while holding r.mu; reload reads r.store
+	// under the same lock, so writing it unlocked would be a data race.
+	r.store = nil
 	for _, c := range r.sessions {
 		c.closeInternal()
 	}
@@ -364,21 +372,21 @@ func readPolicySettingValue(store Store, s *setting.Definition) (value any, err 
 	case setting.PreferenceOptionValue:
 		s, err := store.ReadString(key)
 		if err == nil {
-			var value setting.PreferenceOption
+			var value ptype.PreferenceOption
 			if err = value.UnmarshalText([]byte(s)); err == nil {
 				return value, nil
 			}
 		}
-		return setting.ShowChoiceByPolicy, err
+		return ptype.ShowChoiceByPolicy, err
 	case setting.VisibilityValue:
 		s, err := store.ReadString(key)
 		if err == nil {
-			var value setting.Visibility
+			var value ptype.Visibility
 			if err = value.UnmarshalText([]byte(s)); err == nil {
 				return value, nil
 			}
 		}
-		return setting.VisibleByPolicy, err
+		return ptype.VisibleByPolicy, err
 	case setting.DurationValue:
 		s, err := store.ReadString(key)
 		if err == nil {

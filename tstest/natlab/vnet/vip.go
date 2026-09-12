@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package vnet
@@ -19,7 +19,51 @@ var (
 	fakeDERP2             = newVIP("derp2.tailscale", "33.4.0.2") // 3340=DERP; 2=derp 2
 	fakeLogCatcher        = newVIP("log.tailscale.com", 4)
 	fakeSyslog            = newVIP("syslog.tailscale", 9)
+	fakeCloudInit         = newVIP("cloud-init.tailscale", 5) // serves cloud-init metadata/userdata per node
+	fakeFiles             = newVIP("files.tailscale", 6)      // serves binary files (tta, tailscale, tailscaled) to VMs
+	fakeACME              = newVIP("acme.example", 7)         // fake ACME CA for vmtests
+
+	// fakeSplitDNS is a second DNS server, distinct from fakeDNS, serving only
+	// splitDNSZone.
+	fakeSplitDNS = newVIP("split-dns", "4.11.4.12", "2411::412")
+
+	// FakeDualStackWeb is a dual-stack webserver VIP used by
+	// TestExitNodeV4Only to verify that traffic works through an
+	// IPv4-only exit node even when DNS returns both A and AAAA.
+	FakeDualStackWeb = newVIP("dualstack-web.example.com", "5.0.0.100", "2052::5:100")
 )
+
+// The zone served *only* by fakeSplitDNS, never by the default fakeDNS. An
+// answer of SplitDNSAddr for SplitDNSName therefore proves a split-DNS route to
+// fakeSplitDNS was honored; point a route for SplitDNSDomain at
+// [FakeSplitDNSIPv4] to verify that. Names are in DNS wire format, as the query
+// parser produces them: no trailing dot.
+const (
+	SplitDNSDomain = "split-dns.example"
+	SplitDNSName   = "internal." + SplitDNSDomain
+	SplitDNSAddr   = "10.99.1.1"
+
+	// SplitDNSBareName is a single label, for tests that need an
+	// upstream-only answer for a name no search domain has completed. Being
+	// outside SplitDNSDomain, it is reached by a resolver pointed at
+	// [FakeSplitDNSIPv4], not by a route for that domain.
+	SplitDNSBareName = "bare-upstream-only"
+	SplitDNSBareAddr = "10.99.1.2"
+)
+
+// splitDNSZone holds the names served only by fakeSplitDNS.
+var splitDNSZone = map[string]netip.Addr{
+	SplitDNSName:     netip.MustParseAddr(SplitDNSAddr),
+	SplitDNSBareName: netip.MustParseAddr(SplitDNSBareAddr),
+}
+
+// FakeSplitDNSIPv4 returns the IPv4 address of the secondary (split-DNS) fake
+// DNS server. It answers only [SplitDNSName] and [SplitDNSBareName].
+func FakeSplitDNSIPv4() netip.Addr { return fakeSplitDNS.v4 }
+
+// FakeSplitDNSIPv6 returns the IPv6 address of the secondary (split-DNS) fake
+// DNS server.
+func FakeSplitDNSIPv6() netip.Addr { return fakeSplitDNS.v6 }
 
 type virtualIP struct {
 	name string // for DNS
@@ -30,6 +74,13 @@ type virtualIP struct {
 func (v virtualIP) Match(a netip.Addr) bool {
 	return v.v4 == a.Unmap() || v.v6 == a
 }
+
+// TestDriverIPv4 returns the IPv4 address of the test driver VIP (52.52.0.2).
+// TTA agents dial this IP on port TestDriverPort to connect to the test harness.
+func TestDriverIPv4() netip.Addr { return fakeTestAgent.v4 }
+
+// TestDriverPort is the port the test driver listens on.
+const TestDriverPort = 8008
 
 // FakeDNSIPv4 returns the fake DNS IPv4 address.
 func FakeDNSIPv4() netip.Addr { return fakeDNS.v4 }

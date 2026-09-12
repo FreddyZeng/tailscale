@@ -1,38 +1,57 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
+
+//go:build !ts_omit_drive
 
 package ipnlocal
 
 import (
+	"errors"
 	"fmt"
+	"io"
+	"iter"
+	"net/http"
+	"net/netip"
 	"os"
 	"slices"
 
 	"tailscale.com/drive"
 	"tailscale.com/ipn"
-	"tailscale.com/tailcfg"
-	"tailscale.com/types/netmap"
+	"tailscale.com/tailcfg/peercap"
+	"tailscale.com/types/logger"
 	"tailscale.com/types/views"
+	"tailscale.com/util/httpm"
 )
 
-const (
-	// DriveLocalPort is the port on which the Taildrive listens for location
-	// connections on quad 100.
-	DriveLocalPort = 8080
-)
-
-// DriveSharingEnabled reports whether sharing to remote nodes via Taildrive is
-// enabled. This is currently based on checking for the drive:share node
-// attribute.
-func (b *LocalBackend) DriveSharingEnabled() bool {
-	return b.currentNode().SelfHasCap(tailcfg.NodeAttrsTaildriveShare)
+func init() {
+	hookSetNetMapLockedDrive.Set(setNetMapLockedDrive)
+	hookInstallDriveRemoteSource.Set(installDriveRemoteSource)
 }
 
-// DriveAccessEnabled reports whether accessing Taildrive shares on remote nodes
-// is enabled. This is currently based on checking for the drive:access node
-// attribute.
-func (b *LocalBackend) DriveAccessEnabled() bool {
-	return b.currentNode().SelfHasCap(tailcfg.NodeAttrsTaildriveAccess)
+// setNetMapLockedDrive runs on every full netmap install (the only path that
+// can flip self caps or change the tailnet domain) to re-notify IPN bus
+// listeners of the current local shares.
+//
+// It deliberately does NOT touch the remotes list passed to the local drive
+// filesystem: that flows through [driveRemoteSource], which the filesystem
+// pulls from lazily and only when something might have changed. See
+// [LocalBackend.driveGen].
+func setNetMapLockedDrive(b *LocalBackend) {
+	b.driveNotifyCurrentSharesLocked()
+}
+
+// installDriveRemoteSource registers a [drive.RemoteSource] on the local
+// Taildrive filesystem so it can pull the current set of remotes on demand
+// instead of being pushed a fresh list on every netmap update.
+//
+// It is wired from [NewLocalBackend] via [hookInstallDriveRemoteSource] so
+// non-drive builds don't reference the drive package at all.
+func installDriveRemoteSource(b *LocalBackend) {
+	fs, ok := b.sys.DriveForLocal.GetOK()
+	if !ok {
+		return
+	}
+	fs.SetRemoteSource(driveRemoteSource{b})
 }
 
 // DriveSetServerAddr tells Taildrive to use the given address for connecting
@@ -288,61 +307,228 @@ func (b *LocalBackend) DriveGetShares() views.SliceView[*drive.Share, drive.Shar
 	return b.pm.prefs.DriveShares()
 }
 
-// updateDrivePeersLocked sets all applicable peers from the netmap as Taildrive
-// remotes.
-func (b *LocalBackend) updateDrivePeersLocked(nm *netmap.NetworkMap) {
-	fs, ok := b.sys.DriveForLocal.GetOK()
-	if !ok {
+// driveRemoteSource implements [drive.RemoteSource] by reading from a
+// [LocalBackend]. It is installed once on the local Taildrive filesystem
+// at [NewLocalBackend] time and consulted lazily on incoming WebDAV
+// requests.
+//
+// The filesystem only rebuilds its internal child list when [Generation]
+// changes, so peer churn that doesn't affect the drive-capable peer set
+// (e.g. endpoint or online-status mutations on non-drive peers) costs
+// nothing more than a single atomic load.
+type driveRemoteSource struct{ b *LocalBackend }
+
+// Generation implements [drive.RemoteSource].
+func (s driveRemoteSource) Generation() uint64 {
+	return s.b.driveGen.Load()
+}
+
+// Domain implements [drive.RemoteSource].
+func (s driveRemoteSource) Domain() string {
+	nm := s.b.currentNode().NetMap()
+	if nm == nil {
+		return ""
+	}
+	return nm.Domain
+}
+
+// Transport implements [drive.RemoteSource].
+func (s driveRemoteSource) Transport() http.RoundTripper {
+	return s.b.newDriveTransport()
+}
+
+// Remotes implements [drive.RemoteSource]. It yields one [*drive.Remote]
+// per peer; the per-Remote Available closure filters out peers that
+// aren't online, don't expose PeerAPI, or haven't granted us the
+// Taildrive sharer cap. If drive access is disabled on this node, no
+// remotes are yielded at all, so the filesystem ends up with an empty
+// child list.
+func (s driveRemoteSource) Remotes() iter.Seq[*drive.Remote] {
+	return func(yield func(*drive.Remote) bool) {
+		b := s.b
+		if !b.DriveAccessEnabled() {
+			return
+		}
+		cn := b.currentNode()
+		peers := cn.Peers()
+		b.logf("[v1] taildrive: building drive remotes from %d peers", len(peers))
+		for _, peer := range peers {
+			peerID := peer.ID()
+			peerKey := peer.Key().ShortString()
+			peerName := peer.DisplayName(false)
+			r := &drive.Remote{
+				Name: peerName,
+				URL: func() string {
+					url := fmt.Sprintf("%s/%s", cn.PeerAPIBase(peer), taildrivePrefix[1:])
+					b.logf("[v2] taildrive: url for peer %s (%s): %s", peerKey, peerName, url)
+					return url
+				},
+				Available: func() bool {
+					// Peers are available to Taildrive if:
+					// - They are online
+					// - Their PeerAPI is reachable
+					// - They are allowed to share at least one folder with us
+					peer, ok := cn.NodeByID(peerID)
+					if !ok {
+						b.logf("[v2] taildrive: peer %s (%s, id=%v) not found", peerKey, peerName, peerID)
+						return false
+					}
+					if !peer.Online().Get() {
+						b.logf("[v2] taildrive: peer %s (%s, id=%v) offline", peerKey, peerName, peerID)
+						return false
+					}
+					if cn.PeerAPIBase(peer) == "" {
+						b.logf("[v2] taildrive: peer %s (%s, id=%v) PeerAPI unreachable", peerKey, peerName, peerID)
+						return false
+					}
+					if cn.PeerHasCap(peer, peercap.TaildriveSharer) {
+						b.logf("[v2] taildrive: peer %s (%s, id=%v) available", peerKey, peerName, peerID)
+						return true
+					}
+					b.logf("[v2] taildrive: peer %s (%s, id=%v) not allowed to share", peerKey, peerName, peerID)
+					return false
+				},
+			}
+			if !yield(r) {
+				return
+			}
+		}
+	}
+}
+
+// responseBodyWrapper wraps an io.ReadCloser and stores
+// the number of bytesRead.
+type responseBodyWrapper struct {
+	io.ReadCloser
+	logVerbose    bool
+	bytesRx       int64
+	bytesTx       int64
+	log           logger.Logf
+	method        string
+	statusCode    int
+	contentType   string
+	fileExtension string
+	shareNodeKey  string
+	selfNodeKey   string
+	contentLength int64
+}
+
+// logAccess logs the taildrive: access: log line. If the logger is nil,
+// the log will not be written.
+func (rbw *responseBodyWrapper) logAccess(err string) {
+	if rbw.log == nil {
 		return
 	}
 
-	var driveRemotes []*drive.Remote
-	if b.DriveAccessEnabled() {
-		// Only populate peers if access is enabled, otherwise leave blank.
-		driveRemotes = b.driveRemotesFromPeers(nm)
+	// Some operating systems create and copy lots of 0 length hidden files for
+	// tracking various states. Omit these to keep logs from being too verbose.
+	if rbw.logVerbose || rbw.contentLength > 0 {
+		levelPrefix := ""
+		if rbw.logVerbose {
+			levelPrefix = "[v1] "
+		}
+		rbw.log(
+			"%staildrive: access: %s from %s to %s: status-code=%d ext=%q content-type=%q content-length=%.f tx=%.f rx=%.f err=%q",
+			levelPrefix,
+			rbw.method,
+			rbw.selfNodeKey,
+			rbw.shareNodeKey,
+			rbw.statusCode,
+			rbw.fileExtension,
+			rbw.contentType,
+			roundTraffic(rbw.contentLength),
+			roundTraffic(rbw.bytesTx), roundTraffic(rbw.bytesRx), err)
 	}
-
-	fs.SetRemotes(nm.Domain, driveRemotes, b.newDriveTransport())
 }
 
-func (b *LocalBackend) driveRemotesFromPeers(nm *netmap.NetworkMap) []*drive.Remote {
-	driveRemotes := make([]*drive.Remote, 0, len(nm.Peers))
-	for _, p := range nm.Peers {
-		peerID := p.ID()
-		url := fmt.Sprintf("%s/%s", peerAPIBase(nm, p), taildrivePrefix[1:])
-		driveRemotes = append(driveRemotes, &drive.Remote{
-			Name: p.DisplayName(false),
-			URL:  url,
-			Available: func() bool {
-				// Peers are available to Taildrive if:
-				// - They are online
-				// - They are allowed to share at least one folder with us
-				cn := b.currentNode()
-				peer, ok := cn.PeerByID(peerID)
-				if !ok {
-					return false
-				}
-
-				// Exclude offline peers.
-				// TODO(oxtoacart): for some reason, this correctly
-				// catches when a node goes from offline to online,
-				// but not the other way around...
-				// TODO(oxtoacart,nickkhyl): the reason was probably
-				// that we were using netmap.Peers instead of b.peers.
-				// The netmap.Peers slice is not updated in all cases.
-				// It should be fixed now that we use PeerByIDOk.
-				if !peer.Online().Get() {
-					return false
-				}
-
-				// Check that the peer is allowed to share with us.
-				if cn.PeerHasCap(peer, tailcfg.PeerCapabilityTaildriveSharer) {
-					return true
-				}
-
-				return false
-			},
-		})
+// Read implements the io.Reader interface.
+func (rbw *responseBodyWrapper) Read(b []byte) (int, error) {
+	n, err := rbw.ReadCloser.Read(b)
+	rbw.bytesRx += int64(n)
+	if err != nil && !errors.Is(err, io.EOF) {
+		rbw.logAccess(err.Error())
 	}
-	return driveRemotes
+
+	return n, err
+}
+
+// Close implements the io.Close interface.
+func (rbw *responseBodyWrapper) Close() error {
+	err := rbw.ReadCloser.Close()
+	var errStr string
+	if err != nil {
+		errStr = err.Error()
+	}
+	rbw.logAccess(errStr)
+
+	return err
+}
+
+// driveTransport is an http.RoundTripper that wraps
+// b.Dialer().PeerAPITransport() with metrics tracking.
+type driveTransport struct {
+	b  *LocalBackend
+	tr http.RoundTripper
+}
+
+func (b *LocalBackend) newDriveTransport() *driveTransport {
+	return &driveTransport{
+		b:  b,
+		tr: b.Dialer().PeerAPITransport(),
+	}
+}
+
+func (dt *driveTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Some WebDAV clients include origin and refer headers, which peerapi does
+	// not like. Remove them.
+	req.Header.Del("origin")
+	req.Header.Del("referer")
+
+	bw := &requestBodyWrapper{}
+	if req.Body != nil {
+		bw.ReadCloser = req.Body
+		req.Body = bw
+	}
+
+	resp, err := dt.tr.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+
+	contentType := "unknown"
+	if ct := req.Header.Get("Content-Type"); ct != "" {
+		contentType = ct
+	}
+
+	dt.b.mu.Lock()
+	selfNodeKey := dt.b.currentNode().Self().Key().ShortString()
+	dt.b.mu.Unlock()
+	n, _, ok := dt.b.WhoIs("tcp", netip.MustParseAddrPort(req.URL.Host))
+	shareNodeKey := "unknown"
+	if ok {
+		shareNodeKey = string(n.Key().ShortString())
+	}
+
+	rbw := responseBodyWrapper{
+		log:           dt.b.logf,
+		logVerbose:    req.Method != httpm.GET && req.Method != httpm.PUT, // other requests like PROPFIND are quite chatty, so we log those at verbose level
+		method:        req.Method,
+		bytesTx:       int64(bw.bytesRead),
+		selfNodeKey:   selfNodeKey,
+		shareNodeKey:  shareNodeKey,
+		contentType:   contentType,
+		contentLength: resp.ContentLength,
+		fileExtension: parseDriveFileExtensionForLog(req.URL.Path),
+		statusCode:    resp.StatusCode,
+		ReadCloser:    resp.Body,
+	}
+
+	if resp.StatusCode >= 400 {
+		// in case of error response, just log immediately
+		rbw.logAccess("")
+	} else {
+		resp.Body = &rbw
+	}
+
+	return resp, nil
 }

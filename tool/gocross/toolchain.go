@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package main
@@ -43,7 +43,11 @@ findTopLevel:
 		}
 	}
 
-	return readRevFile(filepath.Join(d, "go.toolchain.rev"))
+	revFile := "go.toolchain.rev"
+	if os.Getenv("TS_GO_NEXT") == "1" {
+		revFile = "go.toolchain.next.rev"
+	}
+	return readRevFile(filepath.Join(d, revFile))
 }
 
 func readRevFile(path string) (string, error) {
@@ -60,9 +64,17 @@ func getToolchain() (toolchainDir, gorootDir string, err error) {
 		return "", "", err
 	}
 
-	cache := filepath.Join(os.Getenv("HOME"), ".cache")
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", "", err
+	}
+
+	// We use ".cache" instead of os.UserCacheDir for legacy reasons and we
+	// don't want to break that on platforms where the latter returns a different
+	// result.
+	cache := filepath.Join(homeDir, ".cache")
 	toolchainDir = filepath.Join(cache, "tsgo", rev)
-	gorootDir = filepath.Join(toolchainDir, "gocross-goroot")
+	gorootDir = filepath.Join(cache, "tsgoroot", rev)
 
 	// You might wonder why getting the toolchain also provisions and returns a
 	// path suitable for use as GOROOT. Wonder no longer!

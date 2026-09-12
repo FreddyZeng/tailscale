@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package safesocket creates either a Unix socket, if possible, or
@@ -11,6 +11,9 @@ import (
 	"net"
 	"runtime"
 	"time"
+
+	"tailscale.com/feature"
+	"tailscale.com/feature/buildfeatures"
 )
 
 type closeable interface {
@@ -31,7 +34,8 @@ func ConnCloseWrite(c net.Conn) error {
 }
 
 var processStartTime = time.Now()
-var tailscaledProcExists = func() bool { return false } // set by safesocket_ps.go
+
+var tailscaledProcExists feature.Hook[func() bool]
 
 // tailscaledStillStarting reports whether tailscaled is probably
 // still starting up. That is, it reports whether the caller should
@@ -50,7 +54,8 @@ func tailscaledStillStarting() bool {
 	if d > 5*time.Second {
 		return false
 	}
-	return tailscaledProcExists()
+	f, ok := tailscaledProcExists.GetOk()
+	return ok && f()
 }
 
 // ConnectContext connects to tailscaled using a unix socket or named pipe.
@@ -104,13 +109,18 @@ func LocalTCPPortAndToken() (port int, token string, err error) {
 
 // PlatformUsesPeerCreds reports whether the current platform uses peer credentials
 // to authenticate connections.
-func PlatformUsesPeerCreds() bool { return GOOSUsesPeerCreds(runtime.GOOS) }
+func PlatformUsesPeerCreds() bool {
+	if !buildfeatures.HasUnixSocketIdentity {
+		return false
+	}
+	return GOOSUsesPeerCreds(runtime.GOOS)
+}
 
 // GOOSUsesPeerCreds is like PlatformUsesPeerCreds but takes a
 // runtime.GOOS value instead of using the current one.
 func GOOSUsesPeerCreds(goos string) bool {
 	switch goos {
-	case "linux", "darwin", "freebsd":
+	case "linux", "darwin", "freebsd", "solaris", "illumos":
 		return true
 	}
 	return false

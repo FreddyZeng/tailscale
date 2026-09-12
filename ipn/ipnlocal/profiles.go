@@ -1,26 +1,33 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package ipnlocal
 
 import (
 	"cmp"
+	"crypto"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"runtime"
 	"slices"
 	"strings"
 
-	"tailscale.com/clientupdate"
 	"tailscale.com/envknob"
+	"tailscale.com/feature"
 	"tailscale.com/health"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnext"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tstime"
+	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/persist"
 	"tailscale.com/util/clientmetric"
+	"tailscale.com/util/eventbus"
+	"tailscale.com/util/testenv"
 )
 
 var debug = envknob.RegisterBool("TS_DEBUG_PROFILES")
@@ -55,6 +62,13 @@ type profileManager struct {
 	// extHost is the bridge between [profileManager] and the registered [ipnext.Extension]s.
 	// It may be nil in tests. A nil pointer is a valid, no-op host.
 	extHost *ExtensionHost
+
+	// Override for key.NewEmptyHardwareAttestationKey used for testing.
+	newEmptyHardwareAttestationKey func() (key.HardwareAttestationKey, error)
+
+	// clock supplies the current time when stamping LoginProfile.Created.
+	// Tests substitute a fake clock to make creation timestamps deterministic.
+	clock tstime.DefaultClock
 }
 
 // SetExtensionHost sets the [ExtensionHost] for the [profileManager].
@@ -180,7 +194,7 @@ func (pm *profileManager) SwitchToProfile(profile ipn.LoginProfileView) (cp ipn.
 		f(pm.currentProfile, pm.prefs, false)
 	}
 	// Do not call pm.extHost.NotifyProfileChange here; it is invoked in
-	// [LocalBackend.resetForProfileChangeLockedOnEntry] after the netmap reset.
+	// [LocalBackend.resetForProfileChangeLocked] after the netmap reset.
 	// TODO(nickkhyl): Consider moving it here (or into the stateChangeCb handler
 	// in [LocalBackend]) once the profile/node state, including the netmap,
 	// is actually tied to the current profile.
@@ -241,7 +255,14 @@ func (pm *profileManager) allProfilesFor(uid ipn.WindowsUserID) []ipn.LoginProfi
 		}
 	}
 	slices.SortFunc(out, func(a, b ipn.LoginProfileView) int {
-		return cmp.Compare(a.Name(), b.Name())
+		// Legacy (zero Created) first, then stamped oldest-first.
+		if c := a.Created().Compare(b.Created()); c != 0 {
+			return c
+		}
+		if c := cmp.Compare(a.Name(), b.Name()); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.NetworkProfile().DomainName, b.NetworkProfile().DomainName)
 	})
 	return out
 }
@@ -265,7 +286,7 @@ func (pm *profileManager) matchingProfiles(uid ipn.WindowsUserID, f func(ipn.Log
 func (pm *profileManager) findMatchingProfiles(uid ipn.WindowsUserID, prefs ipn.PrefsView) []ipn.LoginProfileView {
 	return pm.matchingProfiles(uid, func(p ipn.LoginProfileView) bool {
 		return p.ControlURL() == prefs.ControlURL() &&
-			(p.UserProfile().ID == prefs.Persist().UserProfile().ID ||
+			(p.UserProfile().ID() == prefs.Persist().UserProfile().ID() ||
 				p.NodeID() == prefs.Persist().NodeID())
 	})
 }
@@ -328,7 +349,7 @@ func (pm *profileManager) setUnattendedModeAsConfigured() error {
 // across user switches to disambiguate the same account but a different tailnet.
 func (pm *profileManager) SetPrefs(prefsIn ipn.PrefsView, np ipn.NetworkProfile) error {
 	cp := pm.currentProfile
-	if persist := prefsIn.Persist(); !persist.Valid() || persist.NodeID() == "" || persist.UserProfile().LoginName == "" {
+	if persist := prefsIn.Persist(); !persist.Valid() || persist.NodeID() == "" || persist.UserProfile().LoginName() == "" {
 		// We don't know anything about this profile, so ignore it for now.
 		return pm.setProfilePrefsNoPermCheck(pm.currentProfile, prefsIn.AsStruct().View())
 	}
@@ -360,7 +381,7 @@ func (pm *profileManager) SetPrefs(prefsIn ipn.PrefsView, np ipn.NetworkProfile)
 	// WantRunning and possibly other fields. This may not be the desired behavior.
 	//
 	// Additionally, LocalBackend doesn't treat it as a proper profile switch, meaning that
-	// [LocalBackend.resetForProfileChangeLockedOnEntry] is not called and certain
+	// [LocalBackend.resetForProfileChangeLocked] is not called and certain
 	// node/profile-specific state may not be reset as expected.
 	//
 	// However, [profileManager] notifies [ipnext.Extension]s about the profile change,
@@ -401,9 +422,10 @@ func (pm *profileManager) setProfilePrefs(lp *ipn.LoginProfile, prefsIn ipn.Pref
 	// and it hasn't been persisted yet. We'll generate both an ID and [ipn.StateKey]
 	// once the information is available and needs to be persisted.
 	if lp.ID == "" {
-		if persist := prefsIn.Persist(); persist.Valid() && persist.NodeID() != "" && persist.UserProfile().LoginName != "" {
+		if persist := prefsIn.Persist(); persist.Valid() && persist.NodeID() != "" && persist.UserProfile().LoginName() != "" {
 			// Generate an ID and [ipn.StateKey] now that we have the node info.
 			lp.ID, lp.Key = newUnusedID(pm.knownProfiles)
+			lp.Created = pm.clock.Now()
 		}
 
 		// Set the current user as the profile owner, unless the current user ID does
@@ -416,7 +438,7 @@ func (pm *profileManager) setProfilePrefs(lp *ipn.LoginProfile, prefsIn ipn.Pref
 
 	var up tailcfg.UserProfile
 	if persist := prefsIn.Persist(); persist.Valid() {
-		up = persist.UserProfile()
+		up = *persist.UserProfile().AsStruct()
 		if up.DisplayName == "" {
 			up.DisplayName = up.LoginName
 		}
@@ -644,8 +666,8 @@ func (pm *profileManager) setProfileAsUserDefault(profile ipn.LoginProfileView) 
 	return pm.WriteState(k, []byte(profile.Key()))
 }
 
-func (pm *profileManager) loadSavedPrefs(key ipn.StateKey) (ipn.PrefsView, error) {
-	bs, err := pm.store.ReadState(key)
+func (pm *profileManager) loadSavedPrefs(k ipn.StateKey) (ipn.PrefsView, error) {
+	bs, err := pm.store.ReadState(k)
 	if err == ipn.ErrStateNotExist || len(bs) == 0 {
 		return defaultPrefs, nil
 	}
@@ -653,10 +675,28 @@ func (pm *profileManager) loadSavedPrefs(key ipn.StateKey) (ipn.PrefsView, error
 		return ipn.PrefsView{}, err
 	}
 	savedPrefs := ipn.NewPrefs()
-	if err := ipn.PrefsFromBytes(bs, savedPrefs); err != nil {
-		return ipn.PrefsView{}, fmt.Errorf("parsing saved prefs: %v", err)
+
+	// if supported by the platform, create an empty hardware attestation key to use when deserializing
+	// to avoid type exceptions from json.Unmarshaling into an interface{}.
+	hw, _ := pm.newEmptyHardwareAttestationKey()
+	savedPrefs.Persist = &persist.Persist{
+		AttestationKey: hw,
 	}
-	pm.logf("using backend prefs for %q: %v", key, savedPrefs.Pretty())
+
+	if err := ipn.PrefsFromBytes(bs, savedPrefs); err != nil {
+		// Try loading again, this time ignoring the AttestationKey contents.
+		// If that succeeds, there's something wrong with the underlying
+		// attestation key mechanism (most likely the TPM changed), but we
+		// should at least proceed with client startup.
+		origErr := err
+		savedPrefs.Persist.AttestationKey = &noopAttestationKey{}
+		if err := ipn.PrefsFromBytes(bs, savedPrefs); err != nil {
+			return ipn.PrefsView{}, fmt.Errorf("parsing saved prefs: %w", err)
+		} else {
+			pm.logf("failed to parse savedPrefs with attestation key (error: %v) but parsing without the attestation key succeeded; will proceed without using the old attestation key", origErr)
+		}
+	}
+	pm.logf("using backend prefs for %q: %v", k, savedPrefs.Pretty())
 
 	// Ignore any old stored preferences for https://login.tailscale.com
 	// as the control server that would override the new default of
@@ -673,7 +713,7 @@ func (pm *profileManager) loadSavedPrefs(key ipn.StateKey) (ipn.PrefsView, error
 	// cause any EditPrefs calls to fail (other than disabling auto-updates).
 	//
 	// Reset AutoUpdate.Apply if we detect such invalid prefs.
-	if savedPrefs.AutoUpdate.Apply.EqualBool(true) && !clientupdate.CanAutoUpdate() {
+	if savedPrefs.AutoUpdate.Apply.EqualBool(true) && !feature.CanAutoUpdate() {
 		savedPrefs.AutoUpdate.Apply.Clear()
 	}
 
@@ -838,7 +878,10 @@ func (pm *profileManager) CurrentPrefs() ipn.PrefsView {
 
 // ReadStartupPrefsForTest reads the startup prefs from disk. It is only used for testing.
 func ReadStartupPrefsForTest(logf logger.Logf, store ipn.StateStore) (ipn.PrefsView, error) {
-	ht := new(health.Tracker) // in tests, don't care about the health status
+	testenv.AssertInTest()
+	bus := eventbus.New()
+	defer bus.Close()
+	ht := health.NewTracker(bus) // in tests, don't care about the health status
 	pm, err := newProfileManager(store, logf, ht)
 	if err != nil {
 		return ipn.PrefsView{}, err
@@ -897,11 +940,12 @@ func newProfileManagerWithGOOS(store ipn.StateStore, logf logger.Logf, ht *healt
 	metricProfileCount.Set(int64(len(knownProfiles)))
 
 	pm := &profileManager{
-		goos:          goos,
-		store:         store,
-		knownProfiles: knownProfiles,
-		logf:          logf,
-		health:        ht,
+		goos:                           goos,
+		store:                          store,
+		knownProfiles:                  knownProfiles,
+		logf:                           logf,
+		health:                         ht,
+		newEmptyHardwareAttestationKey: key.NewEmptyHardwareAttestationKey,
 	}
 
 	var initialProfile ipn.LoginProfileView
@@ -970,3 +1014,21 @@ var (
 	metricMigrationError   = clientmetric.NewCounter("profiles_migration_error")
 	metricMigrationSuccess = clientmetric.NewCounter("profiles_migration_success")
 )
+
+// noopAttestationKey is a key.HardwareAttestationKey that always successfully
+// unmarshals as a zero key.
+type noopAttestationKey struct{}
+
+func (n noopAttestationKey) Public() crypto.PublicKey {
+	panic("noopAttestationKey.Public should not be called; missing IsZero check somewhere?")
+}
+
+func (n noopAttestationKey) Sign(rand io.Reader, digest []byte, opts crypto.SignerOpts) (signature []byte, err error) {
+	panic("noopAttestationKey.Sign should not be called; missing IsZero check somewhere?")
+}
+
+func (n noopAttestationKey) MarshalJSON() ([]byte, error)      { return nil, nil }
+func (n noopAttestationKey) UnmarshalJSON([]byte) error        { return nil }
+func (n noopAttestationKey) Close() error                      { return nil }
+func (n noopAttestationKey) Clone() key.HardwareAttestationKey { return n }
+func (n noopAttestationKey) IsZero() bool                      { return true }

@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !plan9
@@ -7,14 +7,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/netip"
 	"slices"
 	"strings"
 	"sync"
 	"time"
-
-	"errors"
 
 	"go.uber.org/zap"
 	xslices "golang.org/x/exp/slices"
@@ -26,9 +25,12 @@ import (
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
 	tsoperator "tailscale.com/k8s-operator"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
 	"tailscale.com/kube/kubetypes"
+	"tailscale.com/net/netutil"
+	"tailscale.com/net/tsaddr"
 	"tailscale.com/tstime"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/set"
@@ -176,6 +178,7 @@ func (a *ConnectorReconciler) maybeProvisionConnector(ctx context.Context, logge
 	if cn.Spec.Hostname != "" {
 		hostname = string(cn.Spec.Hostname)
 	}
+
 	crl := childResourceLabels(cn.Name, a.tsnamespace, "connector")
 
 	proxyClass := cn.Spec.ProxyClass
@@ -188,10 +191,17 @@ func (a *ConnectorReconciler) maybeProvisionConnector(ctx context.Context, logge
 		}
 	}
 
+	var replicas int32 = 1
+	if cn.Spec.Replicas != nil {
+		replicas = *cn.Spec.Replicas
+	}
+
 	sts := &tailscaleSTSConfig{
+		Replicas:            replicas,
 		ParentResourceName:  cn.Name,
 		ParentResourceUID:   string(cn.UID),
 		Hostname:            hostname,
+		HostnamePrefix:      string(cn.Spec.HostnamePrefix),
 		ChildResourceLabels: crl,
 		Tags:                cn.Spec.Tags.Stringify(),
 		Connector: &connector{
@@ -199,6 +209,8 @@ func (a *ConnectorReconciler) maybeProvisionConnector(ctx context.Context, logge
 		},
 		ProxyClassName: proxyClass,
 		proxyType:      proxyTypeConnector,
+		LoginServer:    a.ssr.loginServer,
+		Tailnet:        cn.Spec.Tailnet,
 	}
 
 	if cn.Spec.SubnetRouter != nil && len(cn.Spec.SubnetRouter.AdvertiseRoutes) > 0 {
@@ -218,16 +230,19 @@ func (a *ConnectorReconciler) maybeProvisionConnector(ctx context.Context, logge
 	} else {
 		a.exitNodes.Remove(cn.UID)
 	}
+
 	if cn.Spec.SubnetRouter != nil {
 		a.subnetRouters.Add(cn.GetUID())
 	} else {
 		a.subnetRouters.Remove(cn.GetUID())
 	}
+
 	if cn.Spec.AppConnector != nil {
 		a.appConnectors.Add(cn.GetUID())
 	} else {
 		a.appConnectors.Remove(cn.GetUID())
 	}
+
 	a.mu.Unlock()
 	gaugeConnectorSubnetRouterResources.Set(int64(a.subnetRouters.Len()))
 	gaugeConnectorExitNodeResources.Set(int64(a.exitNodes.Len()))
@@ -243,27 +258,29 @@ func (a *ConnectorReconciler) maybeProvisionConnector(ctx context.Context, logge
 		return err
 	}
 
-	dev, err := a.ssr.DeviceInfo(ctx, crl, logger)
+	devices, err := a.ssr.DeviceInfo(ctx, crl, logger)
 	if err != nil {
 		return err
 	}
 
-	if dev == nil || dev.hostname == "" {
-		logger.Debugf("no Tailscale hostname known yet, waiting for Connector Pod to finish auth")
-		// No hostname yet. Wait for the connector pod to auth.
-		cn.Status.TailnetIPs = nil
-		cn.Status.Hostname = ""
-		return nil
+	cn.Status.Devices = make([]tsapi.ConnectorDevice, len(devices))
+	for i, dev := range devices {
+		cn.Status.Devices[i] = tsapi.ConnectorDevice{
+			Hostname:   dev.hostname,
+			TailnetIPs: dev.ips,
+		}
 	}
 
-	cn.Status.TailnetIPs = dev.ips
-	cn.Status.Hostname = dev.hostname
+	if len(cn.Status.Devices) > 0 {
+		cn.Status.Hostname = cn.Status.Devices[0].Hostname
+		cn.Status.TailnetIPs = cn.Status.Devices[0].TailnetIPs
+	}
 
 	return nil
 }
 
 func (a *ConnectorReconciler) maybeCleanupConnector(ctx context.Context, logger *zap.SugaredLogger, cn *tsapi.Connector) (bool, error) {
-	if done, err := a.ssr.Cleanup(ctx, logger, childResourceLabels(cn.Name, a.tsnamespace, "connector"), proxyTypeConnector); err != nil {
+	if done, err := a.ssr.Cleanup(ctx, cn.Spec.Tailnet, logger, childResourceLabels(cn.Name, a.tsnamespace, "connector"), proxyTypeConnector); err != nil {
 		return false, fmt.Errorf("failed to cleanup Connector resources: %w", err)
 	} else if !done {
 		logger.Debugf("Connector cleanup not done yet, waiting for next reconcile")
@@ -301,6 +318,15 @@ func (a *ConnectorReconciler) validate(cn *tsapi.Connector) error {
 	if (cn.Spec.SubnetRouter != nil || cn.Spec.ExitNode) && cn.Spec.AppConnector != nil {
 		return errors.New("invalid spec: a Connector that is configured as an app connector must not be also configured as a subnet router or exit node")
 	}
+
+	// These two checks should be caught by the Connector schema validation.
+	if cn.Spec.Replicas != nil && *cn.Spec.Replicas > 1 && cn.Spec.Hostname != "" {
+		return errors.New("invalid spec: a Connector that is configured with multiple replicas cannot specify a hostname. Instead, use a hostnamePrefix")
+	}
+	if cn.Spec.HostnamePrefix != "" && cn.Spec.Hostname != "" {
+		return errors.New("invalid spec: a Connect cannot use both a hostname and hostname prefix")
+	}
+
 	if cn.Spec.AppConnector != nil {
 		return validateAppConnector(cn.Spec.AppConnector)
 	}
@@ -331,6 +357,11 @@ func validateRoutes(routes tsapi.Routes) error {
 		}
 		if pfx.Masked() != pfx {
 			errs = append(errs, fmt.Errorf("route %s has non-address bits set; expected %s", pfx, pfx.Masked()))
+		}
+		if tsaddr.IsViaPrefix(pfx) {
+			if err := netutil.ValidateViaPrefix(pfx); err != nil {
+				errs = append(errs, err)
+			}
 		}
 	}
 	return errors.Join(errs...)

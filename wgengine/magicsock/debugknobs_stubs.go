@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build ios || js
@@ -31,3 +31,4 @@ func debugRingBufferMaxSizeBytes() int { return 0 }
 func inTest() bool                     { return false }
 func debugPeerMap() bool               { return false }
 func pretendpoints() []netip.AddrPort  { return []netip.AddrPort{} }
+func debugNeverDirectUDP() bool        { return false }

@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package varz contains code to export metrics in Prometheus format.
@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"sort"
@@ -23,6 +25,7 @@ import (
 
 	"golang.org/x/exp/constraints"
 	"tailscale.com/metrics"
+	"tailscale.com/syncs"
 	"tailscale.com/types/logger"
 	"tailscale.com/version"
 )
@@ -39,7 +42,33 @@ func init() {
 	expvar.Publish("go_version", StaticStringVar(runtime.Version()))
 	expvar.Publish("counter_uptime_sec", expvar.Func(func() any { return int64(Uptime().Seconds()) }))
 	expvar.Publish("gauge_goroutines", expvar.Func(func() any { return runtime.NumGoroutine() }))
+	if v := nodeBootTime(); v != 0 {
+		var vi any = v // box once
+		// The name matches what Prometheus's node exporter uses
+		// for the same value.
+		expvar.Publish("node_boot_time_seconds", expvar.Func(func() any { return vi }))
+	}
 }
+
+// nodeBootTime returns the machine's boot time in Unix seconds,
+// as reported by the "btime" line of Linux's /proc/stat.
+// It returns 0 if unavailable, such as on non-Linux systems.
+var nodeBootTime = sync.OnceValue(func() int64 {
+	stat, err := os.ReadFile("/proc/stat")
+	if err != nil {
+		return 0
+	}
+	for line := range strings.Lines(string(stat)) {
+		if rest, ok := strings.CutPrefix(line, "btime "); ok {
+			sec, err := strconv.ParseInt(strings.TrimSpace(rest), 10, 64)
+			if err != nil {
+				return 0
+			}
+			return sec
+		}
+	}
+	return 0
+})
 
 const (
 	gaugePrefix     = "gauge_"
@@ -90,8 +119,8 @@ func prometheusMetric(prefix string, key string) (string, string, string) {
 		typ = "histogram"
 		key = strings.TrimPrefix(key, histogramPrefix)
 	}
-	if strings.HasPrefix(key, labelMapPrefix) {
-		key = strings.TrimPrefix(key, labelMapPrefix)
+	if after, ok := strings.CutPrefix(key, labelMapPrefix); ok {
+		key = after
 		if a, b, ok := strings.Cut(key, "_"); ok {
 			label, key = a, b
 		}
@@ -134,6 +163,9 @@ func writePromExpVar(w io.Writer, prefix string, kv expvar.KeyValue) {
 	case *expvar.Int:
 		fmt.Fprintf(w, "# TYPE %s %s\n%s %v\n", name, cmp.Or(typ, "counter"), name, v.Value())
 		return
+	case *syncs.ShardedInt:
+		fmt.Fprintf(w, "# TYPE %s %s\n%s %v\n", name, cmp.Or(typ, "counter"), name, v.Value())
+		return
 	case *expvar.Float:
 		fmt.Fprintf(w, "# TYPE %s %s\n%s %v\n", name, cmp.Or(typ, "gauge"), name, v.Value())
 		return
@@ -148,7 +180,7 @@ func writePromExpVar(w io.Writer, prefix string, kv expvar.KeyValue) {
 	case PrometheusMetricsReflectRooter:
 		root := v.PrometheusMetricsReflectRoot()
 		rv := reflect.ValueOf(root)
-		if rv.Type().Kind() == reflect.Ptr {
+		if rv.Type().Kind() == reflect.Pointer {
 			if rv.IsNil() {
 				return
 			}
@@ -189,7 +221,11 @@ func writePromExpVar(w io.Writer, prefix string, kv expvar.KeyValue) {
 				return
 			}
 			if vs, ok := v.(string); ok && strings.HasSuffix(name, "version") {
-				fmt.Fprintf(w, "%s{version=%q} 1\n", name, vs)
+				if name == "version" {
+					fmt.Fprintf(w, "%s{version=%q,binary=%q} 1\n", name, vs, binaryName())
+				} else {
+					fmt.Fprintf(w, "%s{version=%q} 1\n", name, vs)
+				}
 				return
 			}
 			switch v := v.(type) {
@@ -235,11 +271,21 @@ func writePromExpVar(w io.Writer, prefix string, kv expvar.KeyValue) {
 		if label != "" && typ != "" {
 			fmt.Fprintf(w, "# TYPE %s %s\n", name, typ)
 			v.Do(func(kv expvar.KeyValue) {
-				fmt.Fprintf(w, "%s{%s=%q} %v\n", name, label, kv.Key, kv.Value)
+				switch kv.Value.(type) {
+				case *expvar.Int, *expvar.Float:
+					fmt.Fprintf(w, "%s{%s=%q} %v\n", name, label, kv.Key, kv.Value)
+				default:
+					fmt.Fprintf(w, "# skipping %q expvar map key %q with unknown value type %T\n", name, kv.Key, kv.Value)
+				}
 			})
 		} else {
 			v.Do(func(kv expvar.KeyValue) {
-				fmt.Fprintf(w, "%s_%s %v\n", name, kv.Key, kv.Value)
+				switch kv.Value.(type) {
+				case *expvar.Int, *expvar.Float:
+					fmt.Fprintf(w, "%s_%s %v\n", name, kv.Key, kv.Value)
+				default:
+					fmt.Fprintf(w, "# skipping %q expvar map key %q with unknown value type %T\n", name, kv.Key, kv.Value)
+				}
 			})
 		}
 	}
@@ -307,6 +353,18 @@ func ExpvarDoHandler(expvarDoFunc func(f func(expvar.KeyValue))) func(http.Respo
 		}
 	}
 }
+
+var binaryName = sync.OnceValue(func() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	exe2, err := filepath.EvalSymlinks(exe)
+	if err != nil {
+		return filepath.Base(exe)
+	}
+	return filepath.Base(exe2)
+})
 
 // PrometheusMetricsReflectRooter is an optional interface that expvar.Var implementations
 // can implement to indicate that they should be walked recursively with reflect to find
@@ -387,8 +445,7 @@ func structTypeSortedFields(t reflect.Type) []sortedStructField {
 		return v.([]sortedStructField)
 	}
 	fields := make([]sortedStructField, 0, t.NumField())
-	for i, n := 0, t.NumField(); i < n; i++ {
-		sf := t.Field(i)
+	for sf := range t.Fields() {
 		name := sf.Name
 		if v := sf.Tag.Get("json"); v != "" {
 			v, _, _ = strings.Cut(v, ",")
@@ -401,7 +458,7 @@ func structTypeSortedFields(t reflect.Type) []sortedStructField {
 			}
 		}
 		fields = append(fields, sortedStructField{
-			Index:           i,
+			Index:           sf.Index[0],
 			Name:            name,
 			SortName:        removeTypePrefixes(name),
 			MetricType:      sf.Tag.Get("metrictype"),
@@ -435,7 +492,7 @@ func foreachExportedStructField(rv reflect.Value, f func(fieldOrJSONName, metric
 		sf := ssf.StructFieldType
 		if ssf.MetricType != "" || sf.Type.Kind() == reflect.Struct {
 			f(ssf.Name, ssf.MetricType, rv.Field(ssf.Index))
-		} else if sf.Type.Kind() == reflect.Ptr && sf.Type.Elem().Kind() == reflect.Struct {
+		} else if sf.Type.Kind() == reflect.Pointer && sf.Type.Elem().Kind() == reflect.Struct {
 			fv := rv.Field(ssf.Index)
 			if !fv.IsNil() {
 				f(ssf.Name, ssf.MetricType, fv.Elem())

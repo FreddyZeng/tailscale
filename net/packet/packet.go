@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package packet
@@ -17,7 +17,22 @@ import (
 const unknown = ipproto.Unknown
 
 // RFC1858: prevent overlapping fragment attacks.
+//
+// The bound is sized for IPv4 (max IPv4 header + basic TCP header) but is
+// intentionally reused by decode6 for IPv6 fragments. It is conservative for
+// IPv6, whose fragments carry no per-fragment IP header, so it only ever
+// rejects more later fragments as Unknown, never fewer.
 const minFragBlks = (60 + 20) / 8 // max IPv4 header + basic TCP header in fragment blocks (8 bytes each)
+
+// ip6FragHeader is the IANA protocol number for the IPv6 Fragment extension
+// header ("IPv6-Frag"). It appears as the base header's Next Header value on a
+// fragmented packet; decode6 steps over it to reach the real sub-protocol.
+// This is distinct from ipproto.Fragment (0xFF), our internal sentinel for a
+// non-first fragment whose sub-protocol header is not present.
+const ip6FragHeader ipproto.Proto = 44
+
+// ip6FragHeaderLength is the length of the IPv6 Fragment extension header.
+const ip6FragHeaderLength = 8
 
 type TCPFlag uint8
 
@@ -51,10 +66,11 @@ type Parsed struct {
 	IPVersion uint8
 	// IPProto is the IP subprotocol (UDP, TCP, etc.). Valid iff IPVersion != 0.
 	IPProto ipproto.Proto
-	// SrcIP4 is the source address. Family matches IPVersion. Port is
-	// valid iff IPProto == TCP || IPProto == UDP.
+	// Src is the source address. Family matches IPVersion. Port is
+	// valid iff IPProto == TCP || IPProto == UDP || IPProto == SCTP.
 	Src netip.AddrPort
-	// DstIP4 is the destination address. Family matches IPVersion.
+	// Dst is the destination address. Family matches IPVersion. Port is
+	// valid iff IPProto == TCP || IPProto == UDP || IPProto == SCTP.
 	Dst netip.AddrPort
 	// TCPFlags is the packet's TCP flag bits. Valid iff IPProto == TCP.
 	TCPFlags TCPFlag
@@ -160,14 +176,8 @@ func (q *Parsed) decode4(b []byte) {
 
 	if fragOfs == 0 {
 		// This is the first fragment
-		if moreFrags && len(sub) < minFragBlks {
-			// Suspiciously short first fragment, dump it.
-			q.IPProto = unknown
-			return
-		}
-		// otherwise, this is either non-fragmented (the usual case)
-		// or a big enough initial fragment that we can read the
-		// whole subprotocol header.
+		// Every protocol below MUST check that it has at least one entire
+		// transport header in order to protect against fragment confusion.
 		switch q.IPProto {
 		case ipproto.ICMPv4:
 			if len(sub) < icmp4HeaderLength {
@@ -179,6 +189,10 @@ func (q *Parsed) decode4(b []byte) {
 			q.dataofs = q.subofs + icmp4HeaderLength
 			return
 		case ipproto.IGMP:
+			if len(sub) < igmpHeaderLength {
+				q.IPProto = unknown
+				return
+			}
 			// Keep IPProto, but don't parse anything else
 			// out.
 			return
@@ -211,6 +225,15 @@ func (q *Parsed) decode4(b []byte) {
 			q.Dst = withPort(q.Dst, binary.BigEndian.Uint16(sub[2:4]))
 			return
 		case ipproto.TSMP:
+			// Strictly disallow fragmented TSMP
+			if moreFrags {
+				q.IPProto = unknown
+				return
+			}
+			if len(sub) < minTSMPSize {
+				q.IPProto = unknown
+				return
+			}
 			// Inter-tailscale messages.
 			q.dataofs = q.subofs
 			return
@@ -223,8 +246,11 @@ func (q *Parsed) decode4(b []byte) {
 	} else {
 		// This is a fragment other than the first one.
 		if fragOfs < minFragBlks {
-			// First frag was suspiciously short, so we can't
-			// trust the followup either.
+			// disallow fragment offsets that are potentially inside of a
+			// transport header. This is notably asymmetric with the
+			// first-packet limit, that may allow a first-packet that requires a
+			// shorter offset than this limit, but without state to tie this
+			// to the first fragment we can not allow shorter packets.
 			q.IPProto = unknown
 			return
 		}
@@ -261,19 +287,25 @@ func (q *Parsed) decode6(b []byte) {
 	q.Src = withIP(q.Src, srcIP)
 	q.Dst = withIP(q.Dst, dstIP)
 
-	// We don't support any IPv6 extension headers. Don't try to
-	// be clever. Therefore, the IP subprotocol always starts at
-	// byte 40.
+	// The IP subprotocol normally begins right after the 40-byte IPv6
+	// header. The one extension header we parse is the Fragment header
+	// (Next Header 44): a host source-fragmenting a datagram larger than
+	// the tun MTU emits these, and RFC 8200 section 4.5 requires the
+	// receiver to reassemble them, so we must let them through. For the
+	// first fragment we step over the fragment header and read the real
+	// sub-protocol's ports exactly as decode4 does; later fragments are
+	// marked ipproto.Fragment and passed through by the filter.
 	//
-	// Note that this means we don't support fragmentation in
-	// IPv6. This is fine, because IPv6 strongly mandates that you
-	// should not fragment, which makes fragmentation on the open
-	// internet extremely uncommon.
-	//
-	// This also means we don't support IPSec headers (AH/ESP), or
-	// IPv6 jumbo frames. Those will get marked Unknown and
-	// dropped.
+	// We still don't parse any other extension headers (hop-by-hop,
+	// routing, destination options) or IPSec headers (AH/ESP), nor a
+	// Fragment header that isn't the base header's immediate Next Header.
+	// Those get marked Unknown and dropped.
 	q.subofs = 40
+	if q.IPProto == ip6FragHeader {
+		if !q.decode6Fragment(b) {
+			return
+		}
+	}
 	sub := b[q.subofs:]
 	sub = sub[:len(sub):len(sub)] // help the compiler do bounds check elimination
 
@@ -314,6 +346,10 @@ func (q *Parsed) decode6(b []byte) {
 		q.Dst = withPort(q.Dst, binary.BigEndian.Uint16(sub[2:4]))
 		return
 	case ipproto.TSMP:
+		if len(sub) < minTSMPSize {
+			q.IPProto = unknown
+			return
+		}
 		// Inter-tailscale messages.
 		q.dataofs = q.subofs
 		return
@@ -324,6 +360,49 @@ func (q *Parsed) decode6(b []byte) {
 		q.IPProto = unknown
 		return
 	}
+}
+
+// decode6Fragment parses the IPv6 Fragment extension header at q.subofs in b
+// (q.subofs is the 40-byte base header length when called). It reports whether
+// decode6 should continue into the sub-protocol switch: true only for the
+// first fragment, where q.subofs and q.IPProto have been advanced to the real
+// transport header so its ports get parsed like an unfragmented packet. For
+// later or malformed fragments it sets q.IPProto itself (ipproto.Fragment to
+// pass through, or unknown to drop) and returns false.
+func (q *Parsed) decode6Fragment(b []byte) (continueDecode bool) {
+	// The fragment header is 8 bytes: Next Header, Reserved, a 13-bit
+	// Fragment Offset (in 8-byte blocks) plus a More-Fragments flag, and a
+	// 32-bit Identification.
+	if len(b) < q.subofs+ip6FragHeaderLength {
+		q.IPProto = unknown
+		return false
+	}
+	frag := b[q.subofs:]
+	nextHdr := ipproto.Proto(frag[0])
+	fragOfs := binary.BigEndian.Uint16(frag[2:4]) >> 3
+
+	// Step over the fragment header. The real sub-protocol (first fragment)
+	// or the continued payload (later fragments) begins here.
+	q.subofs += ip6FragHeaderLength
+
+	if fragOfs == 0 {
+		// First fragment: decode the real sub-protocol's header so the
+		// filter can match on its ports. The switch in decode6 performs
+		// the per-protocol bounds checks, including rejecting a first
+		// fragment too short to hold the transport header.
+		q.IPProto = nextHdr
+		return true
+	}
+
+	// Later fragment: there's no sub-protocol header to read. Reject offsets
+	// small enough to overlap the transport header (RFC 1858, same guard as
+	// decode4); otherwise pass it through as a fragment.
+	if fragOfs < minFragBlks {
+		q.IPProto = unknown
+		return false
+	}
+	q.IPProto = ipproto.Fragment
+	return false
 }
 
 func (q *Parsed) IP4Header() IP4Header {

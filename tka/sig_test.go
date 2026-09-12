@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package tka
@@ -51,7 +51,7 @@ func TestSigDirect(t *testing.T) {
 }
 
 func TestSigNested(t *testing.T) {
-	// Network-lock key (the key used to sign the nested sig)
+	// tailnet-lock key (the key used to sign the nested sig)
 	pub, priv := testingKey25519(t, 1)
 	k := Key{Kind: Key25519, Public: pub, Votes: 2}
 	// Rotation key (the key used to sign the outer sig)
@@ -64,7 +64,7 @@ func TestSigNested(t *testing.T) {
 	nodeKeyPub, _ := node.Public().MarshalBinary()
 
 	// The original signature for the old node key, signed by
-	// the network-lock key.
+	// the tailnet-lock key.
 	nestedSig := NodeKeySignature{
 		SigKind:        SigDirect,
 		KeyID:          k.MustID(),
@@ -76,8 +76,8 @@ func TestSigNested(t *testing.T) {
 	if err := nestedSig.verifySignature(oldNode.Public(), k); err != nil {
 		t.Fatalf("verifySignature(oldNode) failed: %v", err)
 	}
-	if l := sigChainLength(nestedSig); l != 1 {
-		t.Errorf("nestedSig chain length = %v, want 1", l)
+	if ln := sigChainLength(nestedSig); ln != 1 {
+		t.Errorf("nestedSig chain length = %v, want 1", ln)
 	}
 
 	// The signature authorizing the rotation, signed by the
@@ -93,8 +93,8 @@ func TestSigNested(t *testing.T) {
 	if err := sig.verifySignature(node.Public(), k); err != nil {
 		t.Fatalf("verifySignature(node) failed: %v", err)
 	}
-	if l := sigChainLength(sig); l != 2 {
-		t.Errorf("sig chain length = %v, want 2", l)
+	if ln := sigChainLength(sig); ln != 2 {
+		t.Errorf("sig chain length = %v, want 2", ln)
 	}
 
 	// Test verification fails if the wrong verification key is provided
@@ -119,7 +119,7 @@ func TestSigNested(t *testing.T) {
 	}
 
 	// Test verification fails if the outer signature is signed with a
-	// different public key to whats specified in WrappingPubkey
+	// different public key to what's specified in WrappingPubkey
 	sig.Signature = ed25519.Sign(priv, sigHash[:])
 	if err := sig.verifySignature(node.Public(), k); err == nil {
 		t.Error("verifySignature(node) succeeded with different signature")
@@ -127,7 +127,7 @@ func TestSigNested(t *testing.T) {
 }
 
 func TestSigNested_DeepNesting(t *testing.T) {
-	// Network-lock key (the key used to sign the nested sig)
+	// tailnet-lock key (the key used to sign the nested sig)
 	pub, priv := testingKey25519(t, 1)
 	k := Key{Kind: Key25519, Public: pub, Votes: 2}
 	// Rotation key (the key used to sign the outer sig)
@@ -137,7 +137,7 @@ func TestSigNested_DeepNesting(t *testing.T) {
 	oldPub, _ := oldNode.Public().MarshalBinary()
 
 	// The original signature for the old node key, signed by
-	// the network-lock key.
+	// the tailnet-lock key.
 	nestedSig := NodeKeySignature{
 		SigKind:        SigDirect,
 		KeyID:          k.MustID(),
@@ -152,7 +152,7 @@ func TestSigNested_DeepNesting(t *testing.T) {
 
 	outer := nestedSig
 	var lastNodeKey key.NodePrivate
-	for range 15 { // 15 = max nesting level for CBOR
+	for range cborDecOpts.MaxNestedLevels - 1 {
 		lastNodeKey = key.NewNode()
 		nodeKeyPub, _ := lastNodeKey.Public().MarshalBinary()
 
@@ -173,11 +173,8 @@ func TestSigNested_DeepNesting(t *testing.T) {
 	}
 
 	// Test this works with our public API
-	a, _ := Open(newTestchain(t, "G1\nG1.template = genesis",
-		optTemplate("genesis", AUM{MessageKind: AUMCheckpoint, State: &State{
-			Keys:               []Key{k},
-			DisablementSecrets: [][]byte{DisablementKDF([]byte{1, 2, 3})},
-		}})).Chonk())
+	c := newTestchain(t, "G1\nG1.template = genesis", genesisTemplate(k))
+	a, _ := Open(c.Chonk())
 	if err := a.NodeKeyAuthorized(lastNodeKey.Public(), outer.Serialize()); err != nil {
 		t.Errorf("NodeKeyAuthorized(lastNodeKey) failed: %v", err)
 	}
@@ -199,7 +196,7 @@ func TestSigNested_DeepNesting(t *testing.T) {
 }
 
 func TestSigCredential(t *testing.T) {
-	// Network-lock key (the key used to sign the nested sig)
+	// tailnet-lock key (the key used to sign the nested sig)
 	pub, priv := testingKey25519(t, 1)
 	k := Key{Kind: Key25519, Public: pub, Votes: 2}
 	// 'credential' key (the one being delegated to)
@@ -238,11 +235,8 @@ func TestSigCredential(t *testing.T) {
 	}
 
 	// Test someone can't misuse our public API for verifying node-keys
-	a, _ := Open(newTestchain(t, "G1\nG1.template = genesis",
-		optTemplate("genesis", AUM{MessageKind: AUMCheckpoint, State: &State{
-			Keys:               []Key{k},
-			DisablementSecrets: [][]byte{DisablementKDF([]byte{1, 2, 3})},
-		}})).Chonk())
+	c := newTestchain(t, "G1\nG1.template = genesis", genesisTemplate(k))
+	a, _ := Open(c.Chonk())
 	if err := a.NodeKeyAuthorized(node.Public(), nestedSig.Serialize()); err == nil {
 		t.Error("NodeKeyAuthorized(SigCredential, node) did not fail")
 	}
@@ -275,7 +269,7 @@ func TestSigCredential(t *testing.T) {
 	}
 
 	// Test verification fails if the outer signature is signed with a
-	// different public key to whats specified in WrappingPubkey
+	// different public key to what's specified in WrappingPubkey
 	sig.Signature = ed25519.Sign(priv, sigHash[:])
 	if err := sig.verifySignature(node.Public(), k); err == nil {
 		t.Error("verifySignature(node) succeeded with different signature")
@@ -309,7 +303,7 @@ func TestSigSerializeUnserialize(t *testing.T) {
 }
 
 func TestNodeKeySignatureRotationDetails(t *testing.T) {
-	// Trusted network lock key
+	// Trusted tailnet lock key
 	pub, priv := testingKey25519(t, 1)
 	k := Key{Kind: Key25519, Public: pub, Votes: 2}
 
@@ -507,7 +501,7 @@ func TestDecodeWrappedAuthkey(t *testing.T) {
 }
 
 func TestResignNKS(t *testing.T) {
-	// Tailnet lock keypair of a signing node.
+	// Tailnet Lock keypair of a signing node.
 	authPub, authPriv := testingKey25519(t, 1)
 	authKey := Key{Kind: Key25519, Public: authPub, Votes: 2}
 
@@ -519,7 +513,7 @@ func TestResignNKS(t *testing.T) {
 	origPub, _ := origNode.Public().MarshalBinary()
 
 	// The original signature for the old node key, signed by
-	// the network-lock key.
+	// the tailnet-lock key.
 	directSig := NodeKeySignature{
 		SigKind:        SigDirect,
 		KeyID:          authKey.MustID(),

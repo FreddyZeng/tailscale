@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package conffile
@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"strings"
 
+	"tailscale.com/feature"
+	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/omit"
 )
 
@@ -35,6 +37,9 @@ func getEC2MetadataToken() (string, error) {
 }
 
 func readVMUserData() ([]byte, error) {
+	if !buildfeatures.HasAWS {
+		return nil, feature.ErrUnavailable
+	}
 	// TODO(bradfitz): support GCP, Azure, Proxmox/cloud-init
 	// (NoCloud/ConfigDrive ISO), etc.
 

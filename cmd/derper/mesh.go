@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package main
@@ -13,18 +13,19 @@ import (
 
 	"tailscale.com/derp"
 	"tailscale.com/derp/derphttp"
+	"tailscale.com/derp/derpserver"
 	"tailscale.com/net/netmon"
 	"tailscale.com/types/logger"
 )
 
-func startMesh(s *derp.Server) error {
+func startMesh(s *derpserver.Server) error {
 	if *meshWith == "" {
 		return nil
 	}
 	if !s.HasMeshKey() {
 		return errors.New("--mesh-with requires --mesh-psk-file")
 	}
-	for _, hostTuple := range strings.Split(*meshWith, ",") {
+	for hostTuple := range strings.SplitSeq(*meshWith, ",") {
 		if err := startMeshWithHost(s, hostTuple); err != nil {
 			return err
 		}
@@ -32,7 +33,7 @@ func startMesh(s *derp.Server) error {
 	return nil
 }
 
-func startMeshWithHost(s *derp.Server, hostTuple string) error {
+func startMeshWithHost(s *derpserver.Server, hostTuple string) error {
 	var host string
 	var dialHost string
 	hostParts := strings.Split(hostTuple, "/")
@@ -72,6 +73,7 @@ func startMeshWithHost(s *derp.Server, hostTuple string) error {
 
 	add := func(m derp.PeerPresentMessage) { s.AddPacketForwarder(m.Key, c) }
 	remove := func(m derp.PeerGoneMessage) { s.RemovePacketForwarder(m.Peer, c) }
-	go c.RunWatchConnectionLoop(context.Background(), s.PublicKey(), logf, add, remove)
+	notifyError := func(err error) {}
+	go c.RunWatchConnectionLoop(context.Background(), s.PublicKey(), logf, add, remove, notifyError)
 	return nil
 }

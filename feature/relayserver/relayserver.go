@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package relayserver registers the relay server feature and implements its
@@ -7,24 +7,26 @@ package relayserver
 
 import (
 	"encoding/json"
-	"errors"
-	"io"
+	"fmt"
 	"net/http"
 	"net/netip"
-	"sync"
 
-	"tailscale.com/envknob"
+	"tailscale.com/disco"
 	"tailscale.com/feature"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnext"
-	"tailscale.com/ipn/ipnlocal"
+	"tailscale.com/ipn/localapi"
 	"tailscale.com/net/udprelay"
 	"tailscale.com/net/udprelay/endpoint"
+	"tailscale.com/net/udprelay/status"
+	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
-	"tailscale.com/types/ptr"
-	"tailscale.com/util/httpm"
+	"tailscale.com/types/views"
+	"tailscale.com/util/eventbus"
+	"tailscale.com/wgengine/magicsock"
 )
 
 // featureName is the name of the feature implemented by this package.
@@ -34,32 +36,75 @@ const featureName = "relayserver"
 func init() {
 	feature.Register(featureName)
 	ipnext.RegisterExtension(featureName, newExtension)
-	ipnlocal.RegisterPeerAPIHandler("/v0/relay/endpoint", handlePeerAPIRelayAllocateEndpoint)
+	localapi.Register("debug-peer-relay-sessions", servePeerRelayDebugSessions)
+}
+
+// servePeerRelayDebugSessions is an HTTP handler for the Local API that
+// returns debug/status information for peer relay sessions being relayed by
+// this Tailscale node. It writes a JSON-encoded [status.ServerStatus] into the
+// HTTP response, or returns an HTTP 405/500 with error text as the body.
+func servePeerRelayDebugSessions(h *localapi.Handler, w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "GET required", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var e *extension
+	if ok := h.LocalBackend().FindMatchingExtension(&e); !ok {
+		http.Error(w, "peer relay server extension unavailable", http.StatusInternalServerError)
+		return
+	}
+
+	st := e.serverStatus()
+	j, err := json.Marshal(st)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to marshal json: %v", err), http.StatusInternalServerError)
+		return
+	}
+	w.Write(j)
 }
 
 // newExtension is an [ipnext.NewExtensionFn] that creates a new relay server
 // extension. It is registered with [ipnext.RegisterExtension] if the package is
 // imported.
-func newExtension(logf logger.Logf, _ ipnext.SafeBackend) (ipnext.Extension, error) {
-	return &extension{logf: logger.WithPrefix(logf, featureName+": ")}, nil
+func newExtension(logf logger.Logf, sb ipnext.SafeBackend) (ipnext.Extension, error) {
+	e := &extension{
+		newServerFn: func(logf logger.Logf, port uint16, onlyStaticAddrPorts bool) (relayServer, error) {
+			return udprelay.NewServer(logf, port, onlyStaticAddrPorts, sb.Sys().UserMetricsRegistry(), sb.Sys().ControlKnobs())
+		},
+		logf: logger.WithPrefix(logf, featureName+": "),
+	}
+	e.ec = sb.Sys().Bus.Get().Client("relayserver.extension")
+	e.respPub = eventbus.Publish[magicsock.UDPRelayAllocResp](e.ec)
+	eventbus.SubscribeFunc(e.ec, e.onDERPMapView)
+	eventbus.SubscribeFunc(e.ec, e.onAllocReq)
+	return e, nil
+}
+
+// relayServer is an interface for [udprelay.Server].
+type relayServer interface {
+	Close() error
+	AllocateEndpoint(discoA, discoB key.DiscoPublic) (endpoint.ServerEndpoint, error)
+	GetSessions() []status.ServerSession
+	SetDERPMapView(tailcfg.DERPMapView)
+	SetStaticAddrPorts(addrPorts views.Slice[netip.AddrPort])
 }
 
 // extension is an [ipnext.Extension] managing the relay server on platforms
 // that import this package.
 type extension struct {
-	logf logger.Logf
+	newServerFn func(logf logger.Logf, port uint16, onlyStaticAddrPorts bool) (relayServer, error) // swappable for tests
+	logf        logger.Logf
+	ec          *eventbus.Client
+	respPub     *eventbus.Publisher[magicsock.UDPRelayAllocResp]
 
-	mu                     sync.Mutex // guards the following fields
-	shutdown               bool
-	port                   *int        // ipn.Prefs.RelayServerPort, nil if disabled
-	hasNodeAttrRelayServer bool        // tailcfg.NodeAttrRelayServer
-	server                 relayServer // lazily initialized
-}
-
-// relayServer is the interface of [udprelay.Server].
-type relayServer interface {
-	AllocateEndpoint(discoA key.DiscoPublic, discoB key.DiscoPublic) (endpoint.ServerEndpoint, error)
-	Close() error
+	mu                            syncs.Mutex                 // guards the following fields
+	shutdown                      bool                        // true if Shutdown() has been called
+	rs                            relayServer                 // nil when disabled
+	port                          *uint16                     // ipn.Prefs.RelayServerPort, nil if disabled
+	staticEndpoints               views.Slice[netip.AddrPort] // ipn.Prefs.RelayServerStaticEndpoints
+	derpMapView                   tailcfg.DERPMapView         // latest seen over the eventbus
+	hasNodeAttrDisableRelayServer bool                        // [tailcfg.NodeAttrDisableRelayServer]
 }
 
 // Name implements [ipnext.Extension].
@@ -77,119 +122,149 @@ func (e *extension) Init(host ipnext.Host) error {
 	return nil
 }
 
+func (e *extension) onDERPMapView(view tailcfg.DERPMapView) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.derpMapView = view
+	if e.rs != nil {
+		e.rs.SetDERPMapView(view)
+	}
+}
+
+func (e *extension) onAllocReq(req magicsock.UDPRelayAllocReq) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.shutdown {
+		return
+	}
+	if e.rs == nil {
+		if !e.relayServerShouldBeRunningLocked() {
+			return
+		}
+		e.tryStartRelayServerLocked()
+		if e.rs == nil {
+			return
+		}
+	}
+	se, err := e.rs.AllocateEndpoint(req.Message.ClientDisco[0], req.Message.ClientDisco[1])
+	if err != nil {
+		e.logf("error allocating endpoint: %v", err)
+		return
+	}
+	// Take a defensive stance around publishing from within an
+	// [*eventbus.SubscribeFunc] by publishing from a separate goroutine. At the
+	// time of writing (2025-11-21), publishing from within the
+	// [*eventbus.SubscribeFunc] goroutine is potentially unsafe if publisher
+	// and subscriber share a lock.
+	go e.respPub.Publish(magicsock.UDPRelayAllocResp{
+		ReqRxFromNodeKey:  req.RxFromNodeKey,
+		ReqRxFromDiscoKey: req.RxFromDiscoKey,
+		Message: &disco.AllocateUDPRelayEndpointResponse{
+			Generation: req.Message.Generation,
+			UDPRelayEndpoint: disco.UDPRelayEndpoint{
+				ServerDisco:         se.ServerDisco,
+				ClientDisco:         se.ClientDisco,
+				LamportID:           se.LamportID,
+				VNI:                 se.VNI,
+				BindLifetime:        se.BindLifetime.Duration,
+				SteadyStateLifetime: se.SteadyStateLifetime.Duration,
+				AddrPorts:           se.AddrPorts,
+			},
+		},
+	})
+}
+
+func (e *extension) tryStartRelayServerLocked() {
+	rs, err := e.newServerFn(e.logf, *e.port, false)
+	if err != nil {
+		e.logf("error initializing server: %v", err)
+		return
+	}
+	e.rs = rs
+	e.rs.SetDERPMapView(e.derpMapView)
+}
+
+func (e *extension) relayServerShouldBeRunningLocked() bool {
+	return !e.shutdown && e.port != nil && !e.hasNodeAttrDisableRelayServer
+}
+
+// handleRelayServerLifetimeLocked handles the lifetime of [e.rs].
+func (e *extension) handleRelayServerLifetimeLocked() {
+	defer e.handleRelayServerStaticAddrPortsLocked()
+	if !e.relayServerShouldBeRunningLocked() {
+		e.stopRelayServerLocked()
+		return
+	} else if e.rs != nil {
+		return // already running
+	}
+	e.tryStartRelayServerLocked()
+}
+
+func (e *extension) handleRelayServerStaticAddrPortsLocked() {
+	if e.rs != nil {
+		// TODO(jwhited): env var support
+		e.rs.SetStaticAddrPorts(e.staticEndpoints)
+	}
+}
+
 func (e *extension) selfNodeViewChanged(nodeView tailcfg.NodeView) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.hasNodeAttrRelayServer = nodeView.HasCap(tailcfg.NodeAttrRelayServer)
-	if !e.hasNodeAttrRelayServer && e.server != nil {
-		e.server.Close()
-		e.server = nil
-	}
+	e.hasNodeAttrDisableRelayServer = nodeView.HasCap(nodecap.DisableRelayServer)
+	e.handleRelayServerLifetimeLocked()
 }
 
 func (e *extension) profileStateChanged(_ ipn.LoginProfileView, prefs ipn.PrefsView, sameNode bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.staticEndpoints = prefs.RelayServerStaticEndpoints()
 	newPort, ok := prefs.RelayServerPort().GetOk()
 	enableOrDisableServer := ok != (e.port != nil)
 	portChanged := ok && e.port != nil && newPort != *e.port
 	if enableOrDisableServer || portChanged || !sameNode {
-		if e.server != nil {
-			e.server.Close()
-			e.server = nil
-		}
+		e.stopRelayServerLocked()
 		e.port = nil
 		if ok {
-			e.port = ptr.To(newPort)
+			e.port = new(newPort)
 		}
 	}
+	e.handleRelayServerLifetimeLocked()
+}
+
+func (e *extension) stopRelayServerLocked() {
+	if e.rs != nil {
+		e.rs.Close()
+	}
+	e.rs = nil
 }
 
 // Shutdown implements [ipnlocal.Extension].
 func (e *extension) Shutdown() error {
+	// [extension.mu] must not be held when closing the [eventbus.Client]. Close
+	// blocks until all [eventbus.SubscribeFunc]'s have returned, and the ones
+	// used in this package also acquire [extension.mu]. See #17894.
+	e.ec.Close()
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.shutdown = true
-	if e.server != nil {
-		e.server.Close()
-		e.server = nil
-	}
+	e.stopRelayServerLocked()
 	return nil
 }
 
-func (e *extension) relayServerOrInit() (relayServer, error) {
+// serverStatus gathers and returns current peer relay server status information
+// for this Tailscale node, and status of each peer relay session this node is
+// relaying (if any).
+func (e *extension) serverStatus() status.ServerStatus {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.shutdown {
-		return nil, errors.New("relay server is shutdown")
+	st := status.ServerStatus{
+		UDPPort:  nil,
+		Sessions: nil,
 	}
-	if e.server != nil {
-		return e.server, nil
+	if e.rs == nil {
+		return st
 	}
-	if e.port == nil {
-		return nil, errors.New("relay server is not configured")
-	}
-	if !e.hasNodeAttrRelayServer {
-		return nil, errors.New("no relay:server node attribute")
-	}
-	if !envknob.UseWIPCode() {
-		return nil, errors.New("TAILSCALE_USE_WIP_CODE envvar is not set")
-	}
-	var err error
-	e.server, _, err = udprelay.NewServer(*e.port, []netip.Addr{netip.MustParseAddr("127.0.0.1")})
-	if err != nil {
-		return nil, err
-	}
-	return e.server, nil
-}
-
-func handlePeerAPIRelayAllocateEndpoint(h ipnlocal.PeerAPIHandler, w http.ResponseWriter, r *http.Request) {
-	e, ok := ipnlocal.GetExt[*extension](h.LocalBackend())
-	if !ok {
-		http.Error(w, "relay failed to initialize", http.StatusServiceUnavailable)
-		return
-	}
-
-	httpErrAndLog := func(message string, code int) {
-		http.Error(w, message, code)
-		h.Logf("relayserver: request from %v returned code %d: %s", h.RemoteAddr(), code, message)
-	}
-
-	if !h.PeerCaps().HasCapability(tailcfg.PeerCapabilityRelay) {
-		httpErrAndLog("relay not permitted", http.StatusForbidden)
-		return
-	}
-
-	if r.Method != httpm.POST {
-		httpErrAndLog("only POST method is allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var allocateEndpointReq struct {
-		DiscoKeys []key.DiscoPublic
-	}
-	err := json.NewDecoder(io.LimitReader(r.Body, 512)).Decode(&allocateEndpointReq)
-	if err != nil {
-		httpErrAndLog(err.Error(), http.StatusBadRequest)
-		return
-	}
-	if len(allocateEndpointReq.DiscoKeys) != 2 {
-		httpErrAndLog("2 disco public keys must be supplied", http.StatusBadRequest)
-		return
-	}
-
-	rs, err := e.relayServerOrInit()
-	if err != nil {
-		httpErrAndLog(err.Error(), http.StatusServiceUnavailable)
-		return
-	}
-	ep, err := rs.AllocateEndpoint(allocateEndpointReq.DiscoKeys[0], allocateEndpointReq.DiscoKeys[1])
-	if err != nil {
-		httpErrAndLog(err.Error(), http.StatusInternalServerError)
-		return
-	}
-	err = json.NewEncoder(w).Encode(&ep)
-	if err != nil {
-		httpErrAndLog(err.Error(), http.StatusInternalServerError)
-	}
+	st.UDPPort = new(*e.port)
+	st.Sessions = e.rs.GetSessions()
+	return st
 }

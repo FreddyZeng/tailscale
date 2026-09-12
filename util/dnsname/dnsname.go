@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package dnsname contains string functions for working with DNS names.
@@ -14,7 +14,7 @@ const (
 	// maxLabelLength is the maximum length of a label permitted by RFC 1035.
 	maxLabelLength = 63
 	// maxNameLength is the maximum length of a DNS name.
-	maxNameLength = 253
+	maxNameLength = 254
 )
 
 // A FQDN is a fully-qualified DNS name or name suffix.
@@ -94,14 +94,34 @@ func (f FQDN) Contains(other FQDN) bool {
 	return strings.HasSuffix(other.WithTrailingDot(), cmp)
 }
 
+// Parent returns the parent domain by stripping the first label.
+// For "foo.bar.baz.", it returns "bar.baz."
+// It returns an empty FQDN for root or single-label domains.
+func (f FQDN) Parent() FQDN {
+	s := f.WithTrailingDot()
+	_, rest, ok := strings.Cut(s, ".")
+	if !ok || rest == "" {
+		return ""
+	}
+	return FQDN(rest)
+}
+
 // ValidLabel reports whether label is a valid DNS label. All errors are
 // [vizerror.Error].
 func ValidLabel(label string) error {
+	return ValidLabelLike(label, maxLabelLength)
+}
+
+// ValidLabelLike reports whether label contains DNS-valid characters
+// only, adheres to a given maximum length, and starts and ends with
+// a letter or number. For strict DNS-validity use [ValidLabel].
+// All errors are [vizerror.Error].
+func ValidLabelLike(label string, maxLen int) error {
 	if len(label) == 0 {
 		return vizerror.New("empty DNS label")
 	}
-	if len(label) > maxLabelLength {
-		return vizerror.Errorf("%q is too long, max length is %d bytes", label, maxLabelLength)
+	if len(label) > maxLen {
+		return vizerror.Errorf("%q is too long, max length is %d bytes", label, maxLen)
 	}
 	if !isalphanum(label[0]) {
 		return vizerror.Errorf("%q is not a valid DNS label: must start with a letter or number", label)
@@ -109,7 +129,8 @@ func ValidLabel(label string) error {
 	if !isalphanum(label[len(label)-1]) {
 		return vizerror.Errorf("%q is not a valid DNS label: must end with a letter or number", label)
 	}
-	if len(label) < 2 {
+	if len(label) <= 2 {
+		// Return early because we've already checked start and end characters (the only 2) are alphanumeric.
 		return nil
 	}
 	for i := 1; i < len(label)-1; i++ {
@@ -222,7 +243,7 @@ func ValidHostname(hostname string) error {
 		return err
 	}
 
-	for _, label := range strings.Split(fqdn.WithoutTrailingDot(), ".") {
+	for label := range strings.SplitSeq(fqdn.WithoutTrailingDot(), ".") {
 		if err := ValidLabel(label); err != nil {
 			return err
 		}

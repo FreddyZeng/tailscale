@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package source defines interfaces for policy stores,
@@ -13,6 +13,7 @@ import (
 	"io"
 
 	"tailscale.com/types/lazy"
+	"tailscale.com/util/syspolicy/pkey"
 	"tailscale.com/util/syspolicy/setting"
 )
 
@@ -31,19 +32,19 @@ type Store interface {
 	// ReadString returns the value of a [setting.StringValue] with the specified key,
 	// an [setting.ErrNotConfigured] if the policy setting is not configured, or
 	// an error on failure.
-	ReadString(key setting.Key) (string, error)
+	ReadString(key pkey.Key) (string, error)
 	// ReadUInt64 returns the value of a [setting.IntegerValue] with the specified key,
 	// an [setting.ErrNotConfigured] if the policy setting is not configured, or
 	// an error on failure.
-	ReadUInt64(key setting.Key) (uint64, error)
+	ReadUInt64(key pkey.Key) (uint64, error)
 	// ReadBoolean returns the value of a [setting.BooleanValue] with the specified key,
 	// an [setting.ErrNotConfigured] if the policy setting is not configured, or
 	// an error on failure.
-	ReadBoolean(key setting.Key) (bool, error)
+	ReadBoolean(key pkey.Key) (bool, error)
 	// ReadStringArray returns the value of a [setting.StringListValue] with the specified key,
 	// an [setting.ErrNotConfigured] if the policy setting is not configured, or
 	// an error on failure.
-	ReadStringArray(key setting.Key) ([]string, error)
+	ReadStringArray(key pkey.Key) ([]string, error)
 }
 
 // Lockable is an optional interface that [Store] implementations may support.

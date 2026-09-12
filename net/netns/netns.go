@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package netns contains the common code for using the Go net package
@@ -17,6 +17,7 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"runtime"
 	"sync/atomic"
 
 	"tailscale.com/net/netknob"
@@ -39,18 +40,48 @@ var bindToInterfaceByRoute atomic.Bool
 // setting the TS_BIND_TO_INTERFACE_BY_ROUTE.
 //
 // Currently, this only changes the behaviour on macOS and Windows.
-func SetBindToInterfaceByRoute(v bool) {
-	bindToInterfaceByRoute.Store(v)
+func SetBindToInterfaceByRoute(logf logger.Logf, v bool) {
+	if bindToInterfaceByRoute.Swap(v) != v {
+		logf("netns: bindToInterfaceByRoute changed to %v", v)
+	}
+}
+
+// When true, disableAndroidBindToActiveNetwork skips binding sockets to the currently
+// active network on Android.
+var disableAndroidBindToActiveNetwork atomic.Bool
+
+// SetDisableAndroidBindToActiveNetwork disables the default behavior of binding
+// sockets to the currently active network on Android.
+func SetDisableAndroidBindToActiveNetwork(logf logger.Logf, v bool) {
+	if runtime.GOOS == "android" && disableAndroidBindToActiveNetwork.Swap(v) != v {
+		logf("netns: disableAndroidBindToActiveNetwork changed to %v", v)
+	}
 }
 
 var disableBindConnToInterface atomic.Bool
 
 // SetDisableBindConnToInterface disables the (normal) behavior of binding
-// connections to the default network interface.
+// connections to the default network interface on Darwin nodes.
 //
-// Currently, this only has an effect on Darwin.
-func SetDisableBindConnToInterface(v bool) {
-	disableBindConnToInterface.Store(v)
+// Unless you intended to disable this for tailscaled on macos (which is likely
+// to break things), you probably wanted to set
+// SetDisableBindConnToInterfaceAppleExt which will disable explicit interface
+// binding only when tailscaled is running inside a network extension process.
+func SetDisableBindConnToInterface(logf logger.Logf, v bool) {
+	if disableBindConnToInterface.Swap(v) != v {
+		logf("netns: disableBindConnToInterface changed to %v", v)
+	}
+}
+
+var disableBindConnToInterfaceAppleExt atomic.Bool
+
+// SetDisableBindConnToInterfaceAppleExt disables the (normal) behavior of binding
+// connections to the default network interface but only on Apple clients where
+// tailscaled is running inside a network extension.
+func SetDisableBindConnToInterfaceAppleExt(logf logger.Logf, v bool) {
+	if runtime.GOOS == "darwin" && disableBindConnToInterfaceAppleExt.Swap(v) != v {
+		logf("netns: disableBindConnToInterfaceAppleExt changed to %v", v)
+	}
 }
 
 // Listener returns a new net.Listener with its Control hook func

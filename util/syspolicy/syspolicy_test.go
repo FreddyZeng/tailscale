@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package syspolicy
@@ -12,6 +12,9 @@ import (
 	"tailscale.com/types/logger"
 	"tailscale.com/util/syspolicy/internal/loggerx"
 	"tailscale.com/util/syspolicy/internal/metrics"
+	"tailscale.com/util/syspolicy/pkey"
+	"tailscale.com/util/syspolicy/ptype"
+	"tailscale.com/util/syspolicy/rsop"
 	"tailscale.com/util/syspolicy/setting"
 	"tailscale.com/util/syspolicy/source"
 	"tailscale.com/util/testenv"
@@ -19,10 +22,20 @@ import (
 
 var someOtherError = errors.New("error other than not found")
 
+// registerWellKnownSettingsForTest registers all implicit setting definitions
+// for the duration of the test.
+func registerWellKnownSettingsForTest(tb testenv.TB) {
+	tb.Helper()
+	err := setting.SetDefinitionsForTest(tb, implicitDefinitions...)
+	if err != nil {
+		tb.Fatalf("Failed to register well-known settings: %v", err)
+	}
+}
+
 func TestGetString(t *testing.T) {
 	tests := []struct {
 		name         string
-		key          Key
+		key          pkey.Key
 		handlerValue string
 		handlerError error
 		defaultValue string
@@ -31,8 +44,8 @@ func TestGetString(t *testing.T) {
 		wantMetrics  []metrics.TestState
 	}{
 		{
-			name:         "read existing value",
-			key:          AdminConsoleVisibility,
+			name:         "read-existing-value",
+			key:          pkey.AdminConsoleVisibility,
 			handlerValue: "hide",
 			wantValue:    "hide",
 			wantMetrics: []metrics.TestState{
@@ -41,22 +54,22 @@ func TestGetString(t *testing.T) {
 			},
 		},
 		{
-			name:         "read non-existing value",
-			key:          EnableServerMode,
+			name:         "read-non-existing-value",
+			key:          pkey.EnableServerMode,
 			handlerError: ErrNotConfigured,
 			wantError:    nil,
 		},
 		{
-			name:         "read non-existing value, non-blank default",
-			key:          EnableServerMode,
+			name:         "read-non-existing-value-non-blank-default",
+			key:          pkey.EnableServerMode,
 			handlerError: ErrNotConfigured,
 			defaultValue: "test",
 			wantValue:    "test",
 			wantError:    nil,
 		},
 		{
-			name:         "reading value returns other error",
-			key:          NetworkDevicesVisibility,
+			name:         "reading-value-returns-other-error",
+			key:          pkey.NetworkDevicesVisibility,
 			handlerError: someOtherError,
 			wantError:    someOtherError,
 			wantMetrics: []metrics.TestState{
@@ -66,7 +79,7 @@ func TestGetString(t *testing.T) {
 		},
 	}
 
-	RegisterWellKnownSettingsForTest(t)
+	registerWellKnownSettingsForTest(t)
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -80,7 +93,7 @@ func TestGetString(t *testing.T) {
 			}
 			registerSingleSettingStoreForTest(t, s)
 
-			value, err := GetString(tt.key, tt.defaultValue)
+			value, err := getString(tt.key, tt.defaultValue)
 			if !errorsMatchForTest(err, tt.wantError) {
 				t.Errorf("err=%q, want %q", err, tt.wantError)
 			}
@@ -103,7 +116,7 @@ func TestGetString(t *testing.T) {
 func TestGetUint64(t *testing.T) {
 	tests := []struct {
 		name         string
-		key          Key
+		key          pkey.Key
 		handlerValue uint64
 		handlerError error
 		defaultValue uint64
@@ -111,28 +124,28 @@ func TestGetUint64(t *testing.T) {
 		wantError    error
 	}{
 		{
-			name:         "read existing value",
-			key:          LogSCMInteractions,
+			name:         "read-existing-value",
+			key:          pkey.LogSCMInteractions,
 			handlerValue: 1,
 			wantValue:    1,
 		},
 		{
-			name:         "read non-existing value",
-			key:          LogSCMInteractions,
+			name:         "read-non-existing-value",
+			key:          pkey.LogSCMInteractions,
 			handlerValue: 0,
 			handlerError: ErrNotConfigured,
 			wantValue:    0,
 		},
 		{
-			name:         "read non-existing value, non-zero default",
-			key:          LogSCMInteractions,
+			name:         "read-non-existing-value-non-zero-default",
+			key:          pkey.LogSCMInteractions,
 			defaultValue: 2,
 			handlerError: ErrNotConfigured,
 			wantValue:    2,
 		},
 		{
-			name:         "reading value returns other error",
-			key:          FlushDNSOnSessionUnlock,
+			name:         "reading-value-returns-other-error",
+			key:          pkey.FlushDNSOnSessionUnlock,
 			handlerError: someOtherError,
 			wantError:    someOtherError,
 		},
@@ -155,7 +168,7 @@ func TestGetUint64(t *testing.T) {
 			}
 			registerSingleSettingStoreForTest(t, s)
 
-			value, err := GetUint64(tt.key, tt.defaultValue)
+			value, err := getUint64(tt.key, tt.defaultValue)
 			if !errorsMatchForTest(err, tt.wantError) {
 				t.Errorf("err=%q, want %q", err, tt.wantError)
 			}
@@ -169,7 +182,7 @@ func TestGetUint64(t *testing.T) {
 func TestGetBoolean(t *testing.T) {
 	tests := []struct {
 		name         string
-		key          Key
+		key          pkey.Key
 		handlerValue bool
 		handlerError error
 		defaultValue bool
@@ -178,8 +191,8 @@ func TestGetBoolean(t *testing.T) {
 		wantMetrics  []metrics.TestState
 	}{
 		{
-			name:         "read existing value",
-			key:          FlushDNSOnSessionUnlock,
+			name:         "read-existing-value",
+			key:          pkey.FlushDNSOnSessionUnlock,
 			handlerValue: true,
 			wantValue:    true,
 			wantMetrics: []metrics.TestState{
@@ -188,15 +201,15 @@ func TestGetBoolean(t *testing.T) {
 			},
 		},
 		{
-			name:         "read non-existing value",
-			key:          LogSCMInteractions,
+			name:         "read-non-existing-value",
+			key:          pkey.LogSCMInteractions,
 			handlerValue: false,
 			handlerError: ErrNotConfigured,
 			wantValue:    false,
 		},
 		{
-			name:         "reading value returns other error",
-			key:          FlushDNSOnSessionUnlock,
+			name:         "reading-value-returns-other-error",
+			key:          pkey.FlushDNSOnSessionUnlock,
 			handlerError: someOtherError,
 			wantError:    someOtherError, // expect error...
 			defaultValue: true,
@@ -208,7 +221,7 @@ func TestGetBoolean(t *testing.T) {
 		},
 	}
 
-	RegisterWellKnownSettingsForTest(t)
+	registerWellKnownSettingsForTest(t)
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -222,7 +235,7 @@ func TestGetBoolean(t *testing.T) {
 			}
 			registerSingleSettingStoreForTest(t, s)
 
-			value, err := GetBoolean(tt.key, tt.defaultValue)
+			value, err := getBoolean(tt.key, tt.defaultValue)
 			if !errorsMatchForTest(err, tt.wantError) {
 				t.Errorf("err=%q, want %q", err, tt.wantError)
 			}
@@ -245,54 +258,54 @@ func TestGetBoolean(t *testing.T) {
 func TestGetPreferenceOption(t *testing.T) {
 	tests := []struct {
 		name         string
-		key          Key
+		key          pkey.Key
 		handlerValue string
 		handlerError error
-		wantValue    setting.PreferenceOption
+		wantValue    ptype.PreferenceOption
 		wantError    error
 		wantMetrics  []metrics.TestState
 	}{
 		{
-			name:         "always by policy",
-			key:          EnableIncomingConnections,
+			name:         "always-by-policy",
+			key:          pkey.EnableIncomingConnections,
 			handlerValue: "always",
-			wantValue:    setting.AlwaysByPolicy,
+			wantValue:    ptype.AlwaysByPolicy,
 			wantMetrics: []metrics.TestState{
 				{Name: "$os_syspolicy_any", Value: 1},
 				{Name: "$os_syspolicy_AllowIncomingConnections", Value: 1},
 			},
 		},
 		{
-			name:         "never by policy",
-			key:          EnableIncomingConnections,
+			name:         "never-by-policy",
+			key:          pkey.EnableIncomingConnections,
 			handlerValue: "never",
-			wantValue:    setting.NeverByPolicy,
+			wantValue:    ptype.NeverByPolicy,
 			wantMetrics: []metrics.TestState{
 				{Name: "$os_syspolicy_any", Value: 1},
 				{Name: "$os_syspolicy_AllowIncomingConnections", Value: 1},
 			},
 		},
 		{
-			name:         "use default",
-			key:          EnableIncomingConnections,
+			name:         "use-default",
+			key:          pkey.EnableIncomingConnections,
 			handlerValue: "",
-			wantValue:    setting.ShowChoiceByPolicy,
+			wantValue:    ptype.ShowChoiceByPolicy,
 			wantMetrics: []metrics.TestState{
 				{Name: "$os_syspolicy_any", Value: 1},
 				{Name: "$os_syspolicy_AllowIncomingConnections", Value: 1},
 			},
 		},
 		{
-			name:         "read non-existing value",
-			key:          EnableIncomingConnections,
+			name:         "read-non-existing-value",
+			key:          pkey.EnableIncomingConnections,
 			handlerError: ErrNotConfigured,
-			wantValue:    setting.ShowChoiceByPolicy,
+			wantValue:    ptype.ShowChoiceByPolicy,
 		},
 		{
-			name:         "other error is returned",
-			key:          EnableIncomingConnections,
+			name:         "other-error-is-returned",
+			key:          pkey.EnableIncomingConnections,
 			handlerError: someOtherError,
-			wantValue:    setting.ShowChoiceByPolicy,
+			wantValue:    ptype.ShowChoiceByPolicy,
 			wantError:    someOtherError,
 			wantMetrics: []metrics.TestState{
 				{Name: "$os_syspolicy_errors", Value: 1},
@@ -301,7 +314,7 @@ func TestGetPreferenceOption(t *testing.T) {
 		},
 	}
 
-	RegisterWellKnownSettingsForTest(t)
+	registerWellKnownSettingsForTest(t)
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -315,7 +328,7 @@ func TestGetPreferenceOption(t *testing.T) {
 			}
 			registerSingleSettingStoreForTest(t, s)
 
-			option, err := GetPreferenceOption(tt.key)
+			option, err := getPreferenceOption(tt.key, ptype.ShowChoiceByPolicy)
 			if !errorsMatchForTest(err, tt.wantError) {
 				t.Errorf("err=%q, want %q", err, tt.wantError)
 			}
@@ -338,46 +351,46 @@ func TestGetPreferenceOption(t *testing.T) {
 func TestGetVisibility(t *testing.T) {
 	tests := []struct {
 		name         string
-		key          Key
+		key          pkey.Key
 		handlerValue string
 		handlerError error
-		wantValue    setting.Visibility
+		wantValue    ptype.Visibility
 		wantError    error
 		wantMetrics  []metrics.TestState
 	}{
 		{
-			name:         "hidden by policy",
-			key:          AdminConsoleVisibility,
+			name:         "hidden-by-policy",
+			key:          pkey.AdminConsoleVisibility,
 			handlerValue: "hide",
-			wantValue:    setting.HiddenByPolicy,
+			wantValue:    ptype.HiddenByPolicy,
 			wantMetrics: []metrics.TestState{
 				{Name: "$os_syspolicy_any", Value: 1},
 				{Name: "$os_syspolicy_AdminConsole", Value: 1},
 			},
 		},
 		{
-			name:         "visibility default",
-			key:          AdminConsoleVisibility,
+			name:         "visibility-default",
+			key:          pkey.AdminConsoleVisibility,
 			handlerValue: "show",
-			wantValue:    setting.VisibleByPolicy,
+			wantValue:    ptype.VisibleByPolicy,
 			wantMetrics: []metrics.TestState{
 				{Name: "$os_syspolicy_any", Value: 1},
 				{Name: "$os_syspolicy_AdminConsole", Value: 1},
 			},
 		},
 		{
-			name:         "read non-existing value",
-			key:          AdminConsoleVisibility,
+			name:         "read-non-existing-value",
+			key:          pkey.AdminConsoleVisibility,
 			handlerValue: "show",
 			handlerError: ErrNotConfigured,
-			wantValue:    setting.VisibleByPolicy,
+			wantValue:    ptype.VisibleByPolicy,
 		},
 		{
-			name:         "other error is returned",
-			key:          AdminConsoleVisibility,
+			name:         "other-error-is-returned",
+			key:          pkey.AdminConsoleVisibility,
 			handlerValue: "show",
 			handlerError: someOtherError,
-			wantValue:    setting.VisibleByPolicy,
+			wantValue:    ptype.VisibleByPolicy,
 			wantError:    someOtherError,
 			wantMetrics: []metrics.TestState{
 				{Name: "$os_syspolicy_errors", Value: 1},
@@ -386,7 +399,7 @@ func TestGetVisibility(t *testing.T) {
 		},
 	}
 
-	RegisterWellKnownSettingsForTest(t)
+	registerWellKnownSettingsForTest(t)
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -400,7 +413,7 @@ func TestGetVisibility(t *testing.T) {
 			}
 			registerSingleSettingStoreForTest(t, s)
 
-			visibility, err := GetVisibility(tt.key)
+			visibility, err := getVisibility(tt.key)
 			if !errorsMatchForTest(err, tt.wantError) {
 				t.Errorf("err=%q, want %q", err, tt.wantError)
 			}
@@ -423,7 +436,7 @@ func TestGetVisibility(t *testing.T) {
 func TestGetDuration(t *testing.T) {
 	tests := []struct {
 		name         string
-		key          Key
+		key          pkey.Key
 		handlerValue string
 		handlerError error
 		defaultValue time.Duration
@@ -432,8 +445,8 @@ func TestGetDuration(t *testing.T) {
 		wantMetrics  []metrics.TestState
 	}{
 		{
-			name:         "read existing value",
-			key:          KeyExpirationNoticeTime,
+			name:         "read-existing-value",
+			key:          pkey.KeyExpirationNoticeTime,
 			handlerValue: "2h",
 			wantValue:    2 * time.Hour,
 			defaultValue: 24 * time.Hour,
@@ -443,8 +456,8 @@ func TestGetDuration(t *testing.T) {
 			},
 		},
 		{
-			name:         "invalid duration value",
-			key:          KeyExpirationNoticeTime,
+			name:         "invalid-duration-value",
+			key:          pkey.KeyExpirationNoticeTime,
 			handlerValue: "-20",
 			wantValue:    24 * time.Hour,
 			wantError:    errors.New(`time: missing unit in duration "-20"`),
@@ -455,22 +468,22 @@ func TestGetDuration(t *testing.T) {
 			},
 		},
 		{
-			name:         "read non-existing value",
-			key:          KeyExpirationNoticeTime,
+			name:         "read-non-existing-value",
+			key:          pkey.KeyExpirationNoticeTime,
 			handlerError: ErrNotConfigured,
 			wantValue:    24 * time.Hour,
 			defaultValue: 24 * time.Hour,
 		},
 		{
-			name:         "read non-existing value different default",
-			key:          KeyExpirationNoticeTime,
+			name:         "read-non-existing-value-different-default",
+			key:          pkey.KeyExpirationNoticeTime,
 			handlerError: ErrNotConfigured,
 			wantValue:    0 * time.Second,
 			defaultValue: 0 * time.Second,
 		},
 		{
-			name:         "other error is returned",
-			key:          KeyExpirationNoticeTime,
+			name:         "other-error-is-returned",
+			key:          pkey.KeyExpirationNoticeTime,
 			handlerError: someOtherError,
 			wantValue:    24 * time.Hour,
 			wantError:    someOtherError,
@@ -482,7 +495,7 @@ func TestGetDuration(t *testing.T) {
 		},
 	}
 
-	RegisterWellKnownSettingsForTest(t)
+	registerWellKnownSettingsForTest(t)
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -496,7 +509,7 @@ func TestGetDuration(t *testing.T) {
 			}
 			registerSingleSettingStoreForTest(t, s)
 
-			duration, err := GetDuration(tt.key, tt.defaultValue)
+			duration, err := getDuration(tt.key, tt.defaultValue)
 			if !errorsMatchForTest(err, tt.wantError) {
 				t.Errorf("err=%q, want %q", err, tt.wantError)
 			}
@@ -519,7 +532,7 @@ func TestGetDuration(t *testing.T) {
 func TestGetStringArray(t *testing.T) {
 	tests := []struct {
 		name         string
-		key          Key
+		key          pkey.Key
 		handlerValue []string
 		handlerError error
 		defaultValue []string
@@ -528,8 +541,8 @@ func TestGetStringArray(t *testing.T) {
 		wantMetrics  []metrics.TestState
 	}{
 		{
-			name:         "read existing value",
-			key:          AllowedSuggestedExitNodes,
+			name:         "read-existing-value",
+			key:          pkey.AllowedSuggestedExitNodes,
 			handlerValue: []string{"foo", "bar"},
 			wantValue:    []string{"foo", "bar"},
 			wantMetrics: []metrics.TestState{
@@ -538,22 +551,22 @@ func TestGetStringArray(t *testing.T) {
 			},
 		},
 		{
-			name:         "read non-existing value",
-			key:          AllowedSuggestedExitNodes,
+			name:         "read-non-existing-value",
+			key:          pkey.AllowedSuggestedExitNodes,
 			handlerError: ErrNotConfigured,
 			wantError:    nil,
 		},
 		{
-			name:         "read non-existing value, non nil default",
-			key:          AllowedSuggestedExitNodes,
+			name:         "read-non-existing-value-non-nil-default",
+			key:          pkey.AllowedSuggestedExitNodes,
 			handlerError: ErrNotConfigured,
 			defaultValue: []string{"foo", "bar"},
 			wantValue:    []string{"foo", "bar"},
 			wantError:    nil,
 		},
 		{
-			name:         "reading value returns other error",
-			key:          AllowedSuggestedExitNodes,
+			name:         "reading-value-returns-other-error",
+			key:          pkey.AllowedSuggestedExitNodes,
 			handlerError: someOtherError,
 			wantError:    someOtherError,
 			wantMetrics: []metrics.TestState{
@@ -563,7 +576,7 @@ func TestGetStringArray(t *testing.T) {
 		},
 	}
 
-	RegisterWellKnownSettingsForTest(t)
+	registerWellKnownSettingsForTest(t)
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -577,7 +590,7 @@ func TestGetStringArray(t *testing.T) {
 			}
 			registerSingleSettingStoreForTest(t, s)
 
-			value, err := GetStringArray(tt.key, tt.defaultValue)
+			value, err := getStringArray(tt.key, tt.defaultValue)
 			if !errorsMatchForTest(err, tt.wantError) {
 				t.Errorf("err=%q, want %q", err, tt.wantError)
 			}
@@ -597,21 +610,31 @@ func TestGetStringArray(t *testing.T) {
 	}
 }
 
+// mustRegisterStoreForTest is like [rsop.RegisterStoreForTest], but it fails the test if the store could not be registered.
+func mustRegisterStoreForTest(tb testenv.TB, name string, scope setting.PolicyScope, store source.Store) *rsop.StoreRegistration {
+	tb.Helper()
+	reg, err := rsop.RegisterStoreForTest(tb, name, scope, store)
+	if err != nil {
+		tb.Fatalf("Failed to register policy store %q as a %v policy source: %v", name, scope, err)
+	}
+	return reg
+}
+
 func registerSingleSettingStoreForTest[T source.TestValueType](tb testenv.TB, s source.TestSetting[T]) {
 	policyStore := source.NewTestStoreOf(tb, s)
-	MustRegisterStoreForTest(tb, "TestStore", setting.DeviceScope, policyStore)
+	mustRegisterStoreForTest(tb, "TestStore", setting.DeviceScope, policyStore)
 }
 
 func BenchmarkGetString(b *testing.B) {
 	loggerx.SetForTest(b, logger.Discard, logger.Discard)
-	RegisterWellKnownSettingsForTest(b)
+	registerWellKnownSettingsForTest(b)
 
 	wantControlURL := "https://login.tailscale.com"
-	registerSingleSettingStoreForTest(b, source.TestSettingOf(ControlURL, wantControlURL))
+	registerSingleSettingStoreForTest(b, source.TestSettingOf(pkey.ControlURL, wantControlURL))
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		gotControlURL, _ := GetString(ControlURL, "https://controlplane.tailscale.com")
+		gotControlURL, _ := getString(pkey.ControlURL, "https://controlplane.tailscale.com")
 		if gotControlURL != wantControlURL {
 			b.Fatalf("got %v; want %v", gotControlURL, wantControlURL)
 		}

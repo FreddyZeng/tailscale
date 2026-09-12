@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Cloner is a tool to automate the creation of a Clone method.
@@ -121,7 +121,18 @@ func gen(buf *bytes.Buffer, it *codegen.ImportTracker, typ *types.Named) {
 				continue
 			}
 			if !hasBasicUnderlying(ft) {
-				writef("dst.%s = *src.%s.Clone()", fname, fname)
+				// don't dereference if the underlying type is an interface
+				if _, isInterface := ft.Underlying().(*types.Interface); isInterface {
+					writef("if src.%s != nil { dst.%s = src.%s.Clone() }", fname, fname, fname)
+				} else {
+					writef("dst.%s = *src.%s.Clone()", fname, fname)
+				}
+				continue
+			}
+			// Named types with basic underlying types (map/slice) that
+			// have their own Clone method should use it directly.
+			if methodResultType(ft, "Clone") != nil {
+				writef("dst.%s = src.%s.Clone()", fname, fname)
 				continue
 			}
 		}
@@ -132,27 +143,9 @@ func gen(buf *bytes.Buffer, it *codegen.ImportTracker, typ *types.Named) {
 				writef("if src.%s != nil {", fname)
 				writef("dst.%s = make([]%s, len(src.%s))", fname, n, fname)
 				writef("for i := range dst.%s {", fname)
-				if ptr, isPtr := ft.Elem().(*types.Pointer); isPtr {
-					writef("if src.%s[i] == nil { dst.%s[i] = nil } else {", fname, fname)
-					if codegen.ContainsPointers(ptr.Elem()) {
-						if _, isIface := ptr.Elem().Underlying().(*types.Interface); isIface {
-							it.Import("tailscale.com/types/ptr")
-							writef("\tdst.%s[i] = ptr.To((*src.%s[i]).Clone())", fname, fname)
-						} else {
-							writef("\tdst.%s[i] = src.%s[i].Clone()", fname, fname)
-						}
-					} else {
-						it.Import("tailscale.com/types/ptr")
-						writef("\tdst.%s[i] = ptr.To(*src.%s[i])", fname, fname)
-					}
-					writef("}")
-				} else if ft.Elem().String() == "encoding/json.RawMessage" {
-					writef("\tdst.%s[i] = append(src.%s[i][:0:0], src.%s[i]...)", fname, fname, fname)
-				} else if _, isIface := ft.Elem().Underlying().(*types.Interface); isIface {
-					writef("\tdst.%s[i] = src.%s[i].Clone()", fname, fname)
-				} else {
-					writef("\tdst.%s[i] = *src.%s[i].Clone()", fname, fname)
-				}
+				writeSliceElemClone(writef, ft.Elem(),
+					fmt.Sprintf("src.%s[i]", fname),
+					fmt.Sprintf("dst.%s[i]", fname))
 				writef("}")
 				writef("}")
 			} else {
@@ -165,67 +158,72 @@ func gen(buf *bytes.Buffer, it *codegen.ImportTracker, typ *types.Named) {
 				writef("dst.%s = src.%s.Clone()", fname, fname)
 				continue
 			}
-			it.Import("tailscale.com/types/ptr")
 			writef("if dst.%s != nil {", fname)
 			if _, isIface := base.Underlying().(*types.Interface); isIface && hasPtrs {
-				writef("\tdst.%s = ptr.To((*src.%s).Clone())", fname, fname)
+				writef("\tdst.%s = new((*src.%s).Clone())", fname, fname)
 			} else if !hasPtrs {
-				writef("\tdst.%s = ptr.To(*src.%s)", fname, fname)
+				writef("\tdst.%s = new(*src.%s)", fname, fname)
 			} else {
 				writef("\t" + `panic("TODO pointers in pointers")`)
 			}
 			writef("}")
 		case *types.Map:
 			elem := ft.Elem()
-			if sliceType, isSlice := elem.(*types.Slice); isSlice {
+			if sliceType, isSlice := elem.Underlying().(*types.Slice); isSlice {
 				n := it.QualifiedName(sliceType.Elem())
 				writef("if dst.%s != nil {", fname)
 				writef("\tdst.%s = map[%s]%s{}", fname, it.QualifiedName(ft.Key()), it.QualifiedName(elem))
-				writef("\tfor k := range src.%s {", fname)
-				// use zero-length slice instead of nil to ensure
-				// the key is always copied.
-				writef("\t\tdst.%s[k] = append([]%s{}, src.%s[k]...)", fname, n, fname)
-				writef("\t}")
+				if codegen.ContainsPointers(sliceType.Elem()) {
+					writef("\tfor k, sv := range src.%s {", fname)
+					writef("\t\tif sv == nil {")
+					writef("\t\t\tdst.%s[k] = nil", fname)
+					writef("\t\t\tcontinue")
+					writef("\t\t}")
+					writef("\t\tdst.%s[k] = make([]%s, len(sv))", fname, n)
+					writef("\t\tfor i := range sv {")
+					innerWritef := func(format string, args ...any) {
+						writef("\t\t"+format, args...)
+					}
+					writeSliceElemClone(innerWritef, sliceType.Elem(),
+						"sv[i]", fmt.Sprintf("dst.%s[k][i]", fname))
+					writef("\t\t}")
+					writef("\t}")
+				} else {
+					writef("\tfor k := range src.%s {", fname)
+					// use zero-length slice instead of nil to ensure
+					// the key is always copied.
+					writef("\t\tdst.%s[k] = append([]%s{}, src.%s[k]...)", fname, n, fname)
+					writef("\t}")
+				}
 				writef("}")
-			} else if codegen.ContainsPointers(elem) {
+			} else if codegen.IsViewType(elem) || !codegen.ContainsPointers(elem) {
+				// If the map values are view types (which are
+				// immutable and don't need cloning) or don't
+				// themselves contain pointers, we can just
+				// clone the map itself.
+				it.Import("", "maps")
+				writef("\tdst.%s = maps.Clone(src.%s)", fname, fname)
+			} else {
+				// Otherwise we need to clone each element of
+				// the map using our recursive helper.
 				writef("if dst.%s != nil {", fname)
 				writef("\tdst.%s = map[%s]%s{}", fname, it.QualifiedName(ft.Key()), it.QualifiedName(elem))
 				writef("\tfor k, v := range src.%s {", fname)
 
-				switch elem := elem.Underlying().(type) {
-				case *types.Pointer:
-					writef("\t\tif v == nil { dst.%s[k] = nil } else {", fname)
-					if base := elem.Elem().Underlying(); codegen.ContainsPointers(base) {
-						if _, isIface := base.(*types.Interface); isIface {
-							it.Import("tailscale.com/types/ptr")
-							writef("\t\t\tdst.%s[k] = ptr.To((*v).Clone())", fname)
-						} else {
-							writef("\t\t\tdst.%s[k] = v.Clone()", fname)
-						}
-					} else {
-						it.Import("tailscale.com/types/ptr")
-						writef("\t\t\tdst.%s[k] = ptr.To(*v)", fname)
-					}
-					writef("}")
-				case *types.Interface:
-					if cloneResultType := methodResultType(elem, "Clone"); cloneResultType != nil {
-						if _, isPtr := cloneResultType.(*types.Pointer); isPtr {
-							writef("\t\tdst.%s[k] = *(v.Clone())", fname)
-						} else {
-							writef("\t\tdst.%s[k] = v.Clone()", fname)
-						}
-					} else {
-						writef(`panic("%s (%v) does not have a Clone method")`, fname, elem)
-					}
-				default:
-					writef("\t\tdst.%s[k] = *(v.Clone())", fname)
-				}
-
+				// Use a recursive helper here; this handles
+				// arbitrarily nested maps in addition to
+				// simpler types.
+				writeMapValueClone(mapValueCloneParams{
+					Buf:        buf,
+					It:         it,
+					Elem:       elem,
+					SrcExpr:    "v",
+					DstExpr:    fmt.Sprintf("dst.%s[k]", fname),
+					BaseIndent: "\t",
+					Depth:      1,
+				})
 				writef("\t}")
 				writef("}")
-			} else {
-				it.Import("maps")
-				writef("\tdst.%s = maps.Clone(src.%s)", fname, fname)
 			}
 		case *types.Interface:
 			// If ft is an interface with a "Clone() ft" method, it can be used to clone the field.
@@ -243,6 +241,31 @@ func gen(buf *bytes.Buffer, it *codegen.ImportTracker, typ *types.Named) {
 	fmt.Fprintf(buf, "}\n\n")
 
 	buf.Write(codegen.AssertStructUnchanged(t, name, typeParams, "Clone", it))
+}
+
+// writeSliceElemClone generates code to deep-clone a single slice element
+// from srcExpr to dstExpr. It handles pointer, json.RawMessage, interface,
+// and named struct element types.
+func writeSliceElemClone(writef func(string, ...any), elemType types.Type, srcExpr, dstExpr string) {
+	if ptr, isPtr := elemType.(*types.Pointer); isPtr {
+		writef("if %s == nil { %s = nil } else {", srcExpr, dstExpr)
+		if codegen.ContainsPointers(ptr.Elem()) {
+			if _, isIface := ptr.Elem().Underlying().(*types.Interface); isIface {
+				writef("\t%s = new((*%s).Clone())", dstExpr, srcExpr)
+			} else {
+				writef("\t%s = %s.Clone()", dstExpr, srcExpr)
+			}
+		} else {
+			writef("\t%s = new(*%s)", dstExpr, srcExpr)
+		}
+		writef("}")
+	} else if elemType.String() == "encoding/json.RawMessage" {
+		writef("%s = append(%s[:0:0], %s...)", dstExpr, srcExpr, srcExpr)
+	} else if _, isIface := elemType.Underlying().(*types.Interface); isIface {
+		writef("%s = %s.Clone()", dstExpr, srcExpr)
+	} else {
+		writef("%s = *%s.Clone()", dstExpr, srcExpr)
+	}
 }
 
 // hasBasicUnderlying reports true when typ.Underlying() is a slice or a map.
@@ -265,4 +288,98 @@ func methodResultType(typ types.Type, method string) types.Type {
 		return nil
 	}
 	return sig.Results().At(0).Type()
+}
+
+type mapValueCloneParams struct {
+	// Buf is the buffer to write generated code to
+	Buf *bytes.Buffer
+	// It is the import tracker for managing imports.
+	It *codegen.ImportTracker
+	// Elem is the type of the map value to clone
+	Elem types.Type
+	// SrcExpr is the expression for the source value (e.g., "v", "v2", "v3")
+	SrcExpr string
+	// DstExpr is the expression for the destination (e.g., "dst.Field[k]", "dst.Field[k][k2]")
+	DstExpr string
+	// BaseIndent is the "base" indentation string for the generated code
+	// (i.e. 1 or more tabs). Additional indentation will be added based on
+	// the Depth parameter.
+	BaseIndent string
+	// Depth is the current nesting depth (1 for first level, 2 for second, etc.)
+	Depth int
+}
+
+// writeMapValueClone generates code to clone a map value recursively.
+// It handles arbitrary nesting of maps, pointers, and interfaces.
+func writeMapValueClone(params mapValueCloneParams) {
+	indent := params.BaseIndent + strings.Repeat("\t", params.Depth)
+	writef := func(format string, args ...any) {
+		fmt.Fprintf(params.Buf, indent+format+"\n", args...)
+	}
+
+	switch elem := params.Elem.Underlying().(type) {
+	case *types.Pointer:
+		writef("if %s == nil { %s = nil } else {", params.SrcExpr, params.DstExpr)
+		if base := elem.Elem().Underlying(); codegen.ContainsPointers(base) {
+			if _, isIface := base.(*types.Interface); isIface {
+				writef("\t%s = new((*%s).Clone())", params.DstExpr, params.SrcExpr)
+			} else {
+				writef("\t%s = %s.Clone()", params.DstExpr, params.SrcExpr)
+			}
+		} else {
+			writef("\t%s = new(*%s)", params.DstExpr, params.SrcExpr)
+		}
+		writef("}")
+
+	case *types.Map:
+		// Recursively handle nested maps
+		innerElem := elem.Elem()
+		if codegen.IsViewType(innerElem) || !codegen.ContainsPointers(innerElem) {
+			// Inner map values don't need deep cloning
+			params.It.Import("", "maps")
+			writef("%s = maps.Clone(%s)", params.DstExpr, params.SrcExpr)
+		} else {
+			// Inner map values need cloning
+			keyType := params.It.QualifiedName(elem.Key())
+			valueType := params.It.QualifiedName(innerElem)
+			// Generate unique variable names for nested loops based on depth
+			keyVar := fmt.Sprintf("k%d", params.Depth+1)
+			valVar := fmt.Sprintf("v%d", params.Depth+1)
+
+			writef("if %s == nil {", params.SrcExpr)
+			writef("\t%s = nil", params.DstExpr)
+			writef("\tcontinue")
+			writef("}")
+			writef("%s = map[%s]%s{}", params.DstExpr, keyType, valueType)
+			writef("for %s, %s := range %s {", keyVar, valVar, params.SrcExpr)
+
+			// Recursively generate cloning code for the nested map value
+			nestedDstExpr := fmt.Sprintf("%s[%s]", params.DstExpr, keyVar)
+			writeMapValueClone(mapValueCloneParams{
+				Buf:        params.Buf,
+				It:         params.It,
+				Elem:       innerElem,
+				SrcExpr:    valVar,
+				DstExpr:    nestedDstExpr,
+				BaseIndent: params.BaseIndent,
+				Depth:      params.Depth + 1,
+			})
+
+			writef("}")
+		}
+
+	case *types.Interface:
+		if cloneResultType := methodResultType(elem, "Clone"); cloneResultType != nil {
+			if _, isPtr := cloneResultType.(*types.Pointer); isPtr {
+				writef("%s = *(%s.Clone())", params.DstExpr, params.SrcExpr)
+			} else {
+				writef("%s = %s.Clone()", params.DstExpr, params.SrcExpr)
+			}
+		} else {
+			writef(`panic("map value (%%v) does not have a Clone method")`, elem)
+		}
+
+	default:
+		writef("%s = *(%s.Clone())", params.DstExpr, params.SrcExpr)
+	}
 }

@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build linux
@@ -14,17 +14,25 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
+	"tailscale.com/client/local"
 	"tailscale.com/ipn"
+	"tailscale.com/kube/authkey"
+	"tailscale.com/kube/egressservices"
+	"tailscale.com/kube/ingressservices"
 	"tailscale.com/kube/kubeapi"
 	"tailscale.com/kube/kubeclient"
 	"tailscale.com/kube/kubetypes"
-	"tailscale.com/logtail/backoff"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/backoff"
 )
+
+const fieldManager = "tailscale-container"
 
 // kubeClient is a wrapper around Tailscale's internal kube client that knows how to talk to the kube API server. We use
 // this rather than any of the upstream Kubernetes client libaries to avoid extra imports.
@@ -43,7 +51,7 @@ func newKubeClient(root string, stateSecret string) (*kubeClient, error) {
 	var err error
 	kc, err := kubeclient.New("tailscale-container")
 	if err != nil {
-		return nil, fmt.Errorf("Error creating kube client: %w", err)
+		return nil, fmt.Errorf("error creating kube client: %w", err)
 	}
 	if (root != "/") || os.Getenv("TS_KUBERNETES_READ_API_SERVER_ADDRESS_FROM_ENV") == "true" {
 		// Derive the API server address from the environment variables
@@ -60,7 +68,7 @@ func (kc *kubeClient) storeDeviceID(ctx context.Context, deviceID tailcfg.Stable
 			kubetypes.KeyDeviceID: []byte(deviceID),
 		},
 	}
-	return kc.StrategicMergePatchSecret(ctx, kc.stateSecret, s, "tailscale-container")
+	return kc.StrategicMergePatchSecret(ctx, kc.stateSecret, s, fieldManager)
 }
 
 // storeDeviceEndpoints writes device's tailnet IPs and MagicDNS name to fields 'device_ips', 'device_fqdn' of client's
@@ -81,7 +89,7 @@ func (kc *kubeClient) storeDeviceEndpoints(ctx context.Context, fqdn string, add
 			kubetypes.KeyDeviceIPs:  deviceIPs,
 		},
 	}
-	return kc.StrategicMergePatchSecret(ctx, kc.stateSecret, s, "tailscale-container")
+	return kc.StrategicMergePatchSecret(ctx, kc.stateSecret, s, fieldManager)
 }
 
 // storeHTTPSEndpoint writes an HTTPS endpoint exposed by this device via 'tailscale serve' to the client's state
@@ -93,7 +101,7 @@ func (kc *kubeClient) storeHTTPSEndpoint(ctx context.Context, ep string) error {
 			kubetypes.KeyHTTPSEndpoint: []byte(ep),
 		},
 	}
-	return kc.StrategicMergePatchSecret(ctx, kc.stateSecret, s, "tailscale-container")
+	return kc.StrategicMergePatchSecret(ctx, kc.stateSecret, s, fieldManager)
 }
 
 // deleteAuthKey deletes the 'authkey' field of the given kube
@@ -117,21 +125,89 @@ func (kc *kubeClient) deleteAuthKey(ctx context.Context) error {
 	return nil
 }
 
-// storeCapVerUID stores the current capability version of tailscale and, if provided, UID of the Pod in the tailscale
-// state Secret.
-// These two fields are used by the Kubernetes Operator to observe the current capability version of tailscaled running in this container.
-func (kc *kubeClient) storeCapVerUID(ctx context.Context, podUID string) error {
-	capVerS := fmt.Sprintf("%d", tailcfg.CurrentCapabilityVersion)
-	d := map[string][]byte{
-		kubetypes.KeyCapVer: []byte(capVerS),
+// resetContainerbootState resets state from previous runs of containerboot to
+// ensure the operator doesn't use stale state when a Pod is first recreated.
+//
+// Device identity keys (device_id, device_fqdn, device_ips) are preserved so
+// the operator can clean up the old device from the control plane.
+func (kc *kubeClient) resetContainerbootState(ctx context.Context, podUID string, tailscaledConfigAuthkey string) error {
+	existingSecret, err := kc.GetSecret(ctx, kc.stateSecret)
+	switch {
+	case kubeclient.IsNotFoundErr(err):
+		// In the case that the Secret doesn't exist, we don't have any state to reset and can return early.
+		return nil
+	case err != nil:
+		return fmt.Errorf("failed to read state Secret %q to reset state: %w", kc.stateSecret, err)
+	}
+
+	s := &kubeapi.Secret{
+		Data: map[string][]byte{
+			kubetypes.KeyCapVer:              fmt.Appendf(nil, "%d", tailcfg.CurrentCapabilityVersion),
+			kubetypes.KeyHTTPSEndpoint:       nil,
+			egressservices.KeyEgressServices: nil,
+			ingressservices.IngressConfigKey: nil,
+		},
 	}
 	if podUID != "" {
-		d[kubetypes.KeyPodUID] = []byte(podUID)
+		s.Data[kubetypes.KeyPodUID] = []byte(podUID)
 	}
-	s := &kubeapi.Secret{
-		Data: d,
+
+	// Only clear reissue_authkey if the operator has actioned it.
+	brokenAuthkey, ok := existingSecret.Data[kubetypes.KeyReissueAuthkey]
+	if ok && tailscaledConfigAuthkey != "" && string(brokenAuthkey) != tailscaledConfigAuthkey {
+		s.Data[kubetypes.KeyReissueAuthkey] = nil
 	}
-	return kc.StrategicMergePatchSecret(ctx, kc.stateSecret, s, "tailscale-container")
+
+	return kc.StrategicMergePatchSecret(ctx, kc.stateSecret, s, fieldManager)
+}
+
+func (kc *kubeClient) setAndWaitForAuthKeyReissue(ctx context.Context, client *local.Client, cfg *settings, tailscaledConfigAuthKey string) error {
+	err := client.DisconnectControl(ctx)
+	if err != nil {
+		return fmt.Errorf("error disconnecting from control: %w", err)
+	}
+
+	err = authkey.SetReissueAuthKey(ctx, kc.Client, kc.stateSecret, tailscaledConfigAuthKey, authkey.TailscaleContainerFieldManager)
+	if err != nil {
+		return fmt.Errorf("failed to set reissue_authkey in Kubernetes Secret: %w", err)
+	}
+
+	clearFn := func(ctx context.Context) error {
+		return authkey.ClearReissueAuthKey(ctx, kc.Client, kc.stateSecret, authkey.TailscaleContainerFieldManager)
+	}
+
+	getAuthKey := func() string { return authkey.AuthKeyFromConfig(cfg.TailscaledConfigFilePath) }
+	tailscaledCfgDir := filepath.Dir(cfg.TailscaledConfigFilePath)
+	var notify <-chan struct{}
+	if w, err := fsnotify.NewWatcher(); err != nil {
+		log.Printf("auth key reissue: fsnotify unavailable, using polling: %v", err)
+	} else if err := w.Add(tailscaledCfgDir); err != nil {
+		w.Close()
+		log.Printf("auth key reissue: fsnotify watch failed, using polling: %v", err)
+	} else {
+		defer w.Close()
+		ch := make(chan struct{}, 1)
+		toWatch := filepath.Join(tailscaledCfgDir, "..data")
+		go func() {
+			for ev := range w.Events {
+				if ev.Name == toWatch {
+					select {
+					case ch <- struct{}{}:
+					default:
+					}
+				}
+			}
+		}()
+		notify = ch
+		log.Printf("auth key reissue: watching for config changes via fsnotify")
+	}
+
+	err = authkey.WaitForAuthKeyReissue(ctx, tailscaledConfigAuthKey, 10*time.Minute, getAuthKey, clearFn, notify)
+	if err != nil {
+		return fmt.Errorf("failed to receive new auth key: %w", err)
+	}
+
+	return nil
 }
 
 // waitForConsistentState waits for tailscaled to finish writing state if it

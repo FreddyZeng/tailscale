@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !wasm && !windows && !plan9
@@ -39,7 +39,7 @@ func init() {
 			return ""
 		}
 		prefix := []byte("SSH_CLIENT=")
-		for _, env := range bytes.Split(b, []byte{0}) {
+		for env := range bytes.SplitSeq(b, []byte{0}) {
 			if bytes.HasPrefix(env, prefix) {
 				return string(env[len(prefix):])
 			}

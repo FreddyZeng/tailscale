@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package dnscache contains a minimal DNS cache that makes a bunch of
@@ -8,22 +8,75 @@ package dnscache
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"log"
 	"net"
 	"net/netip"
 	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"tailscale.com/envknob"
+	"tailscale.com/feature"
+	"tailscale.com/feature/buildfeatures"
+	"tailscale.com/net/bakedroots"
 	"tailscale.com/net/netx"
+	"tailscale.com/syncs"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/cloudenv"
 	"tailscale.com/util/singleflight"
-	"tailscale.com/util/slicesx"
+	"tailscale.com/util/testenv"
+)
+
+// HookSetCacheDir optionally points to the dnsresolvecache feature's
+// function to configure the directory in which resolved IPs are
+// persisted to disk. It is called by tailscaled at startup, if the
+// feature is linked in.
+var HookSetCacheDir feature.Hook[func(dir string, logf logger.Logf)]
+
+// HookPersistResolution optionally points to the dnsresolvecache
+// feature's function to record a successful DNS resolution of host
+// to disk. The resolver argument is one of the "forward", "cloud",
+// or "fallback" resolver source names. The feature defers the actual
+// disk write until [HookHostVerified] confirms one of the
+// resolution's IPs.
+var HookPersistResolution feature.Hook[func(host, resolver string, ips []netip.Addr)]
+
+// HookLookupDiskCache optionally points to the dnsresolvecache
+// feature's function to load previously persisted IPs for host from
+// disk. It is consulted only after regular DNS resolution has
+// failed, before falling back to the DERP-based bootstrap DNS.
+var HookLookupDiskCache feature.Hook[func(host string) ([]netip.Addr, bool)]
+
+// HookHostVerified optionally points to the dnsresolvecache
+// feature's function to record that a TLS connection to host, at the
+// given remote IP, presented a certificate chain that is valid for
+// host. That is checked independently of the connection's own TLS
+// config, which may deliberately tolerate interception (as the
+// control plane Noise connection does). The feature uses this to
+// flush a pending resolution of host to disk only once one of its
+// IPs has been cryptographically verified to be host.
+var HookHostVerified feature.Hook[func(host string, ip netip.Addr)]
+
+// Resolver source names, as passed to [HookPersistResolution] and
+// used for deciding fallback behavior in Resolver.lookupIP.
+const (
+	srcForward  = "forward"  // Resolver.Forward (or the test hook)
+	srcCloud    = "cloud"    // cloud host resolver (e.g. GCP metadata resolver)
+	srcDisk     = "disk"     // dnsresolvecache disk cache of an earlier resolution
+	srcFallback = "fallback" // Resolver.LookupIPFallback (DERP-based bootstrap DNS)
+)
+
+var (
+	metricDiskFallbackHit    = clientmetric.NewCounter("dnscache_disk_fallback_hit")
+	metricDiskFallbackMiss   = clientmetric.NewCounter("dnscache_disk_fallback_miss")
+	metricDERPFallbackOK     = clientmetric.NewCounter("dnscache_derp_fallback_ok")
+	metricDERPFallbackDialOK = clientmetric.NewCounter("dnscache_derp_fallback_dial_ok")
 )
 
 var zaddr netip.Addr
@@ -63,6 +116,10 @@ type Resolver struct {
 	// If nil, net.DefaultResolver is used.
 	Forward *net.Resolver
 
+	// LookupIPForTest, if non-nil and in tests, handles requests instead
+	// of the usual mechanisms.
+	LookupIPForTest func(ctx context.Context, host string) ([]netip.Addr, error)
+
 	// LookupIPFallback optionally provides a backup DNS mechanism
 	// to use if Forward returns an error or no results.
 	LookupIPFallback func(ctx context.Context, host string) ([]netip.Addr, error)
@@ -92,7 +149,7 @@ type Resolver struct {
 
 	sf singleflight.Group[string, ipRes]
 
-	mu      sync.Mutex
+	mu      syncs.Mutex
 	ipCache map[string]ipCacheEntry
 }
 
@@ -200,6 +257,9 @@ func (r *Resolver) LookupIP(ctx context.Context, host string) (ip, v6 netip.Addr
 			}
 			allIPs = append(allIPs, naIP)
 		}
+		if !ip.IsValid() && v6.IsValid() {
+			ip = v6
+		}
 		r.dlogf("returning %d static results", len(allIPs))
 		return
 	}
@@ -284,11 +344,30 @@ func (r *Resolver) lookupIP(ctx context.Context, host string) (ip, ip6 netip.Add
 
 	lookupCtx, lookupCancel := context.WithTimeout(ctx, r.lookupTimeoutForHost(host))
 	defer lookupCancel()
-	ips, err := r.fwd().LookupNetIP(lookupCtx, "ip", host)
-	if err != nil || len(ips) == 0 {
-		if resolver, ok := r.cloudHostResolver(); ok {
-			r.dlogf("resolving %q via cloud resolver", host)
-			ips, err = resolver.LookupNetIP(lookupCtx, "ip", host)
+
+	var ips []netip.Addr
+	src := srcForward
+	if r.LookupIPForTest != nil && testenv.InTest() {
+		ips, err = r.LookupIPForTest(ctx, host)
+	} else {
+		ips, err = r.fwd().LookupNetIP(lookupCtx, "ip", host)
+		if err != nil || len(ips) == 0 {
+			if resolver, ok := r.cloudHostResolver(); ok {
+				r.dlogf("resolving %q via cloud resolver", host)
+				src = srcCloud
+				ips, err = resolver.LookupNetIP(lookupCtx, "ip", host)
+			}
+		}
+	}
+	if buildfeatures.HasDNSResolveCache && (err != nil || len(ips) == 0) {
+		if f, ok := HookLookupDiskCache.GetOk(); ok {
+			if cached, ok := f(host); ok {
+				r.dlogf("resolving %q from disk cache after error", host)
+				metricDiskFallbackHit.Add(1)
+				ips, err, src = cached, nil, srcDisk
+			} else {
+				metricDiskFallbackMiss.Add(1)
+			}
 		}
 	}
 	if (err != nil || len(ips) == 0) && r.LookupIPFallback != nil {
@@ -299,7 +378,11 @@ func (r *Resolver) lookupIP(ctx context.Context, host string) (ip, ip6 netip.Add
 		} else {
 			r.dlogf("resolving %q using fallback resolver due to no returned IPs", host)
 		}
+		src = srcFallback
 		ips, err = r.LookupIPFallback(lookupCtx, host)
+		if err == nil && len(ips) > 0 {
+			metricDERPFallbackOK.Add(1)
+		}
 	}
 	if err != nil {
 		return netip.Addr{}, netip.Addr{}, nil, err
@@ -329,16 +412,24 @@ func (r *Resolver) lookupIP(ctx context.Context, host string) (ip, ip6 netip.Add
 			}
 		}
 	}
-	r.addIPCache(host, ip, ip6, ips, r.ttl())
+	r.addIPCache(host, src, ip, ip6, ips, r.ttl())
 	return ip, ip6, ips, nil
 }
 
-func (r *Resolver) addIPCache(host string, ip, ip6 netip.Addr, allIPs []netip.Addr, d time.Duration) {
+func (r *Resolver) addIPCache(host, src string, ip, ip6 netip.Addr, allIPs []netip.Addr, d time.Duration) {
 	if ip.IsPrivate() {
 		// Don't cache obviously wrong entries from captive portals.
 		// TODO: use DoH or DoT for the forwarding resolver?
 		r.dlogf("%q resolved to private IP %v; using but not caching", host, ip)
 		return
+	}
+
+	// Skip persisting disk-sourced results to avoid rewriting the
+	// disk cache files with their own contents.
+	if buildfeatures.HasDNSResolveCache && src != srcDisk {
+		if f, ok := HookPersistResolution.GetOk(); ok {
+			f(host, src, allIPs)
+		}
 	}
 
 	r.dlogf("%q resolved to IP %v; caching", host, ip)
@@ -401,30 +492,28 @@ func (d *dialer) DialContext(ctx context.Context, network, address string) (retC
 			return
 		}
 		if c, err := dc.raceDial(ctx, ips); err == nil {
+			metricDERPFallbackDialOK.Add(1)
 			retConn = c
 			ret = nil
 			return
 		}
 	}()
 
-	ip, ip6, allIPs, err := d.dnsCache.LookupIP(ctx, host)
+	ip, _, allIPs, err := d.dnsCache.LookupIP(ctx, host)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve %q: %w", host, err)
 	}
-	i4s := v4addrs(allIPs)
-	if len(i4s) < 2 {
+
+	// If we only have one candidate, just dial that, no matter what the
+	// address family is.
+	if len(allIPs) == 1 {
 		d.dnsCache.dlogf("dialing %s, %s for %s", network, ip, address)
-		c, err := dc.dialOne(ctx, ip.Unmap())
-		if err == nil || ctx.Err() != nil || !ip6.IsValid() {
-			return c, err
-		}
-		// Fall back to trying IPv6.
-		return dc.dialOne(ctx, ip6)
+		return dc.dialOne(ctx, ip.Unmap())
 	}
 
-	// Multiple IPv4 candidates, and 0+ IPv6.
-	ipsToTry := append(i4s, v6addrs(allIPs)...)
-	return dc.raceDial(ctx, ipsToTry)
+	// If we have multiple candidates, across address families, use happy
+	// eyeballs to find a connection.
+	return dc.raceDial(ctx, allIPs)
 }
 
 func (d *dialer) shouldTryBootstrap(ctx context.Context, err error, dc *dialCall) bool {
@@ -460,7 +549,7 @@ type dialCall struct {
 	d                            *dialer
 	network, address, host, port string
 
-	mu    sync.Mutex           // lock ordering: dialer.mu, then dialCall.mu
+	mu    syncs.Mutex          // lock ordering: dialer.mu, then dialCall.mu
 	fails map[netip.Addr]error // set of IPs that failed to dial thus far
 }
 
@@ -540,16 +629,6 @@ const fallbackDelay = 300 * time.Millisecond
 // raceDial tries to dial port on each ip in ips, starting a new race
 // dial every fallbackDelay apart, returning whichever completes first.
 func (dc *dialCall) raceDial(ctx context.Context, ips []netip.Addr) (net.Conn, error) {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	type res struct {
-		c   net.Conn
-		err error
-	}
-	resc := make(chan res)           // must be unbuffered
-	failBoost := make(chan struct{}) // best effort send on dial failure
-
 	// Remove IPs that we tried & failed to dial previously
 	// (such as when we're being called after a dnsfallback lookup and get
 	// the same results)
@@ -557,96 +636,20 @@ func (dc *dialCall) raceDial(ctx context.Context, ips []netip.Addr) (net.Conn, e
 	if len(ips) == 0 {
 		return nil, errors.New("no IPs")
 	}
-
-	// Partition candidate list and then merge such that an IPv6 address is
-	// in the first spot if present, and then addresses are interleaved.
-	// This ensures that we're trying an IPv6 address first, then
-	// alternating between v4 and v6 in case one of the two networks is
-	// broken.
-	var iv4, iv6 []netip.Addr
-	for _, ip := range ips {
-		if ip.Is6() {
-			iv6 = append(iv6, ip)
-		} else {
-			iv4 = append(iv4, ip)
-		}
+	port, err := strconv.ParseUint(dc.port, 10, 16)
+	if err != nil {
+		return nil, fmt.Errorf("invalid port %q: %w", dc.port, err)
 	}
-	ips = slicesx.Interleave(iv6, iv4)
-
-	go func() {
-		for i, ip := range ips {
-			if i != 0 {
-				timer := time.NewTimer(fallbackDelay)
-				select {
-				case <-timer.C:
-				case <-failBoost:
-					timer.Stop()
-				case <-ctx.Done():
-					timer.Stop()
-					return
-				}
-			}
-			go func(ip netip.Addr) {
-				c, err := dc.dialOne(ctx, ip)
-				if err != nil {
-					// Best effort wake-up a pending dial.
-					// e.g. IPv4 dials failing quickly on an IPv6-only system.
-					// In that case we don't want to wait 300ms per IPv4 before
-					// we get to the IPv6 addresses.
-					select {
-					case failBoost <- struct{}{}:
-					default:
-					}
-				}
-				select {
-				case resc <- res{c, err}:
-				case <-ctx.Done():
-					if c != nil {
-						c.Close()
-					}
-				}
-			}(ip)
-		}
-	}()
-
-	var firstErr error
-	var fails int
-	for {
-		select {
-		case r := <-resc:
-			if r.c != nil {
-				return r.c, nil
-			}
-			fails++
-			if firstErr == nil {
-				firstErr = r.err
-			}
-			if fails == len(ips) {
-				return nil, firstErr
-			}
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
+	addrs := make([]netip.AddrPort, len(ips))
+	for i, ip := range ips {
+		addrs[i] = netip.AddrPortFrom(ip, uint16(port))
 	}
-}
-
-func v4addrs(aa []netip.Addr) (ret []netip.Addr) {
-	for _, a := range aa {
-		a = a.Unmap()
-		if a.Is4() {
-			ret = append(ret, a)
-		}
-	}
-	return ret
-}
-
-func v6addrs(aa []netip.Addr) (ret []netip.Addr) {
-	for _, a := range aa {
-		if a.Is6() && !a.Is4In6() {
-			ret = append(ret, a)
-		}
-	}
-	return ret
+	return netx.RaceDial(ctx, addrs, func(ctx context.Context, network, address string) (net.Conn, error) {
+		c, err := dc.d.fwd(ctx, network, address)
+		ipp, _ := netip.ParseAddrPort(address)
+		dc.noteDialResult(ipp.Addr(), err)
+		return c, err
+	}, fallbackDelay)
 }
 
 // TLSDialer is like Dialer but returns a func suitable for using with net/http.Transport.DialTLSContext.
@@ -680,8 +683,52 @@ func TLSDialer(fwd netx.DialFunc, dnsCache *Resolver, tlsConfigBase *tls.Config)
 			// DNS mechanism.
 			return nil, err
 		}
+		// Tell the dnsresolvecache feature (if linked in) that the
+		// remote IP presented a valid certificate for host. The chain
+		// is checked here, independently of whatever verification the
+		// tls.Config did during the handshake, because some callers
+		// (notably controlhttp, which runs Noise atop whatever
+		// transport it gets) deliberately tolerate invalid TLS
+		// certificates; an intercepted connection must not mark the
+		// DNS resolution as verified.
+		if buildfeatures.HasDNSResolveCache {
+			if f, ok := HookHostVerified.GetOk(); ok && certValidForHost(tlsConn.ConnectionState(), host, cfg.RootCAs) {
+				if ap, err := netip.ParseAddrPort(tcpConn.RemoteAddr().String()); err == nil {
+					f(host, ap.Addr().Unmap())
+				}
+			}
+		}
 		return tlsConn, nil
 	}
+}
+
+// certValidForHost reports whether cs's peer certificate chain is
+// valid for host, verifying against roots if non-nil (a caller's
+// explicitly configured trust anchors), else against the system
+// roots. In either case the baked-in Let's Encrypt roots are also
+// tried, as net/tlsdial's Config does.
+func certValidForHost(cs tls.ConnectionState, host string, roots *x509.CertPool) bool {
+	if len(cs.PeerCertificates) == 0 {
+		return false
+	}
+	opts := x509.VerifyOptions{
+		DNSName:       host,
+		Roots:         roots, // nil means system roots
+		Intermediates: x509.NewCertPool(),
+	}
+	for _, cert := range cs.PeerCertificates[1:] {
+		opts.Intermediates.AddCert(cert)
+	}
+	if _, err := cs.PeerCertificates[0].Verify(opts); err == nil {
+		return true
+	}
+	if buildfeatures.HasBakedRoots {
+		opts.Roots = bakedroots.Get()
+		if _, err := cs.PeerCertificates[0].Verify(opts); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 func cloneTLSConfig(cfg *tls.Config) *tls.Config {

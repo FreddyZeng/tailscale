@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package conffile contains code to load, manipulate, and access config file
@@ -13,6 +13,7 @@ import (
 	"os"
 	"runtime"
 
+	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/ipn"
 )
 
@@ -40,6 +41,15 @@ func (c *Config) WantRunning() bool {
 // from the VM's metadata service's user-data field.
 const VMUserDataPath = "vm:user-data"
 
+// ErrNoConfig is returned (wrapped) by Load when the config source is absent or
+// unreadable: a missing file, an EC2 instance with no user-data, an unreachable
+// metadata service, or a build without the relevant cloud support. It reports
+// "no config was provided", as distinct from "a config was provided but is
+// invalid" (which Load returns as an unwrapped parse/validate error). Callers
+// that want to boot unconfigured when no config is present (e.g. tailscaled's
+// "optional:" -config prefix) can check for it with errors.Is.
+var ErrNoConfig = errors.New("no config present")
+
 // hujsonStandardize is set to hujson.Standardize by conffile_hujson.go on
 // platforms that support config files.
 var hujsonStandardize func([]byte) ([]byte, error)
@@ -50,10 +60,6 @@ func Load(path string) (*Config, error) {
 	case "ios", "android":
 		// compile-time for deadcode elimination
 		return nil, fmt.Errorf("config file loading not supported on %q", runtime.GOOS)
-	}
-	if hujsonStandardize == nil {
-		// Build tags are wrong in conffile_hujson.go
-		return nil, errors.New("[unexpected] config file loading not wired up")
 	}
 	var c Config
 	c.Path = path
@@ -66,16 +72,26 @@ func Load(path string) (*Config, error) {
 		c.Raw, err = os.ReadFile(path)
 	}
 	if err != nil {
-		return nil, err
+		// Read-phase failure: the config source is absent or unreadable.
+		// Wrap ErrNoConfig so callers can distinguish this from a config
+		// that was read but failed to parse below.
+		return nil, fmt.Errorf("%w: %v", ErrNoConfig, err)
 	}
-	c.Std, err = hujsonStandardize(c.Raw)
-	if err != nil {
-		return nil, fmt.Errorf("error parsing config file %s HuJSON/JSON: %w", path, err)
+	if buildfeatures.HasHuJSONConf && hujsonStandardize != nil {
+		c.Std, err = hujsonStandardize(c.Raw)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing config file %s HuJSON/JSON: %w", path, err)
+		}
+	} else {
+		c.Std = c.Raw // config file must be valid JSON with ts_omit_hujsonconf
 	}
 	var ver struct {
 		Version string `json:"version"`
 	}
 	if err := json.Unmarshal(c.Std, &ver); err != nil {
+		if !buildfeatures.HasHuJSONConf {
+			return nil, fmt.Errorf("error parsing config file %s, which must be valid standard JSON: %w", path, err)
+		}
 		return nil, fmt.Errorf("error parsing config file %s: %w", path, err)
 	}
 	switch ver.Version {

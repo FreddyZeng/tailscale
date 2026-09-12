@@ -1,16 +1,29 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package portlist
 
 import (
 	"net"
+	"runtime"
 	"testing"
 
 	"tailscale.com/tstest"
 )
 
+func maybeSkip(t testing.TB) {
+	if runtime.GOOS == "linux" {
+		tstest.SkipOnKernelVersions(t,
+			"https://github.com/tailscale/tailscale/issues/16966",
+			"6.6.102", "6.6.103", "6.6.104",
+			"6.12.42", "6.12.43", "6.12.44", "6.12.45",
+			"6.14.0",
+		)
+	}
+}
+
 func TestGetList(t *testing.T) {
+	maybeSkip(t)
 	tstest.ResourceCheck(t)
 
 	var p Poller
@@ -25,6 +38,7 @@ func TestGetList(t *testing.T) {
 }
 
 func TestIgnoreLocallyBoundPorts(t *testing.T) {
+	maybeSkip(t)
 	tstest.ResourceCheck(t)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -47,6 +61,8 @@ func TestIgnoreLocallyBoundPorts(t *testing.T) {
 }
 
 func TestPoller(t *testing.T) {
+	maybeSkip(t)
+
 	var p Poller
 	p.IncludeLocalhost = true
 	get := func(t *testing.T) []Port {
@@ -198,6 +214,7 @@ func BenchmarkGetListIncremental(b *testing.B) {
 }
 
 func benchmarkGetList(b *testing.B, incremental bool) {
+	maybeSkip(b)
 	b.ReportAllocs()
 	var p Poller
 	p.init()

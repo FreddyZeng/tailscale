@@ -1,5 +1,7 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
+
+//go:build linux && !ts_omit_acme
 
 package cli
 
@@ -28,7 +30,7 @@ func Test_listCerts(t *testing.T) {
 		wantErr bool
 	}{
 		{
-			name: "normal response",
+			name: "normal-response",
 			caller: fakeAPICaller{
 				Data: json.RawMessage(`{
 "certificates" : [
@@ -115,12 +117,12 @@ func Test_listCerts(t *testing.T) {
 			},
 		},
 		{
-			name:    "call error",
+			name:    "call-error",
 			caller:  fakeAPICaller{nil, fmt.Errorf("caller failed")},
 			wantErr: true,
 		},
 		{
-			name:    "payload decode error",
+			name:    "payload-decode-error",
 			caller:  fakeAPICaller{json.RawMessage("This isn't JSON!"), nil},
 			wantErr: true,
 		},

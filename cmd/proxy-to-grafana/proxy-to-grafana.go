@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // proxy-to-grafana is a reverse proxy which identifies users based on their
@@ -55,6 +55,7 @@ import (
 
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/peercap"
 	"tailscale.com/tsnet"
 )
 
@@ -67,7 +68,7 @@ var (
 )
 
 // aclCap is the Tailscale ACL capability used to configure proxy-to-grafana.
-const aclCap tailcfg.PeerCapability = "tailscale.com/cap/proxy-to-grafana"
+const aclCap peercap.Cap = "tailscale.com/cap/proxy-to-grafana"
 
 // aclGrant is an access control rule that assigns Grafana permissions
 // while provisioning a user.

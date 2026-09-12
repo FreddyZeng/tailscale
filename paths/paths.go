@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package paths returns platform and user-specific default paths to
@@ -6,6 +6,7 @@
 package paths
 
 import (
+	"log"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -29,6 +30,14 @@ func DefaultTailscaledSocket() string {
 	}
 	if runtime.GOOS == "plan9" {
 		return "/srv/tailscaled.sock"
+	}
+	if runtime.GOOS == "android" {
+		// Android (e.g. a userspace tailscaled under Termux) has no /var,
+		// and the cwd-relative fallback below only works when the daemon
+		// and the CLI happen to be started from the same directory
+		// (see #21161). Use the shared per-app temp directory so both
+		// agree on an absolute path.
+		return filepath.Join(os.TempDir(), "tailscaled.sock")
 	}
 	switch distro.Get() {
 	case distro.Synology:
@@ -68,6 +77,37 @@ func DefaultTailscaledStateFile() string {
 		return filepath.Join(os.Getenv("ProgramData"), "Tailscale", "server-state.conf")
 	}
 	return ""
+}
+
+// DefaultTailscaledStateDir returns the default state directory
+// to use for tailscaled, for use when the user provided neither
+// a state directory or state file path to use.
+//
+// It returns the empty string if there's no reasonable default.
+func DefaultTailscaledStateDir() string {
+	if runtime.GOOS == "plan9" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			log.Fatalf("failed to get home directory: %v", err)
+		}
+		return filepath.Join(home, "tailscale-state")
+	}
+	return filepath.Dir(DefaultTailscaledStateFile())
+}
+
+// MakeAutomaticStateDir reports whether the platform
+// automatically creates the state directory for tailscaled
+// when it's absent.
+func MakeAutomaticStateDir() bool {
+	switch runtime.GOOS {
+	case "plan9":
+		return true
+	case "linux":
+		if distro.Get() == distro.JetKVM {
+			return true
+		}
+	}
+	return false
 }
 
 // MkStateDir ensures that dirPath, the daemon's configuration directory

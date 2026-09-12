@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package cli
@@ -14,7 +14,7 @@ import (
 )
 
 func TestFilterFormatAndSortExitNodes(t *testing.T) {
-	t.Run("without filter", func(t *testing.T) {
+	t.Run("without-filter", func(t *testing.T) {
 		ps := []*ipnstate.PeerStatus{
 			{
 				HostName: "everest-1",
@@ -74,10 +74,10 @@ func TestFilterFormatAndSortExitNodes(t *testing.T) {
 		want := filteredExitNodes{
 			Countries: []*filteredCountry{
 				{
-					Name: noLocationData,
+					Name: "",
 					Cities: []*filteredCity{
 						{
-							Name: noLocationData,
+							Name: "",
 							Peers: []*ipnstate.PeerStatus{
 								ps[5],
 							},
@@ -139,7 +139,7 @@ func TestFilterFormatAndSortExitNodes(t *testing.T) {
 		}
 	})
 
-	t.Run("with country filter", func(t *testing.T) {
+	t.Run("with-country-filter", func(t *testing.T) {
 		ps := []*ipnstate.PeerStatus{
 			{
 				HostName: "baker-1",
@@ -273,14 +273,20 @@ func TestSortByCountryName(t *testing.T) {
 			Name: "Zimbabwe",
 		},
 		{
-			Name: noLocationData,
+			Name: "",
 		},
 	}
 
 	sortByCountryName(fc)
 
-	if fc[0].Name != noLocationData {
-		t.Fatalf("sortByCountryName did not order countries by alphabetical order, got %v, want %v", fc[0].Name, noLocationData)
+	want := []string{"", "Albania", "Sweden", "Zimbabwe"}
+	var got []string
+	for _, c := range fc {
+		got = append(got, c.Name)
+	}
+
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("sortByCountryName did not order countries by alphabetical order (-want +got):\n%s", diff)
 	}
 }
 
@@ -296,13 +302,19 @@ func TestSortByCityName(t *testing.T) {
 			Name: "Squamish",
 		},
 		{
-			Name: noLocationData,
+			Name: "",
 		},
 	}
 
 	sortByCityName(fc)
 
-	if fc[0].Name != noLocationData {
-		t.Fatalf("sortByCityName did not order cities by alphabetical order, got %v, want %v", fc[0].Name, noLocationData)
+	want := []string{"", "Goteborg", "Kingston", "Squamish"}
+	var got []string
+	for _, c := range fc {
+		got = append(got, c.Name)
+	}
+
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("sortByCityName did not order countries by alphabetical order (-want +got):\n%s", diff)
 	}
 }

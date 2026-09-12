@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package proxymap contains a mapping table for ephemeral localhost ports used
@@ -9,9 +9,9 @@ import (
 	"fmt"
 	"net/netip"
 	"strings"
-	"sync"
 	"time"
 
+	"tailscale.com/syncs"
 	"tailscale.com/util/mak"
 )
 
@@ -22,7 +22,7 @@ import (
 // ask tailscaled (via the LocalAPI WhoIs method) the Tailscale identity that a
 // given localhost:port corresponds to.
 type Mapper struct {
-	mu sync.Mutex
+	mu syncs.Mutex
 
 	// m holds the mapping from localhost IP:ports to Tailscale IPs. It is
 	// keyed first by the protocol ("tcp" or "udp"), then by the IP:port.

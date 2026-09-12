@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package ipnlocal
@@ -10,14 +10,18 @@ import (
 	"reflect"
 	"testing"
 
+	"tailscale.com/appc"
 	"tailscale.com/ipn"
 	"tailscale.com/net/dns"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/tstest"
 	"tailscale.com/types/dnstype"
 	"tailscale.com/types/netmap"
+	"tailscale.com/types/opt"
 	"tailscale.com/util/cloudenv"
 	"tailscale.com/util/dnsname"
+	"tailscale.com/util/set"
 )
 
 func ipps(ippStrs ...string) (ipps []netip.Prefix) {
@@ -69,9 +73,10 @@ func TestDNSConfigForNetmap(t *testing.T) {
 		},
 		{
 			name: "self_name_and_peers",
+			os:   "windows", // the full Hosts map is built only for the Windows hosts-file path
 			nm: &netmap.NetworkMap{
-				Name: "myname.net",
 				SelfNode: (&tailcfg.Node{
+					Name:      "myname.net.",
 					Addresses: ipps("100.101.101.101"),
 				}).View(),
 			},
@@ -104,20 +109,54 @@ func TestDNSConfigForNetmap(t *testing.T) {
 			},
 		},
 		{
+			name: "subdomain_resolve_capability",
+			os:   "windows", // the full Hosts map is built only for the Windows hosts-file path
+			nm: &netmap.NetworkMap{
+				SelfNode: (&tailcfg.Node{
+					Name:      "myname.net.",
+					Addresses: ipps("100.101.101.101"),
+				}).View(),
+				AllCaps: set.SetOf([]nodecap.Cap{nodecap.DNSSubdomainResolve}),
+			},
+			peers: nodeViews([]*tailcfg.Node{
+				{
+					ID:        1,
+					Name:      "peer-with-cap.net.",
+					Addresses: ipps("100.102.0.1"),
+					CapMap:    tailcfg.NodeCapMap{nodecap.DNSSubdomainResolve: nil},
+				},
+				{
+					ID:        2,
+					Name:      "peer-without-cap.net.",
+					Addresses: ipps("100.102.0.2"),
+				},
+			}),
+			prefs: &ipn.Prefs{},
+			want: &dns.Config{
+				Routes: map[dnsname.FQDN][]*dnstype.Resolver{},
+				Hosts: map[dnsname.FQDN][]netip.Addr{
+					"myname.net.":           ips("100.101.101.101"),
+					"peer-with-cap.net.":    ips("100.102.0.1"),
+					"peer-without-cap.net.": ips("100.102.0.2"),
+				},
+			},
+		},
+		{
 			// An ephemeral node with only an IPv6 address
 			// should get IPv6 records for all its peers,
 			// even if they have IPv4.
 			name: "v6_only_self",
+			os:   "windows", // the full Hosts map is built only for the Windows hosts-file path
 			nm: &netmap.NetworkMap{
-				Name: "myname.net",
 				SelfNode: (&tailcfg.Node{
+					Name:      "myname.net.",
 					Addresses: ipps("fe75::1"),
 				}).View(),
 			},
 			peers: nodeViews([]*tailcfg.Node{
 				{
 					ID:        1,
-					Name:      "peera.net",
+					Name:      "peera.net.",
 					Addresses: ipps("100.102.0.1", "100.102.0.2", "fe75::1001"),
 				},
 				{
@@ -146,8 +185,8 @@ func TestDNSConfigForNetmap(t *testing.T) {
 		{
 			name: "extra_records",
 			nm: &netmap.NetworkMap{
-				Name: "myname.net",
 				SelfNode: (&tailcfg.Node{
+					Name:      "myname.net.",
 					Addresses: ipps("100.101.101.101"),
 				}).View(),
 				DNS: tailcfg.DNSConfig{
@@ -162,16 +201,17 @@ func TestDNSConfigForNetmap(t *testing.T) {
 			want: &dns.Config{
 				Routes: map[dnsname.FQDN][]*dnstype.Resolver{},
 				Hosts: map[dnsname.FQDN][]netip.Addr{
-					"myname.net.": ips("100.101.101.101"),
-					"foo.com.":    ips("1.2.3.4"),
-					"bar.com.":    ips("1::6"),
+					"foo.com.": ips("1.2.3.4"),
+					"bar.com.": ips("1::6"),
 				},
 			},
 		},
 		{
 			name: "corp_dns_misc",
 			nm: &netmap.NetworkMap{
-				Name: "host.some.domain.net.",
+				SelfNode: (&tailcfg.Node{
+					Name: "host.some.domain.net.",
+				}).View(),
 				DNS: tailcfg.DNSConfig{
 					Proxied: true,
 					Domains: []string{"foo.com", "bar.com"},
@@ -181,7 +221,8 @@ func TestDNSConfigForNetmap(t *testing.T) {
 				CorpDNS: true,
 			},
 			want: &dns.Config{
-				Hosts: map[dnsname.FQDN][]netip.Addr{},
+				AcceptDNS: true,
+				Hosts:     map[dnsname.FQDN][]netip.Addr{},
 				Routes: map[dnsname.FQDN][]*dnstype.Resolver{
 					"0.e.1.a.c.5.1.1.a.7.d.f.ip6.arpa.": nil,
 					"100.100.in-addr.arpa.":             nil,
@@ -281,7 +322,8 @@ func TestDNSConfigForNetmap(t *testing.T) {
 				CorpDNS: true,
 			},
 			want: &dns.Config{
-				Hosts: map[dnsname.FQDN][]netip.Addr{},
+				AcceptDNS: true,
+				Hosts:     map[dnsname.FQDN][]netip.Addr{},
 				DefaultResolvers: []*dnstype.Resolver{
 					{Addr: "8.8.8.8"},
 				},
@@ -304,8 +346,9 @@ func TestDNSConfigForNetmap(t *testing.T) {
 				ExitNodeID: "some-id",
 			},
 			want: &dns.Config{
-				Hosts:  map[dnsname.FQDN][]netip.Addr{},
-				Routes: map[dnsname.FQDN][]*dnstype.Resolver{},
+				AcceptDNS: true,
+				Hosts:     map[dnsname.FQDN][]netip.Addr{},
+				Routes:    map[dnsname.FQDN][]*dnstype.Resolver{},
 				DefaultResolvers: []*dnstype.Resolver{
 					{Addr: "8.8.4.4"},
 				},
@@ -324,15 +367,16 @@ func TestDNSConfigForNetmap(t *testing.T) {
 				CorpDNS: true,
 			},
 			want: &dns.Config{
-				Hosts:  map[dnsname.FQDN][]netip.Addr{},
-				Routes: map[dnsname.FQDN][]*dnstype.Resolver{},
+				AcceptDNS: true,
+				Hosts:     map[dnsname.FQDN][]netip.Addr{},
+				Routes:    map[dnsname.FQDN][]*dnstype.Resolver{},
 			},
 		},
 		{
 			name: "self_expired",
 			nm: &netmap.NetworkMap{
-				Name: "myname.net",
 				SelfNode: (&tailcfg.Node{
+					Name:      "myname.net.",
 					Addresses: ipps("100.101.101.101"),
 				}).View(),
 			},
@@ -347,12 +391,107 @@ func TestDNSConfigForNetmap(t *testing.T) {
 			prefs: &ipn.Prefs{},
 			want:  &dns.Config{},
 		},
+		{
+			name: "conn25-split-dns",
+			nm: &netmap.NetworkMap{
+				SelfNode: (&tailcfg.Node{
+					Name:      "a",
+					Addresses: ipps("100.101.101.101"),
+					CapMap: tailcfg.NodeCapMap{
+						nodecap.Cap(appc.AppConnectorsExperimentalAttrName): []tailcfg.RawMessage{
+							tailcfg.RawMessage(`{"name":"app1","connectors":["tag:woo"],"domains":["example.com"]}`),
+						},
+					},
+				}).View(),
+				AllCaps: set.Of(nodecap.Cap(appc.AppConnectorsExperimentalAttrName)),
+			},
+			peers: nodeViews([]*tailcfg.Node{
+				{
+					ID:        1,
+					Name:      "p1",
+					Addresses: ipps("100.102.0.1"),
+					Tags:      []string{"tag:woo"},
+					Hostinfo: (&tailcfg.Hostinfo{
+						Services: []tailcfg.Service{
+							{
+								Proto: tailcfg.PeerAPI4,
+								Port:  1234,
+							},
+						},
+						AppConnector: opt.NewBool(true),
+					}).View(),
+				},
+			}),
+			prefs: &ipn.Prefs{
+				CorpDNS: true,
+			},
+			want: &dns.Config{
+				AcceptDNS: true,
+				Hosts:     map[dnsname.FQDN][]netip.Addr{},
+				Routes: map[dnsname.FQDN][]*dnstype.Resolver{
+					dnsname.FQDN("example.com."): {
+						{Addr: "tailscale-app:app1", UseWithExitNode: true},
+					},
+				},
+				MagicDNSHostsUnrouted: true,
+			},
+		},
+		{
+			name: "conn25-split-dns-with-exit-node",
+			nm: &netmap.NetworkMap{
+				SelfNode: (&tailcfg.Node{
+					Name:      "a",
+					Addresses: ipps("100.101.101.101"),
+					CapMap: tailcfg.NodeCapMap{
+						tailcfg.NodeCapability(appc.AppConnectorsExperimentalAttrName): []tailcfg.RawMessage{
+							tailcfg.RawMessage(`{"name":"app1","connectors":["tag:woo"],"domains":["example.com"]}`),
+						},
+					},
+				}).View(),
+				AllCaps: set.Of(tailcfg.NodeCapability(appc.AppConnectorsExperimentalAttrName)),
+			},
+			peers: nodeViews([]*tailcfg.Node{
+				{
+					ID:        1,
+					StableID:  "exit",
+					Name:      "p1",
+					Cap:       26, // can proxy DNS over DoH
+					Addresses: ipps("100.102.0.1"),
+					Tags:      []string{"tag:woo"},
+					Hostinfo: (&tailcfg.Hostinfo{
+						Services: []tailcfg.Service{
+							{
+								Proto: tailcfg.PeerAPI4,
+								Port:  1234,
+							},
+						},
+					}).View(),
+				},
+			}),
+			prefs: &ipn.Prefs{
+				CorpDNS:    true,
+				ExitNodeID: "exit",
+			},
+			want: &dns.Config{
+				AcceptDNS: true,
+				Hosts:     map[dnsname.FQDN][]netip.Addr{},
+				Routes: map[dnsname.FQDN][]*dnstype.Resolver{
+					dnsname.FQDN("example.com."): {
+						{Addr: "tailscale-app:app1", UseWithExitNode: true},
+					},
+				},
+				DefaultResolvers: []*dnstype.Resolver{
+					{Addr: "http://100.102.0.1:1234/dns-query"},
+				},
+				MagicDNSHostsUnrouted: true,
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			verOS := cmp.Or(tt.os, "linux")
+			goos := cmp.Or(tt.os, "linux")
 			var log tstest.MemLogger
-			got := dnsConfigForNetmap(tt.nm, peersMap(tt.peers), tt.prefs.View(), tt.expired, log.Logf, verOS)
+			got := dnsConfigForNetmap(tt.nm, peersMap(tt.peers), tt.prefs.View(), tt.expired, log.Logf, goos)
 			if !reflect.DeepEqual(got, tt.want) {
 				gotj, _ := json.MarshalIndent(got, "", "\t")
 				wantj, _ := json.MarshalIndent(tt.want, "", "\t")
@@ -377,7 +516,7 @@ func peersMap(s []tailcfg.NodeView) map[tailcfg.NodeID]tailcfg.NodeView {
 }
 
 func TestAllowExitNodeDNSProxyToServeName(t *testing.T) {
-	b := &LocalBackend{}
+	b := newTestLocalBackend(t)
 	if b.allowExitNodeDNSProxyToServeName("google.com") {
 		t.Fatal("unexpected true on backend with nil NetMap")
 	}

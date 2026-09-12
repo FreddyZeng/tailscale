@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package netmap
@@ -6,11 +6,13 @@ package netmap
 import (
 	"encoding/hex"
 	"net/netip"
+	"reflect"
 	"testing"
 
 	"go4.org/mem"
 	"tailscale.com/net/netaddr"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tstest/typewalk"
 	"tailscale.com/types/key"
 )
 
@@ -314,5 +316,12 @@ func TestPeerIndexByNodeID(t *testing.T) {
 		if got := nm.PeerIndexByNodeID(miss); got != -1 {
 			t.Errorf("PeerIndexByNodeID(%v) = %v; want -1", miss, got)
 		}
+	}
+}
+
+func TestNoPrivateKeyMaterial(t *testing.T) {
+	private := key.PrivateTypesForTest()
+	for path := range typewalk.MatchingPaths(reflect.TypeFor[NetworkMap](), private.Contains) {
+		t.Errorf("NetworkMap contains private key material at path: %q", path.Name)
 	}
 }

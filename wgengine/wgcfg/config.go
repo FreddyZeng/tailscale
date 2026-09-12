@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package wgcfg has types and a parser for representing WireGuard config.
@@ -6,56 +6,39 @@ package wgcfg
 
 import (
 	"net/netip"
+	"slices"
 
-	"tailscale.com/tailcfg"
+	"github.com/tailscale/wireguard-go/device"
 	"tailscale.com/types/key"
-	"tailscale.com/types/logid"
 )
 
-//go:generate go run tailscale.com/cmd/cloner -type=Config,Peer
+//go:generate go run tailscale.com/cmd/cloner -type=Config
 
 // Config is a WireGuard configuration.
 // It only supports the set of things Tailscale uses.
+//
+// Peers are not part of the config: wireguard-go learns the peer set
+// and each peer's configuration from the live per-peer config source
+// installed via [tailscale.com/wgengine.Engine.SetPeerConfigFunc].
 type Config struct {
-	Name       string
-	NodeID     tailcfg.StableNodeID
 	PrivateKey key.NodePrivate
 	Addresses  []netip.Prefix
-	MTU        uint16
-	DNS        []netip.Addr
-	Peers      []Peer
-
-	// NetworkLogging enables network logging.
-	// It is disabled if either ID is the zero value.
-	// LogExitFlowEnabled indicates whether or not exit flows should be logged.
-	NetworkLogging struct {
-		NodeID             logid.PrivateID
-		DomainID           logid.PrivateID
-		LogExitFlowEnabled bool
-	}
 }
 
-type Peer struct {
-	PublicKey           key.NodePublic
-	DiscoKey            key.DiscoPublic // present only so we can handle restarts within wgengine, not passed to WireGuard
-	AllowedIPs          []netip.Prefix
-	V4MasqAddr          *netip.Addr // if non-nil, masquerade IPv4 traffic to this peer using this address
-	V6MasqAddr          *netip.Addr // if non-nil, masquerade IPv6 traffic to this peer using this address
-	IsJailed            bool        // if true, this peer is jailed and cannot initiate connections
-	PersistentKeepalive uint16      // in seconds between keep-alives; 0 to disable
-	// wireguard-go's endpoint for this peer. It should always equal Peer.PublicKey.
-	// We represent it explicitly so that we can detect if they diverge and recover.
-	// There is no need to set WGEndpoint explicitly when constructing a Peer by hand.
-	// It is only populated when reading Peers from wireguard-go.
-	WGEndpoint key.NodePublic
+// PeerConfig is the WireGuard configuration for one peer.
+type PeerConfig struct {
+	// AllowedIPs is the set of prefixes the peer may originate traffic from.
+	AllowedIPs []netip.Prefix
+
+	// PresharedKey is the optional WireGuard pre-shared key. The zero value
+	// disables the pre-shared-key layer.
+	PresharedKey device.NoisePresharedKey
 }
 
-// PeerWithKey returns the Peer with key k and reports whether it was found.
-func (config Config) PeerWithKey(k key.NodePublic) (Peer, bool) {
-	for _, p := range config.Peers {
-		if p.PublicKey == k {
-			return p, true
-		}
+func (c *Config) Equal(o *Config) bool {
+	if c == nil || o == nil {
+		return c == o
 	}
-	return Peer{}, false
+	return c.PrivateKey.Equal(o.PrivateKey) &&
+		slices.Equal(c.Addresses, o.Addresses)
 }

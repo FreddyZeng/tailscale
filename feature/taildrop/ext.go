@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package taildrop
@@ -9,8 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"maps"
-	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -24,6 +22,8 @@ import (
 	"tailscale.com/ipn/ipnext"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
+	"tailscale.com/tailcfg/peercap"
 	"tailscale.com/tstime"
 	"tailscale.com/types/empty"
 	"tailscale.com/types/logger"
@@ -75,7 +75,7 @@ type Extension struct {
 
 	// FileOps abstracts platform-specific file operations needed for file transfers.
 	// This is currently being used for Android to use the Storage Access Framework.
-	FileOps FileOps
+	fileOps FileOps
 
 	nodeBackendForTest ipnext.NodeBackend // if non-nil, pretend we're this node state for tests
 
@@ -87,30 +87,6 @@ type Extension struct {
 	mgr            atomic.Pointer[manager]           // mutex held to write; safe to read without lock;
 	// outgoingFiles keeps track of Taildrop outgoing files keyed to their OutgoingFile.ID
 	outgoingFiles map[string]*ipn.OutgoingFile
-}
-
-// safDirectoryPrefix is used to determine if the directory is managed via SAF.
-const SafDirectoryPrefix = "content://"
-
-// PutMode controls how Manager.PutFile writes files to storage.
-//
-//	PutModeDirect    – write files directly to a filesystem path (default).
-//	PutModeAndroidSAF – use Android’s Storage Access Framework (SAF), where
-//	                      the OS manages the underlying directory permissions.
-type PutMode int
-
-const (
-	PutModeDirect PutMode = iota
-	PutModeAndroidSAF
-)
-
-// FileOps defines platform-specific file operations.
-type FileOps interface {
-	OpenFileWriter(filename string) (io.WriteCloser, string, error)
-
-	// RenamePartialFile finalizes a partial file.
-	// It returns the new SAF URI as a string and an error.
-	RenamePartialFile(partialUri, targetDirUri, targetName string) (string, error)
 }
 
 func (e *Extension) Name() string {
@@ -130,6 +106,7 @@ func (e *Extension) Init(h ipnext.Host) error {
 
 	// TODO(nickkhyl): remove this after the profileManager refactoring.
 	// See tailscale/tailscale#15974.
+	// This same workaround appears in feature/portlist/portlist.go.
 	profile, prefs := h.Profiles().CurrentProfileState()
 	e.onChangeProfile(profile, prefs, false)
 	return nil
@@ -149,7 +126,7 @@ func (e *Extension) onSelfChange(self tailcfg.NodeView) {
 	if self.Valid() {
 		e.selfUID = self.User()
 	}
-	e.capFileSharing = self.Valid() && self.CapMap().Contains(tailcfg.CapabilityFileSharing)
+	e.capFileSharing = self.Valid() && self.CapMap().Contains(nodecap.FileSharing)
 	osshare.SetFileSharingEnabled(e.capFileSharing, e.logf)
 }
 
@@ -163,8 +140,8 @@ func (e *Extension) onChangeProfile(profile ipn.LoginProfileView, _ ipn.PrefsVie
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	uid := profile.UserProfile().ID
-	activeLogin := profile.UserProfile().LoginName
+	uid := profile.UserProfile().ID()
+	activeLogin := profile.UserProfile().LoginName()
 
 	if uid == 0 {
 		e.setMgrLocked(nil)
@@ -176,23 +153,34 @@ func (e *Extension) onChangeProfile(profile ipn.LoginProfileView, _ ipn.PrefsVie
 		return
 	}
 
-	// If we have a netmap, create a taildrop manager.
-	fileRoot, isDirectFileMode := e.fileRoot(uid, activeLogin)
-	if fileRoot == "" {
-		e.logf("no Taildrop directory configured")
+	// Use the provided [FileOps] implementation (typically for SAF access on Android),
+	// or create an [fsFileOps] instance rooted at fileRoot.
+	//
+	// A non-nil [FileOps] also implies that we are in DirectFileMode.
+	fops := e.fileOps
+	isDirectFileMode := fops != nil
+	if fops == nil {
+		var fileRoot string
+		if fileRoot, isDirectFileMode = e.fileRoot(uid, activeLogin); fileRoot == "" {
+			e.logf("no Taildrop directory configured")
+			e.setMgrLocked(nil)
+			return
+		}
+
+		var err error
+		if fops, err = newFileOps(fileRoot); err != nil {
+			e.logf("taildrop: cannot create FileOps: %v", err)
+			e.setMgrLocked(nil)
+			return
+		}
 	}
-	mode := PutModeDirect
-	if e.directFileRoot != "" && strings.HasPrefix(e.directFileRoot, SafDirectoryPrefix) {
-		mode = PutModeAndroidSAF
-	}
+
 	e.setMgrLocked(managerOptions{
 		Logf:           e.logf,
 		Clock:          tstime.DefaultClock{Clock: e.sb.Clock()},
 		State:          e.stateStore,
-		Dir:            fileRoot,
 		DirectFileMode: isDirectFileMode,
-		FileOps:        e.FileOps,
-		Mode:           mode,
+		fileOps:        fops,
 		SendFileNotify: e.sendFileNotify,
 	}.New())
 }
@@ -221,12 +209,7 @@ func (e *Extension) fileRoot(uid tailcfg.UserID, activeLogin string) (root strin
 	baseDir := fmt.Sprintf("%s-uid-%d",
 		strings.ReplaceAll(activeLogin, "@", "-"),
 		uid)
-	dir := filepath.Join(varRoot, "files", baseDir)
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		e.logf("Taildrop disabled; error making directory: %v", err)
-		return "", false
-	}
-	return dir, false
+	return filepath.Join(varRoot, "files", baseDir), false
 }
 
 // hasCapFileSharing reports whether the current node has the file sharing
@@ -372,7 +355,7 @@ func (e *Extension) FileTargets() ([]*apitype.FileTarget, error) {
 		if self == p.User() {
 			return true
 		}
-		if nb.PeerHasCap(p, tailcfg.PeerCapabilityFileSharingTarget) {
+		if nb.PeerHasCap(p, peercap.FileSharingTarget) {
 			// Explicitly noted in the netmap ACL caps as a target.
 			return true
 		}
@@ -419,7 +402,7 @@ func (e *Extension) taildropTargetStatus(p tailcfg.NodeView, nb ipnext.NodeBacke
 	}
 	if selfUID != p.User() {
 		// Different user must have the explicit file sharing target capability
-		if !nb.PeerHasCap(p, tailcfg.PeerCapabilityFileSharingTarget) {
+		if !nb.PeerHasCap(p, peercap.FileSharingTarget) {
 			return ipnstate.TaildropTargetOwnedByOtherUser
 		}
 	}
@@ -429,14 +412,16 @@ func (e *Extension) taildropTargetStatus(p tailcfg.NodeView, nb ipnext.NodeBacke
 	return ipnstate.TaildropTargetAvailable
 }
 
-// updateOutgoingFiles updates b.outgoingFiles to reflect the given updates and
-// sends an ipn.Notify with the full list of outgoingFiles.
-func (e *Extension) updateOutgoingFiles(updates map[string]*ipn.OutgoingFile) {
+// updateOutgoingFiles merges updates into e.outgoingFiles and emits an
+// ipn.Notify.
+func (e *Extension) updateOutgoingFiles(updates map[string]ipn.OutgoingFile) {
 	e.mu.Lock()
 	if e.outgoingFiles == nil {
 		e.outgoingFiles = make(map[string]*ipn.OutgoingFile, len(updates))
 	}
-	maps.Copy(e.outgoingFiles, updates)
+	for id, f := range updates {
+		e.outgoingFiles[id] = &f
+	}
 	outgoingFiles := make([]*ipn.OutgoingFile, 0, len(e.outgoingFiles))
 	for _, file := range e.outgoingFiles {
 		outgoingFiles = append(outgoingFiles, file)

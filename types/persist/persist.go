@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package persist contains the Persist type.
@@ -24,11 +24,16 @@ type Persist struct {
 	PrivateNodeKey    key.NodePrivate
 	OldPrivateNodeKey key.NodePrivate // needed to request key rotation
 	UserProfile       tailcfg.UserProfile
-	NetworkLockKey    key.NLPrivate
-	NodeID            tailcfg.StableNodeID
+
+	// NetworkLockKey is the node's Tailnet Lock private key.
+	// "Network Lock" was the pre-release name for Tailnet Lock.
+	NetworkLockKey key.NLPrivate
+
+	NodeID         tailcfg.StableNodeID
+	AttestationKey key.HardwareAttestationKey `json:",omitzero"`
 
 	// DisallowedTKAStateIDs stores the tka.State.StateID values which
-	// this node will not operate network lock on. This is used to
+	// this node will not operate tailnet lock on. This is used to
 	// prevent bootstrapping TKA onto a key authority which was forcibly
 	// disabled.
 	DisallowedTKAStateIDs []string `json:",omitempty"`
@@ -84,11 +89,20 @@ func (p *Persist) Equals(p2 *Persist) bool {
 		return false
 	}
 
+	var pub, p2Pub key.HardwareAttestationPublic
+	if p.AttestationKey != nil && !p.AttestationKey.IsZero() {
+		pub = key.HardwareAttestationPublicFromPlatformKey(p.AttestationKey)
+	}
+	if p2.AttestationKey != nil && !p2.AttestationKey.IsZero() {
+		p2Pub = key.HardwareAttestationPublicFromPlatformKey(p2.AttestationKey)
+	}
+
 	return p.PrivateNodeKey.Equal(p2.PrivateNodeKey) &&
 		p.OldPrivateNodeKey.Equal(p2.OldPrivateNodeKey) &&
 		p.UserProfile.Equal(&p2.UserProfile) &&
 		p.NetworkLockKey.Equal(p2.NetworkLockKey) &&
 		p.NodeID == p2.NodeID &&
+		pub.Equal(p2Pub) &&
 		reflect.DeepEqual(nilIfEmpty(p.DisallowedTKAStateIDs), nilIfEmpty(p2.DisallowedTKAStateIDs))
 }
 
@@ -96,12 +110,16 @@ func (p *Persist) Pretty() string {
 	var (
 		ok, nk key.NodePublic
 	)
+	akString := "-"
 	if !p.OldPrivateNodeKey.IsZero() {
 		ok = p.OldPrivateNodeKey.Public()
 	}
 	if !p.PrivateNodeKey.IsZero() {
 		nk = p.PublicNodeKey()
 	}
-	return fmt.Sprintf("Persist{o=%v, n=%v u=%#v}",
-		ok.ShortString(), nk.ShortString(), p.UserProfile.LoginName)
+	if p.AttestationKey != nil && !p.AttestationKey.IsZero() {
+		akString = fmt.Sprintf("%v", p.AttestationKey.Public())
+	}
+	return fmt.Sprintf("Persist{o=%v, n=%v u=%#v ak=%s}",
+		ok.ShortString(), nk.ShortString(), p.UserProfile.LoginName, akString)
 }

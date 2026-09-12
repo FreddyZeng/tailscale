@@ -1,9 +1,22 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package tstest
 
-import "testing"
+import (
+	"runtime"
+	"testing"
+
+	"tailscale.com/tstest/deptest"
+)
+
+func TestDeps(t *testing.T) {
+	deptest.DepChecker{
+		BadDeps: map[string]string{
+			"testing": "do not link the testing package and its flag side effects into non-test binaries; use testenv.TB",
+		},
+	}.Check(t)
+}
 
 func TestReplace(t *testing.T) {
 	before := "before"
@@ -21,4 +34,18 @@ func TestReplace(t *testing.T) {
 	if before != "before" {
 		t.Errorf("before = %q; want %q", before, "before")
 	}
+}
+
+func TestKernelVersion(t *testing.T) {
+	switch runtime.GOOS {
+	case "linux":
+	default:
+		t.Skipf("skipping test on %s", runtime.GOOS)
+	}
+
+	major, minor, patch := KernelVersion()
+	if major == 0 && minor == 0 && patch == 0 {
+		t.Fatal("KernelVersion returned (0, 0, 0); expected valid version")
+	}
+	t.Logf("Kernel version: %d.%d.%d", major, minor, patch)
 }

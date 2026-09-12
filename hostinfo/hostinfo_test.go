@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package hostinfo
@@ -76,5 +76,4 @@ func TestCustomHostnameFunc(t *testing.T) {
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
-
 }

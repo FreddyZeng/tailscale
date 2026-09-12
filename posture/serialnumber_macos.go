@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build cgo && darwin && !ios
@@ -59,10 +59,11 @@ import (
 	"strings"
 
 	"tailscale.com/types/logger"
+	"tailscale.com/util/syspolicy/policyclient"
 )
 
 // GetSerialNumber returns the platform serial sumber as reported by IOKit.
-func GetSerialNumbers(_ logger.Logf) ([]string, error) {
+func GetSerialNumbers(policyclient.Client, logger.Logf) ([]string, error) {
 	csn := C.getSerialNumber()
 	serialNumber := C.GoString(csn)
 

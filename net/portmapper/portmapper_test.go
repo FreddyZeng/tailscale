@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package portmapper
@@ -11,15 +11,15 @@ import (
 	"testing"
 	"time"
 
-	"tailscale.com/control/controlknobs"
-	"tailscale.com/util/eventbus"
+	"tailscale.com/net/portmapper/portmappertype"
+	"tailscale.com/util/eventbus/eventbustest"
 )
 
 func TestCreateOrGetMapping(t *testing.T) {
 	if v, _ := strconv.ParseBool(os.Getenv("HIT_NETWORK")); !v {
 		t.Skip("skipping test without HIT_NETWORK=1")
 	}
-	c := NewClient(Config{Logf: t.Logf, ControlKnobs: new(controlknobs.Knobs)})
+	c := NewClient(Config{Logf: t.Logf})
 	defer c.Close()
 	c.SetLocalPort(1234)
 	for i := range 2 {
@@ -35,7 +35,7 @@ func TestClientProbe(t *testing.T) {
 	if v, _ := strconv.ParseBool(os.Getenv("HIT_NETWORK")); !v {
 		t.Skip("skipping test without HIT_NETWORK=1")
 	}
-	c := NewClient(Config{Logf: t.Logf, ControlKnobs: new(controlknobs.Knobs)})
+	c := NewClient(Config{Logf: t.Logf})
 	defer c.Close()
 	for i := range 3 {
 		if i > 0 {
@@ -50,7 +50,7 @@ func TestClientProbeThenMap(t *testing.T) {
 	if v, _ := strconv.ParseBool(os.Getenv("HIT_NETWORK")); !v {
 		t.Skip("skipping test without HIT_NETWORK=1")
 	}
-	c := NewClient(Config{Logf: t.Logf, ControlKnobs: new(controlknobs.Knobs)})
+	c := NewClient(Config{Logf: t.Logf})
 	defer c.Close()
 	c.debug.VerboseLogs = true
 	c.SetLocalPort(1234)
@@ -142,22 +142,15 @@ func TestUpdateEvent(t *testing.T) {
 		t.Fatalf("Create test gateway: %v", err)
 	}
 
-	bus := eventbus.New()
-	defer bus.Close()
+	bus := eventbustest.NewBus(t)
+	tw := eventbustest.NewWatcher(t, bus)
 
-	sub := eventbus.Subscribe[Mapping](bus.Client("TestUpdateEvent"))
 	c := newTestClient(t, igd, bus)
 	if _, err := c.Probe(t.Context()); err != nil {
 		t.Fatalf("Probe failed: %v", err)
 	}
 	c.GetCachedMappingOrStartCreatingOne()
-
-	select {
-	case evt := <-sub.Events():
-		t.Logf("Received portmap update: %+v", evt)
-	case <-sub.Done():
-		t.Error("Subscriber closed prematurely")
-	case <-time.After(5 * time.Second):
-		t.Error("Timed out waiting for an update event")
+	if err := eventbustest.Expect(tw, eventbustest.Type[portmappertype.Mapping]()); err != nil {
+		t.Error(err.Error())
 	}
 }

@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package cli
@@ -6,6 +6,7 @@ package cli
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -16,6 +17,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/http/httputil"
 	"net/netip"
 	"net/url"
@@ -27,17 +29,20 @@ import (
 	"time"
 
 	"github.com/peterbourgon/ff/v3/ffcli"
-	"golang.org/x/net/http/httpproxy"
-	"golang.org/x/net/http2"
-	"tailscale.com/client/tailscale"
 	"tailscale.com/client/tailscale/apitype"
-	"tailscale.com/control/controlhttp"
+	"tailscale.com/control/ts2021"
+	"tailscale.com/envknob"
+	"tailscale.com/feature"
+	_ "tailscale.com/feature/condregister/useproxy"
+	"tailscale.com/health"
 	"tailscale.com/hostinfo"
-	"tailscale.com/internal/noiseconn"
 	"tailscale.com/ipn"
+	"tailscale.com/net/ace"
+	"tailscale.com/net/dnscache"
 	"tailscale.com/net/netmon"
+	"tailscale.com/net/netutil"
 	"tailscale.com/net/tsaddr"
-	"tailscale.com/net/tshttpproxy"
+	"tailscale.com/net/tsdial"
 	"tailscale.com/paths"
 	"tailscale.com/safesocket"
 	"tailscale.com/tailcfg"
@@ -48,7 +53,10 @@ import (
 )
 
 var (
-	debugCaptureCmd func() *ffcli.Command // or nil
+	debugCaptureCmd          func() *ffcli.Command // or nil
+	debugPortmapCmd          func() *ffcli.Command // or nil
+	debugPeerRelayCmd        func() *ffcli.Command // or nil
+	debugClearNetmapCacheCmd func() *ffcli.Command // or nil
 )
 
 func debugCmd() *ffcli.Command {
@@ -101,6 +109,29 @@ func debugCmd() *ffcli.Command {
 					fs.BoolVar(&daemonLogsArgs.time, "time", false, "include client time")
 					return fs
 				})(),
+			},
+			{
+				Name:       "daemon-bus-events",
+				ShortUsage: "tailscale debug daemon-bus-events",
+				Exec:       runDaemonBusEvents,
+				ShortHelp:  "Watch events on the tailscaled bus",
+			},
+			{
+				Name:       "daemon-bus-graph",
+				ShortUsage: "tailscale debug daemon-bus-graph",
+				Exec:       runDaemonBusGraph,
+				ShortHelp:  "Print graph for the tailscaled bus",
+				FlagSet: (func() *flag.FlagSet {
+					fs := newFlagSet("debug-bus-graph")
+					fs.StringVar(&daemonBusGraphArgs.format, "format", "json", "output format [json/dot]")
+					return fs
+				})(),
+			},
+			{
+				Name:       "daemon-bus-queues",
+				ShortUsage: "tailscale debug daemon-bus-queues",
+				Exec:       runDaemonBusQueues,
+				ShortHelp:  "Print event bus queue depths per client",
 			},
 			{
 				Name:       "metrics",
@@ -159,6 +190,12 @@ func debugCmd() *ffcli.Command {
 				ShortUsage: "tailscale debug rebind",
 				Exec:       localAPIAction("rebind"),
 				ShortHelp:  "Force a magicsock rebind",
+			},
+			{
+				Name:       "rotate-disco-key",
+				ShortUsage: "tailscale debug rotate-disco-key",
+				Exec:       localAPIAction("rotate-disco-key"),
+				ShortHelp:  "Rotate the discovery key",
 			},
 			{
 				Name:       "derp-set-on-demand",
@@ -222,7 +259,7 @@ func debugCmd() *ffcli.Command {
 				ShortHelp:  "Print prefs",
 				FlagSet: (func() *flag.FlagSet {
 					fs := newFlagSet("prefs")
-					fs.BoolVar(&prefsArgs.pretty, "pretty", false, "If true, pretty-print output")
+					fs.BoolVar(&prefsArgs.pretty, "pretty", false, "if true, pretty-print output")
 					return fs
 				})(),
 			},
@@ -233,11 +270,19 @@ func debugCmd() *ffcli.Command {
 				ShortHelp:  "Subscribe to IPN message bus",
 				FlagSet: (func() *flag.FlagSet {
 					fs := newFlagSet("watch-ipn")
-					fs.BoolVar(&watchIPNArgs.netmap, "netmap", true, "include netmap in messages")
-					fs.BoolVar(&watchIPNArgs.initial, "initial", false, "include initial status")
-					fs.BoolVar(&watchIPNArgs.rateLimit, "rate-limit", true, "rate limit messags")
-					fs.BoolVar(&watchIPNArgs.showPrivateKey, "show-private-key", false, "include node private key in printed netmap")
+					fs.BoolVar(&watchIPNArgs.initial, "initial", false, "include the initial backend State and Prefs in the first message")
 					fs.IntVar(&watchIPNArgs.count, "count", 0, "exit after printing this many statuses, or 0 to keep going forever")
+					fs.BoolVar(&watchIPNArgs.engineUpdates, "engine-updates", false, "set NotifyWatchEngineUpdates: send Engine updates")
+					fs.BoolVar(&watchIPNArgs.initialDriveShares, "initial-drive-shares", false, "set NotifyInitialDriveShares: send current Taildrive Shares in first message")
+					fs.BoolVar(&watchIPNArgs.initialOutgoingFiles, "initial-outgoing-files", false, "set NotifyInitialOutgoingFiles: send current Taildrop OutgoingFiles in first message")
+					fs.BoolVar(&watchIPNArgs.initialHealthState, "initial-health", false, "set NotifyInitialHealthState: send current health.State in first message")
+					fs.BoolVar(&watchIPNArgs.healthActions, "health-actions", false, "set NotifyHealthActions: include PrimaryActions in health.State")
+					fs.BoolVar(&watchIPNArgs.initialSuggestedExitNode, "initial-suggested-exit-node", false, "set NotifyInitialSuggestedExitNode: send current SuggestedExitNode in first message")
+					fs.BoolVar(&watchIPNArgs.initialClientVersion, "initial-client-version", false, "set NotifyInitialClientVersion: send current ClientVersion in first message")
+					fs.BoolVar(&watchIPNArgs.peerChanges, "peer-changes", true, "set NotifyPeerChanges: send PeersChanged and PeersRemoved updates")
+					fs.BoolVar(&watchIPNArgs.initialStatus, "initial-status", false, "set NotifyInitialStatus: send current ipnstate.Status in first message")
+					fs.BoolVar(&watchIPNArgs.peerPatches, "peer-patches", true, "set NotifyPeerPatches: send narrow per-field peer patches")
+					fs.BoolVar(&watchIPNArgs.peerWireGuardState, "peer-wireguard-state", false, "set NotifyPeerWireGuardState: send WireGuard session state notifications")
 					return fs
 				})(),
 			},
@@ -248,7 +293,6 @@ func debugCmd() *ffcli.Command {
 				ShortHelp:  "Print the current network map",
 				FlagSet: (func() *flag.FlagSet {
 					fs := newFlagSet("netmap")
-					fs.BoolVar(&netmapArgs.showPrivateKey, "show-private-key", false, "include node private key in printed netmap")
 					return fs
 				})(),
 			},
@@ -269,6 +313,10 @@ func debugCmd() *ffcli.Command {
 					fs.StringVar(&ts2021Args.host, "host", "controlplane.tailscale.com", "hostname of control plane")
 					fs.IntVar(&ts2021Args.version, "version", int(tailcfg.CurrentCapabilityVersion), "protocol version")
 					fs.BoolVar(&ts2021Args.verbose, "verbose", false, "be extra verbose")
+					fs.StringVar(&ts2021Args.aceHost, "ace", "", "if non-empty, use this ACE server IP/hostname as a candidate path")
+					fs.StringVar(&ts2021Args.dialPlanJSONFile, "dial-plan", "", "if non-empty, use this JSON file to configure the dial plan")
+					fs.StringVar(&ts2021Args.connectIP, "connect-ip", "", "if non-empty, dial this IP for the noise connection instead of resolving the host, keeping the host for the key fetch, SNI, and Host header")
+					fs.StringVar(&ts2021Args.forcePort, "force-port", "", "if non-empty (\"80\" or \"443\"), only dial the noise connection on this port; by default port 80 is tried first with a port 443 fallback")
 					return fs
 				})(),
 			},
@@ -301,21 +349,7 @@ func debugCmd() *ffcli.Command {
 				ShortHelp:  "Test a DERP configuration",
 			},
 			ccall(debugCaptureCmd),
-			{
-				Name:       "portmap",
-				ShortUsage: "tailscale debug portmap",
-				Exec:       debugPortmap,
-				ShortHelp:  "Run portmap debugging",
-				FlagSet: (func() *flag.FlagSet {
-					fs := newFlagSet("portmap")
-					fs.DurationVar(&debugPortmapArgs.duration, "duration", 5*time.Second, "timeout for port mapping")
-					fs.StringVar(&debugPortmapArgs.ty, "type", "", `portmap debug type (one of "", "pmp", "pcp", or "upnp")`)
-					fs.StringVar(&debugPortmapArgs.gatewayAddr, "gateway-addr", "", `override gateway IP (must also pass --self-addr)`)
-					fs.StringVar(&debugPortmapArgs.selfAddr, "self-addr", "", `override self IP (must also pass --gateway-addr)`)
-					fs.BoolVar(&debugPortmapArgs.logHTTP, "log-http", false, `print all HTTP requests and responses to the log`)
-					return fs
-				})(),
-			},
+			ccall(debugPortmapCmd),
 			{
 				Name:       "peer-endpoint-changes",
 				ShortUsage: "tailscale debug peer-endpoint-changes <hostname-or-IP>",
@@ -350,6 +384,31 @@ func debugCmd() *ffcli.Command {
 				ShortHelp:  "Print Go's runtime/debug.BuildInfo",
 				Exec:       runGoBuildInfo,
 			},
+			{
+				Name:       "peer-relay-servers",
+				ShortUsage: "tailscale debug peer-relay-servers",
+				ShortHelp:  "Print the current set of candidate peer relay servers",
+				Exec:       runPeerRelayServers,
+			},
+			{
+				Name:       "test-risk",
+				ShortUsage: "tailscale debug test-risk",
+				ShortHelp:  "Do a fake risky action",
+				Exec:       runTestRisk,
+				FlagSet: (func() *flag.FlagSet {
+					fs := newFlagSet("test-risk")
+					fs.StringVar(&testRiskArgs.acceptedRisk, "accept-risk", "", "comma-separated list of accepted risks")
+					return fs
+				})(),
+			},
+			{
+				Name:       "statedir",
+				ShortUsage: "tailscale debug statedir",
+				ShortHelp:  "Print the location of the state directory (if any)",
+				Exec:       runPrintStateDir,
+			},
+			ccall(debugPeerRelayCmd),
+			ccall(debugClearNetmapCacheCmd),
 		}...),
 	}
 }
@@ -586,23 +645,59 @@ func runPrefs(ctx context.Context, args []string) error {
 }
 
 var watchIPNArgs struct {
-	netmap         bool
-	initial        bool
-	showPrivateKey bool
-	rateLimit      bool
-	count          int
+	initial bool
+	count   int
+
+	engineUpdates            bool
+	initialDriveShares       bool
+	initialOutgoingFiles     bool
+	initialHealthState       bool
+	healthActions            bool
+	initialSuggestedExitNode bool
+	initialClientVersion     bool
+	peerChanges              bool
+	initialStatus            bool
+	peerPatches              bool
+	peerWireGuardState       bool
 }
 
 func runWatchIPN(ctx context.Context, args []string) error {
-	var mask ipn.NotifyWatchOpt
+	mask := ipn.NotifyNoNetMap
 	if watchIPNArgs.initial {
-		mask = ipn.NotifyInitialState | ipn.NotifyInitialPrefs | ipn.NotifyInitialNetMap
+		mask |= ipn.NotifyInitialState | ipn.NotifyInitialPrefs
 	}
-	if !watchIPNArgs.showPrivateKey {
-		mask |= ipn.NotifyNoPrivateKeys
+	if watchIPNArgs.engineUpdates {
+		mask |= ipn.NotifyWatchEngineUpdates
 	}
-	if watchIPNArgs.rateLimit {
-		mask |= ipn.NotifyRateLimit
+	if watchIPNArgs.initialDriveShares {
+		mask |= ipn.NotifyInitialDriveShares
+	}
+	if watchIPNArgs.initialOutgoingFiles {
+		mask |= ipn.NotifyInitialOutgoingFiles
+	}
+	if watchIPNArgs.initialHealthState {
+		mask |= ipn.NotifyInitialHealthState
+	}
+	if watchIPNArgs.healthActions {
+		mask |= ipn.NotifyHealthActions
+	}
+	if watchIPNArgs.initialSuggestedExitNode {
+		mask |= ipn.NotifyInitialSuggestedExitNode
+	}
+	if watchIPNArgs.initialClientVersion {
+		mask |= ipn.NotifyInitialClientVersion
+	}
+	if watchIPNArgs.peerChanges {
+		mask |= ipn.NotifyPeerChanges
+	}
+	if watchIPNArgs.initialStatus {
+		mask |= ipn.NotifyInitialStatus
+	}
+	if watchIPNArgs.peerPatches {
+		mask |= ipn.NotifyPeerPatches
+	}
+	if watchIPNArgs.peerWireGuardState {
+		mask |= ipn.NotifyPeerWireGuardState
 	}
 	watcher, err := localClient.WatchIPNBus(ctx, mask)
 	if err != nil {
@@ -615,38 +710,21 @@ func runWatchIPN(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
-		if !watchIPNArgs.netmap {
-			n.NetMap = nil
-		}
 		j, _ := json.MarshalIndent(n, "", "\t")
 		fmt.Printf("%s\n", j)
 	}
 	return nil
 }
 
-var netmapArgs struct {
-	showPrivateKey bool
-}
-
 func runNetmap(ctx context.Context, args []string) error {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	var mask ipn.NotifyWatchOpt = ipn.NotifyInitialNetMap
-	if !netmapArgs.showPrivateKey {
-		mask |= ipn.NotifyNoPrivateKeys
-	}
-	watcher, err := localClient.WatchIPNBus(ctx, mask)
+	raw, err := localClient.DebugResultJSON(ctx, "current-netmap")
 	if err != nil {
 		return err
 	}
-	defer watcher.Close()
-
-	n, err := watcher.Next()
-	if err != nil {
-		return err
-	}
-	j, _ := json.MarshalIndent(n.NetMap, "", "\t")
+	j, _ := json.MarshalIndent(raw, "", "\t")
 	fmt.Printf("%s\n", j)
 	return nil
 }
@@ -763,10 +841,13 @@ func runDaemonLogs(ctx context.Context, args []string) error {
 	}
 	d := json.NewDecoder(logs)
 	for {
+		type logtail struct {
+			Time string `json:"client_time"`
+		}
 		var line struct {
-			Text    string `json:"text"`
-			Verbose int    `json:"v"`
-			Time    string `json:"client_time"`
+			Text    string  `json:"text"`
+			Verbose int     `json:"v"`
+			Logtail logtail `json:"logtail"`
 		}
 		err := d.Decode(&line)
 		if err != nil {
@@ -776,12 +857,76 @@ func runDaemonLogs(ctx context.Context, args []string) error {
 		if line.Text == "" || line.Verbose > daemonLogsArgs.verbose {
 			continue
 		}
-		if daemonLogsArgs.time {
-			fmt.Printf("%s %s\n", line.Time, line.Text)
+		if daemonLogsArgs.time && line.Logtail.Time != "" {
+			fmt.Printf("%s %s\n", line.Logtail.Time, line.Text)
 		} else {
 			fmt.Println(line.Text)
 		}
 	}
+}
+
+func runDaemonBusEvents(ctx context.Context, args []string) error {
+	for line, err := range localClient.StreamBusEvents(ctx) {
+		if err != nil {
+			return err
+		}
+		fmt.Printf("[%d][%q][from: %q][to: %q] %s\n", line.Count, line.Type,
+			line.From, line.To, line.Event)
+	}
+	return nil
+}
+
+var daemonBusGraphArgs struct {
+	format string
+}
+
+func runDaemonBusGraph(ctx context.Context, args []string) error {
+	graph, err := localClient.EventBusGraph(ctx)
+	if err != nil {
+		return err
+	}
+	if format := daemonBusGraphArgs.format; format != "json" && format != "dot" {
+		return fmt.Errorf("unrecognized output format %q", format)
+	}
+	if daemonBusGraphArgs.format == "dot" {
+		var topics eventbus.DebugTopics
+		if err := json.Unmarshal(graph, &topics); err != nil {
+			return fmt.Errorf("unable to parse json: %w", err)
+		}
+		fmt.Print(generateDOTGraph(topics.Topics))
+	} else {
+		fmt.Print(string(graph))
+	}
+	return nil
+}
+
+func runDaemonBusQueues(ctx context.Context, args []string) error {
+	data, err := localClient.EventBusQueues(ctx)
+	if err != nil {
+		return err
+	}
+	fmt.Print(string(data))
+	return nil
+}
+
+// generateDOTGraph generates the DOT graph format based on the events
+func generateDOTGraph(topics []eventbus.DebugTopic) string {
+	var sb strings.Builder
+	sb.WriteString("digraph event_bus {\n")
+
+	for _, topic := range topics {
+		// If no subscribers, still ensure the topic is drawn
+		if len(topic.Subscribers) == 0 {
+			topic.Subscribers = append(topic.Subscribers, "no-subscribers")
+		}
+		for _, subscriber := range topic.Subscribers {
+			fmt.Fprintf(&sb, "\t%q -> %q [label=%q];\n",
+				topic.Publisher, subscriber, cmp.Or(topic.Name, "???"))
+		}
+	}
+
+	sb.WriteString("}\n")
+	return sb.String()
 }
 
 var metricsArgs struct {
@@ -888,27 +1033,49 @@ var ts2021Args struct {
 	host    string // "controlplane.tailscale.com"
 	version int    // 27 or whatever
 	verbose bool
+	aceHost string // if non-empty, FQDN of https ACE server to use ("ace.example.com")
+
+	dialPlanJSONFile string // if non-empty, path to JSON file [tailcfg.ControlDialPlan] JSON
+	connectIP        string // if non-empty, IP to dial for the noise connection instead of resolving host
+	forcePort        string // if non-empty ("80" or "443"), only dial the noise connection on this port
 }
 
 func runTS2021(ctx context.Context, args []string) error {
 	log.SetOutput(Stdout)
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 
+	switch ts2021Args.forcePort {
+	case "":
+	case "443":
+		// Make the controlhttp dialer skip its plaintext port 80 attempt
+		// and go straight to TLS. The dialFunc guard below is then just a
+		// backstop.
+		envknob.Setenv("TS_FORCE_NOISE_443", "true")
+	case "80":
+		// No dialer knob exists to disable the port 443 fallback, so the
+		// dialFunc guard below enforces this one.
+	default:
+		return fmt.Errorf("invalid --force-port value %q; must be \"80\" or \"443\"", ts2021Args.forcePort)
+	}
+
 	keysURL := "https://" + ts2021Args.host + "/key?v=" + strconv.Itoa(ts2021Args.version)
+
+	keyTransport := netutil.NewDefaultTransport()
+	if ts2021Args.aceHost != "" {
+		log.Printf("using ACE server %q", ts2021Args.aceHost)
+		keyTransport.Proxy = nil
+		keyTransport.DialContext = (&ace.Dialer{ACEHost: ts2021Args.aceHost}).Dial
+	}
 
 	if ts2021Args.verbose {
 		u, err := url.Parse(keysURL)
 		if err != nil {
 			return err
 		}
-		envConf := httpproxy.FromEnvironment()
-		if *envConf == (httpproxy.Config{}) {
-			log.Printf("HTTP proxy env: (none)")
-		} else {
-			log.Printf("HTTP proxy env: %+v", envConf)
+		if proxyFromEnv, ok := feature.HookProxyFromEnvironment.GetOk(); ok {
+			proxy, err := proxyFromEnv(&http.Request{URL: u})
+			log.Printf("tshttpproxy.ProxyFromEnvironment = (%v, %v)", proxy, err)
 		}
-		proxy, err := tshttpproxy.ProxyFromEnvironment(&http.Request{URL: u})
-		log.Printf("tshttpproxy.ProxyFromEnvironment = (%v, %v)", proxy, err)
 	}
 	machinePrivate := key.NewMachine()
 	var dialer net.Dialer
@@ -921,7 +1088,7 @@ func runTS2021(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	res, err := http.DefaultClient.Do(req)
+	res, err := keyTransport.RoundTrip(req)
 	if err != nil {
 		log.Printf("Do: %v", err)
 		return err
@@ -940,6 +1107,14 @@ func runTS2021(ctx context.Context, args []string) error {
 	}
 
 	dialFunc := func(ctx context.Context, network, address string) (net.Conn, error) {
+		if _, port, err := net.SplitHostPort(address); err == nil {
+			if ts2021Args.forcePort != "" && port != ts2021Args.forcePort {
+				return nil, fmt.Errorf("dial to port %s disabled by --force-port=%s", port, ts2021Args.forcePort)
+			}
+			if ts2021Args.connectIP != "" {
+				address = net.JoinHostPort(ts2021Args.connectIP, port)
+			}
+		}
 		log.Printf("Dial(%q, %q) ...", network, address)
 		c, err := dialer.DialContext(ctx, network, address)
 		if err != nil {
@@ -965,20 +1140,45 @@ func runTS2021(ctx context.Context, args []string) error {
 		return fmt.Errorf("creating netmon: %w", err)
 	}
 
-	noiseDialer := &controlhttp.Dialer{
-		Hostname:        ts2021Args.host,
-		HTTPPort:        "80",
-		HTTPSPort:       "443",
-		MachineKey:      machinePrivate,
-		ControlKey:      keys.PublicKey,
-		ProtocolVersion: uint16(ts2021Args.version),
-		Dialer:          dialFunc,
-		Logf:            logf,
-		NetMon:          netMon,
+	var dialPlan *tailcfg.ControlDialPlan
+	if ts2021Args.dialPlanJSONFile != "" {
+		b, err := os.ReadFile(ts2021Args.dialPlanJSONFile)
+		if err != nil {
+			return fmt.Errorf("reading dial plan JSON file: %w", err)
+		}
+		dialPlan = new(tailcfg.ControlDialPlan)
+		if err := json.Unmarshal(b, dialPlan); err != nil {
+			return fmt.Errorf("unmarshaling dial plan JSON file: %w", err)
+		}
+	} else if ts2021Args.aceHost != "" {
+		dialPlan = &tailcfg.ControlDialPlan{
+			Candidates: []tailcfg.ControlIPCandidate{
+				{
+					ACEHost:        ts2021Args.aceHost,
+					DialTimeoutSec: 10,
+				},
+			},
+		}
 	}
+
+	opts := ts2021.ClientOpts{
+		ServerURL: "https://" + ts2021Args.host,
+		DialPlan: func() *tailcfg.ControlDialPlan {
+			return dialPlan
+		},
+		Logf:          logf,
+		NetMon:        netMon,
+		PrivKey:       machinePrivate,
+		ServerPubKey:  keys.PublicKey,
+		Dialer:        tsdial.NewFromFuncForDebug(logf, dialFunc),
+		DNSCache:      &dnscache.Resolver{},
+		HealthTracker: &health.Tracker{},
+	}
+
+	// TODO: 	ProtocolVersion: uint16(ts2021Args.version),
 	const tries = 2
 	for i := range tries {
-		err := tryConnect(ctx, keys.PublicKey, noiseDialer)
+		err := tryConnect(ctx, keys.PublicKey, opts)
 		if err != nil {
 			log.Printf("error on attempt %d/%d: %v", i+1, tries, err)
 			continue
@@ -988,53 +1188,37 @@ func runTS2021(ctx context.Context, args []string) error {
 	return nil
 }
 
-func tryConnect(ctx context.Context, controlPublic key.MachinePublic, noiseDialer *controlhttp.Dialer) error {
-	conn, err := noiseDialer.Dial(ctx)
-	log.Printf("controlhttp.Dial = %p, %v", conn, err)
-	if err != nil {
-		return err
-	}
-	log.Printf("did noise handshake")
+func tryConnect(ctx context.Context, controlPublic key.MachinePublic, opts ts2021.ClientOpts) error {
 
-	gotPeer := conn.Peer()
-	if gotPeer != controlPublic {
-		log.Printf("peer = %v, want %v", gotPeer, controlPublic)
-		return errors.New("key mismatch")
-	}
-
-	log.Printf("final underlying conn: %v / %v", conn.LocalAddr(), conn.RemoteAddr())
-
-	h2Transport, err := http2.ConfigureTransports(&http.Transport{
-		IdleConnTimeout: time.Second,
+	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+		GotConn: func(ci httptrace.GotConnInfo) {
+			log.Printf("GotConn: %T", ci.Conn)
+			ncc, ok := ci.Conn.(*ts2021.Conn)
+			if !ok {
+				return
+			}
+			log.Printf("did noise handshake")
+			log.Printf("final underlying conn: %v / %v", ncc.LocalAddr(), ncc.RemoteAddr())
+			gotPeer := ncc.Peer()
+			if gotPeer != controlPublic {
+				log.Fatalf("peer = %v, want %v", gotPeer, controlPublic)
+			}
+		},
 	})
-	if err != nil {
-		return fmt.Errorf("http2.ConfigureTransports: %w", err)
-	}
 
-	// Now, create a Noise conn over the existing conn.
-	nc, err := noiseconn.New(conn.Conn, h2Transport, 0, nil)
+	nc, err := ts2021.NewClient(opts)
 	if err != nil {
-		return fmt.Errorf("noiseconn.New: %w", err)
-	}
-	defer nc.Close()
-
-	// Reserve a RoundTrip for the whoami request.
-	ok, _, err := nc.ReserveNewRequest(ctx)
-	if err != nil {
-		return fmt.Errorf("ReserveNewRequest: %w", err)
-	}
-	if !ok {
-		return errors.New("ReserveNewRequest failed")
+		return fmt.Errorf("NewNoiseClient: %w", err)
 	}
 
 	// Make a /whoami request to the server to verify that we can actually
 	// communicate over the newly-established connection.
-	whoamiURL := "http://" + ts2021Args.host + "/machine/whoami"
+	whoamiURL := "https://" + ts2021Args.host + "/machine/whoami"
 	req, err := http.NewRequestWithContext(ctx, "GET", whoamiURL, nil)
 	if err != nil {
 		return err
 	}
-	resp, err := nc.RoundTrip(req)
+	resp, err := nc.Do(req)
 	if err != nil {
 		return fmt.Errorf("RoundTrip whoami request: %w", err)
 	}
@@ -1118,44 +1302,6 @@ func runSetExpire(ctx context.Context, args []string) error {
 		return errors.New("usage: tailscale debug set-expire --in=<duration>")
 	}
 	return localClient.DebugSetExpireIn(ctx, setExpireArgs.in)
-}
-
-var debugPortmapArgs struct {
-	duration    time.Duration
-	gatewayAddr string
-	selfAddr    string
-	ty          string
-	logHTTP     bool
-}
-
-func debugPortmap(ctx context.Context, args []string) error {
-	opts := &tailscale.DebugPortmapOpts{
-		Duration: debugPortmapArgs.duration,
-		Type:     debugPortmapArgs.ty,
-		LogHTTP:  debugPortmapArgs.logHTTP,
-	}
-	if (debugPortmapArgs.gatewayAddr != "") != (debugPortmapArgs.selfAddr != "") {
-		return fmt.Errorf("if one of --gateway-addr and --self-addr is provided, the other must be as well")
-	}
-	if debugPortmapArgs.gatewayAddr != "" {
-		var err error
-		opts.GatewayAddr, err = netip.ParseAddr(debugPortmapArgs.gatewayAddr)
-		if err != nil {
-			return fmt.Errorf("invalid --gateway-addr: %w", err)
-		}
-		opts.SelfAddr, err = netip.ParseAddr(debugPortmapArgs.selfAddr)
-		if err != nil {
-			return fmt.Errorf("invalid --self-addr: %w", err)
-		}
-	}
-	rc, err := localClient.DebugPortmap(ctx, opts)
-	if err != nil {
-		return err
-	}
-	defer rc.Close()
-
-	_, err = io.Copy(os.Stdout, rc)
-	return err
 }
 
 func runPeerEndpointChanges(ctx context.Context, args []string) error {
@@ -1309,4 +1455,52 @@ func runDebugResolve(ctx context.Context, args []string) error {
 		fmt.Printf("%s\n", ip)
 	}
 	return nil
+}
+
+func runPeerRelayServers(ctx context.Context, args []string) error {
+	if len(args) > 0 {
+		return errors.New("unexpected arguments")
+	}
+	v, err := localClient.DebugResultJSON(ctx, "peer-relay-servers")
+	if err != nil {
+		return err
+	}
+	e := json.NewEncoder(os.Stdout)
+	e.SetIndent("", "  ")
+	e.Encode(v)
+	return nil
+}
+
+var testRiskArgs struct {
+	acceptedRisk string
+}
+
+func runTestRisk(ctx context.Context, args []string) error {
+	if len(args) > 0 {
+		return errors.New("unexpected arguments")
+	}
+	if err := presentRiskToUser("test-risk", "This is a test risky action.", testRiskArgs.acceptedRisk); err != nil {
+		return err
+	}
+	fmt.Println("did-test-risky-action")
+	return nil
+}
+
+func runPrintStateDir(ctx context.Context, args []string) error {
+	if len(args) > 0 {
+		return errors.New("unexpected arguments")
+	}
+	v, err := localClient.DebugResultJSON(ctx, "statedir")
+	if err != nil {
+		return err
+	}
+	statedir, ok := v.(string)
+	if ok && statedir != "" {
+		fmt.Println(statedir)
+		return nil
+	} else if ok && statedir == "" {
+		return errors.New("no statedir is set")
+	} else {
+		return fmt.Errorf("got unexpected response from debug API: %v", v)
+	}
 }

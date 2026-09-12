@@ -1,10 +1,11 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package cli
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -18,22 +19,42 @@ import (
 )
 
 var switchCmd = &ffcli.Command{
-	Name:       "switch",
-	ShortUsage: "tailscale switch <id>",
-	ShortHelp:  "Switch to a different Tailscale account",
+	Name: "switch",
+	ShortUsage: strings.Join([]string{
+		"tailscale switch <id>",
+		"tailscale switch --list [--json]",
+	}, "\n"),
+	ShortHelp: "Switch to a different Tailscale account",
 	LongHelp: `"tailscale switch" switches between logged in accounts. You can
 use the ID that's returned from 'tailnet switch -list'
 to pick which profile you want to switch to. Alternatively, you
-can use the Tailnet or the account names to switch as well.
+can use the Tailnet, account names, or display names to switch as well.
 
 This command is currently in alpha and may change in the future.`,
 
 	FlagSet: func() *flag.FlagSet {
 		fs := flag.NewFlagSet("switch", flag.ExitOnError)
 		fs.BoolVar(&switchArgs.list, "list", false, "list available accounts")
+		fs.BoolVar(&switchArgs.json, "json", false, "list available accounts in JSON format")
 		return fs
 	}(),
 	Exec: switchProfile,
+
+	// Add remove subcommand
+	Subcommands: []*ffcli.Command{
+		{
+			Name:       "remove",
+			ShortUsage: "tailscale switch remove <id>",
+			ShortHelp:  "Remove a Tailscale account",
+			LongHelp: `"tailscale switch remove" removes a Tailscale account from the
+local machine. This does not delete the account itself, but
+it will no longer be available for switching to. You can
+add it back by logging in again.
+
+This command is currently in alpha and may change in the future.`,
+			Exec: removeProfile,
+		},
+	},
 }
 
 func init() {
@@ -46,7 +67,7 @@ func init() {
 		seen := make(map[string]bool, 3*len(all))
 		wordfns := []func(prof ipn.LoginProfile) string{
 			func(prof ipn.LoginProfile) string { return string(prof.ID) },
-			func(prof ipn.LoginProfile) string { return prof.NetworkProfile.DomainName },
+			func(prof ipn.LoginProfile) string { return prof.NetworkProfile.DisplayNameOrDefault() },
 			func(prof ipn.LoginProfile) string { return prof.Name },
 		}
 
@@ -57,7 +78,7 @@ func init() {
 					continue
 				}
 				seen[word] = true
-				words = append(words, fmt.Sprintf("%s\tid: %s, tailnet: %s, account: %s", word, prof.ID, prof.NetworkProfile.DomainName, prof.Name))
+				words = append(words, fmt.Sprintf("%s\tid: %s, tailnet: %s, account: %s", word, prof.ID, prof.NetworkProfile.DisplayNameOrDefault(), prof.Name))
 			}
 		}
 		return words, ffcomplete.ShellCompDirectiveNoFileComp, nil
@@ -66,6 +87,7 @@ func init() {
 
 var switchArgs struct {
 	list bool
+	json bool
 }
 
 func listProfiles(ctx context.Context) error {
@@ -86,16 +108,54 @@ func listProfiles(ctx context.Context) error {
 		}
 		printRow(
 			string(prof.ID),
-			prof.NetworkProfile.DomainName,
+			prof.NetworkProfile.DisplayNameOrDefault(),
 			name,
 		)
 	}
 	return nil
 }
 
+type switchProfileJSON struct {
+	ID       string `json:"id"`
+	Nickname string `json:"nickname"`
+	Tailnet  string `json:"tailnet"`
+	Account  string `json:"account"`
+	Selected bool   `json:"selected"`
+}
+
+func listProfilesJSON(ctx context.Context) error {
+	curP, all, err := localClient.ProfileStatus(ctx)
+	if err != nil {
+		return err
+	}
+	profiles := make([]switchProfileJSON, 0, len(all))
+	for _, prof := range all {
+		profiles = append(profiles, switchProfileJSON{
+			ID:       string(prof.ID),
+			Tailnet:  prof.NetworkProfile.DisplayNameOrDefault(),
+			Account:  prof.UserProfile.LoginName,
+			Nickname: prof.Name,
+			Selected: prof.ID == curP.ID,
+		})
+	}
+	profilesJSON, err := json.MarshalIndent(profiles, "", "  ")
+	if err != nil {
+		return err
+	}
+	printf("%s\n", profilesJSON)
+	return nil
+}
+
 func switchProfile(ctx context.Context, args []string) error {
 	if switchArgs.list {
+		if switchArgs.json {
+			return listProfilesJSON(ctx)
+		}
 		return listProfiles(ctx)
+	}
+	if switchArgs.json {
+		outln("--json argument cannot be used with tailscale switch NAME")
+		os.Exit(1)
 	}
 	if len(args) != 1 {
 		outln("usage: tailscale switch NAME")
@@ -106,32 +166,8 @@ func switchProfile(ctx context.Context, args []string) error {
 		errf("Failed to switch to account: %v\n", err)
 		os.Exit(1)
 	}
-	var profID ipn.ProfileID
-	// Allow matching by ID, Tailnet, or Account
-	// in that order.
-	for _, p := range all {
-		if p.ID == ipn.ProfileID(args[0]) {
-			profID = p.ID
-			break
-		}
-	}
-	if profID == "" {
-		for _, p := range all {
-			if p.NetworkProfile.DomainName == args[0] {
-				profID = p.ID
-				break
-			}
-		}
-	}
-	if profID == "" {
-		for _, p := range all {
-			if p.Name == args[0] {
-				profID = p.ID
-				break
-			}
-		}
-	}
-	if profID == "" {
+	profID, ok := matchProfile(args[0], all)
+	if !ok {
 		errf("No profile named %q\n", args[0])
 		os.Exit(1)
 	}
@@ -177,4 +213,55 @@ func switchProfile(ctx context.Context, args []string) error {
 			os.Exit(1)
 		}
 	}
+}
+
+func removeProfile(ctx context.Context, args []string) error {
+	if len(args) != 1 {
+		outln("usage: tailscale switch remove NAME")
+		os.Exit(1)
+	}
+	cp, all, err := localClient.ProfileStatus(ctx)
+	if err != nil {
+		errf("Failed to remove account: %v\n", err)
+		os.Exit(1)
+	}
+
+	profID, ok := matchProfile(args[0], all)
+	if !ok {
+		errf("No profile named %q\n", args[0])
+		os.Exit(1)
+	}
+
+	if profID == cp.ID {
+		printf("Already on account %q\n", args[0])
+		os.Exit(0)
+	}
+
+	return localClient.DeleteProfile(ctx, profID)
+}
+
+func matchProfile(arg string, all []ipn.LoginProfile) (ipn.ProfileID, bool) {
+	// Allow matching by ID, Tailnet, Account, or Display Name
+	// in that order.
+	for _, p := range all {
+		if p.ID == ipn.ProfileID(arg) {
+			return p.ID, true
+		}
+	}
+	for _, p := range all {
+		if p.NetworkProfile.DomainName == arg {
+			return p.ID, true
+		}
+	}
+	for _, p := range all {
+		if p.Name == arg {
+			return p.ID, true
+		}
+	}
+	for _, p := range all {
+		if p.NetworkProfile.DisplayName == arg {
+			return p.ID, true
+		}
+	}
+	return "", false
 }

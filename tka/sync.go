@@ -1,5 +1,7 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
+
+//go:build !ts_omit_tailnetlock
 
 package tka
 
@@ -7,13 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
-)
 
-const (
-	// Max iterations searching for any intersection.
-	maxSyncIter = 2000
-	// Max iterations searching for a head intersection.
-	maxSyncHeadIntersectionIter = 400
+	"tailscale.com/util/testenv"
 )
 
 // ErrNoIntersection is returned when a shared AUM could
@@ -30,17 +27,40 @@ type SyncOffer struct {
 	Ancestors []AUMHash
 }
 
-const (
-	// The starting number of AUMs to skip when listing
-	// ancestors in a SyncOffer.
-	ancestorsSkipStart = 4
+// ToSyncOffer creates a SyncOffer from the fields received in
+// a [tailcfg.TKASyncOfferRequest].
+func ToSyncOffer(head string, ancestors []string) (SyncOffer, error) {
+	var out SyncOffer
+	if err := out.Head.UnmarshalText([]byte(head)); err != nil {
+		return SyncOffer{}, fmt.Errorf("head.UnmarshalText: %v", err)
+	}
+	out.Ancestors = make([]AUMHash, len(ancestors))
+	for i, a := range ancestors {
+		if err := out.Ancestors[i].UnmarshalText([]byte(a)); err != nil {
+			return SyncOffer{}, fmt.Errorf("ancestor[%d].UnmarshalText: %v", i, err)
+		}
+	}
+	return out, nil
+}
 
-	// How many bits to advance the skip count when listing
-	// ancestors in a SyncOffer.
-	//
-	// 2 bits, so (4<<2), so after skipping 4 it skips 16.
-	ancestorsSkipShift = 2
-)
+// FromSyncOffer marshals the fields of a SyncOffer so they can be
+// sent in a [tailcfg.TKASyncOfferRequest].
+func FromSyncOffer(offer SyncOffer) (head string, ancestors []string, err error) {
+	headBytes, err := offer.Head.MarshalText()
+	if err != nil {
+		return "", nil, fmt.Errorf("head.MarshalText: %v", err)
+	}
+
+	ancestors = make([]string, len(offer.Ancestors))
+	for i, ancestor := range offer.Ancestors {
+		hash, err := ancestor.MarshalText()
+		if err != nil {
+			return "", nil, fmt.Errorf("ancestor[%d].MarshalText: %v", i, err)
+		}
+		ancestors[i] = string(hash)
+	}
+	return string(headBytes), ancestors, nil
+}
 
 // SyncOffer returns an abbreviated description of the current AUM
 // chain, which can be used to synchronize with another (untrusted)
@@ -52,7 +72,7 @@ const (
 // can then be applied locally with Inform().
 //
 // This SyncOffer + AUM exchange should be performed by both ends,
-// because its possible that either end has AUMs that the other needs
+// because it's possible that either end has AUMs that the other needs
 // to find out about.
 func (a *Authority) SyncOffer(storage Chonk) (SyncOffer, error) {
 	oldest := a.oldestAncestor.Hash()
@@ -62,20 +82,10 @@ func (a *Authority) SyncOffer(storage Chonk) (SyncOffer, error) {
 		Ancestors: make([]AUMHash, 0, 6), // 6 chosen arbitrarily.
 	}
 
-	// We send some subset of our ancestors to help the remote
-	// find a more-recent 'head intersection'.
-	// The number of AUMs between each ancestor entry gets
-	// exponentially larger.
-	var (
-		skipAmount uint64  = ancestorsSkipStart
-		curs       AUMHash = a.Head()
-	)
-	for i := uint64(0); i < maxSyncHeadIntersectionIter; i++ {
-		if i > 0 && (i%skipAmount) == 0 {
-			out.Ancestors = append(out.Ancestors, curs)
-			skipAmount = skipAmount << ancestorsSkipShift
-		}
-
+	// We send all our checkpoints to help the remote find a
+	// more-recent 'head intersection'.
+	curs := a.Head()
+	for range maxSyncHeadIntersectionIter {
 		parent, err := storage.AUM(curs)
 		if err != nil {
 			if err != os.ErrNotExist {
@@ -88,6 +98,11 @@ func (a *Authority) SyncOffer(storage Chonk) (SyncOffer, error) {
 		if parent.Hash() == oldest {
 			break
 		}
+
+		if parent.MessageKind == AUMCheckpoint {
+			out.Ancestors = append(out.Ancestors, curs)
+		}
+
 		copy(curs[:], parent.PrevAUMHash)
 	}
 
@@ -121,7 +136,7 @@ func computeSyncIntersection(storage Chonk, localOffer, remoteOffer SyncOffer) (
 	}
 
 	// Case: 'head intersection'
-	// If we have the remote's head, its more likely than not that
+	// If we have the remote's head, it's more likely than not that
 	// we have updates that build on that head. To confirm this,
 	// we iterate backwards through our chain to see if the given
 	// head is an ancestor of our current chain.
@@ -163,7 +178,7 @@ func computeSyncIntersection(storage Chonk, localOffer, remoteOffer SyncOffer) (
 	// Case: 'tail intersection'
 	// So we don't have a clue what the remote's head is, but
 	// if one of the ancestors they gave us is part of our chain,
-	// then theres an intersection, which is a starting point for
+	// then there's an intersection, which is a starting point for
 	// the remote to send us AUMs from.
 	//
 	// We iterate the list of ancestors in order because the remote
@@ -243,4 +258,66 @@ func (a *Authority) MissingAUMs(storage Chonk, remoteOffer SyncOffer) ([]AUM, er
 	}
 
 	panic("unreachable")
+}
+
+// SeedNode is an authority-chonk pair that can be seeded by [SeedAUMs].
+type SeedNode struct {
+	authority *Authority
+	storage   Chonk
+}
+
+// CreateSeedNode creates a node for use with [SeedAUMs].
+func CreateSeedNode(t testenv.TB, authority *Authority, storage Chonk) SeedNode {
+	t.Helper()
+	return SeedNode{authority, storage}
+}
+
+type SeedAUMConfig struct {
+	Count  int
+	Signer Signer
+	Nodes  []SeedNode
+}
+
+// SeedAUMs generates many AUMs by repeatedly adding and removing keys
+// from the TKA.
+//
+// The AUMs are written to all the supplied nodes, so if you pass more
+// than one, you can build up a long sync history.
+//
+// This is only for use in testing.
+func SeedAUMs(t testenv.TB, config SeedAUMConfig) {
+	t.Helper()
+
+	if len(config.Nodes) == 0 {
+		panic("called SeedAUMs without any nodes")
+	}
+	primaryNode := config.Nodes[0]
+
+	// The key that we'll repeatedly add/remove in the TKA.
+	key := Key{Kind: Key25519, Public: []byte{1, 1, 1}, Votes: 1}
+
+	for i := 0; i < config.Count/2; i++ {
+		for _, action := range []string{"add", "remove"} {
+			updater := primaryNode.authority.NewUpdater(config.Signer)
+			if action == "add" {
+				if err := updater.AddKey(key); err != nil {
+					t.Fatalf("error from updater.AddKey: %v")
+				}
+			} else {
+				if err := updater.RemoveKey(key.MustID()); err != nil {
+					t.Fatalf("error from updater.RemoveKey: %v")
+				}
+			}
+			aum, err := updater.Finalize(primaryNode.storage)
+			if err != nil {
+				t.Fatalf("error from authority.Finalize: %v", err)
+			}
+
+			for _, n := range config.Nodes {
+				if err := n.authority.Inform(n.storage, aum); err != nil {
+					t.Fatalf("error from authority.Inform: %v", err)
+				}
+			}
+		}
+	}
 }

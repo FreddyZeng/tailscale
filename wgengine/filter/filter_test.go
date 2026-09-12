@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package filter
@@ -23,6 +23,8 @@ import (
 	"tailscale.com/net/packet"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
+	"tailscale.com/tailcfg/peercap"
 	"tailscale.com/tstest"
 	"tailscale.com/tstime/rate"
 	"tailscale.com/types/ipproto"
@@ -47,12 +49,12 @@ const (
 // or tailcfg.NodeCapability values. Other values panic.
 func m(srcs []netip.Prefix, dsts []NetPortRange, opts ...any) Match {
 	var protos []ipproto.Proto
-	var caps []tailcfg.NodeCapability
+	var caps []nodecap.Cap
 	for _, o := range opts {
 		switch o := o.(type) {
 		case ipproto.Proto:
 			protos = append(protos, o)
-		case tailcfg.NodeCapability:
+		case nodecap.Cap:
 			caps = append(caps, o)
 		default:
 			panic(fmt.Sprintf("unknown option type %T", o))
@@ -83,7 +85,7 @@ func newFilter(logf logger.Logf) *Filter {
 		m(nets("::/0"), netports("::/0:443")),
 		m(nets("0.0.0.0/0"), netports("0.0.0.0/0:*"), testAllowedProto),
 		m(nets("::/0"), netports("::/0:*"), testAllowedProto),
-		m(nil, netports("1.2.3.4:22"), tailcfg.NodeCapability("cap-hit-1234-ssh")),
+		m(nil, netports("1.2.3.4:22"), nodecap.Cap("cap-hit-1234-ssh")),
 	}
 
 	// Expects traffic to 100.122.98.50, 1.2.3.4, 5.6.7.8,
@@ -106,7 +108,7 @@ func TestFilter(t *testing.T) {
 
 	ipWithCap := netip.MustParseAddr("10.0.0.1")
 	ipWithoutCap := netip.MustParseAddr("10.0.0.2")
-	filt.srcIPHasCap = func(ip netip.Addr, cap tailcfg.NodeCapability) bool {
+	filt.srcIPHasCap = func(ip netip.Addr, cap nodecap.Cap) bool {
 		return cap == "cap-hit-1234-ssh" && ip == ipWithCap
 	}
 
@@ -171,12 +173,8 @@ func TestFilter(t *testing.T) {
 		{Drop, parsed(ipproto.TCP, ipWithoutCap.String(), "1.2.3.4", 30000, 22)},
 	}
 	for i, test := range tests {
-		aclFunc := filt.runIn4
-		if test.p.IPVersion == 6 {
-			aclFunc = filt.runIn6
-		}
-		if got, why := aclFunc(&test.p); test.want != got {
-			t.Errorf("#%d runIn got=%v want=%v why=%q packet:%v", i, got, test.want, why, test.p)
+		if got := filt.RunIn(&test.p, 0); test.want != got {
+			t.Errorf("#%d RunIn got=%v want=%v packet:%v", i, got, test.want, test.p)
 			continue
 		}
 		if test.p.IPProto == ipproto.TCP {
@@ -191,8 +189,8 @@ func TestFilter(t *testing.T) {
 			}
 			// TCP and UDP are treated equivalently in the filter - verify that.
 			test.p.IPProto = ipproto.UDP
-			if got, why := aclFunc(&test.p); test.want != got {
-				t.Errorf("#%d runIn (UDP) got=%v want=%v why=%q packet:%v", i, got, test.want, why, test.p)
+			if got := filt.RunIn(&test.p, 0); test.want != got {
+				t.Errorf("#%d RunIn (UDP) got=%v want=%v packet:%v", i, got, test.want, test.p)
 			}
 		}
 		// Update UDP state
@@ -258,6 +256,8 @@ func TestNoAllocs(t *testing.T) {
 		{"udp6_in", in, udp6Packet},
 		{"udp4_out", out, udp4Packet},
 		{"udp6_out", out, udp6Packet},
+		{"frag6_first_in", in, udp6FirstFragment},
+		{"frag6_nonfirst_in", in, udp6NonFirstFragment},
 	}
 
 	for _, test := range tests {
@@ -315,7 +315,7 @@ func TestParseIPSet(t *testing.T) {
 
 	capTests := []struct {
 		in   string
-		want tailcfg.NodeCapability
+		want nodecap.Cap
 	}{
 		{"cap:foo", "foo"},
 		{"cap:people-in-8.8.8.0/24", "people-in-8.8.8.0/24"}, // test precedence of "/" search
@@ -381,6 +381,41 @@ func BenchmarkFilter(b *testing.B) {
 	}
 }
 
+// udp6FirstFragment is the first fragment (offset 0) of a source-fragmented
+// IPv6 UDP datagram from 2001::5 to [2001::1]:443. decode6 reads its ports past
+// the 8-byte Fragment extension header so the filter can match it like an
+// unfragmented packet.
+var udp6FirstFragment = []byte{
+	// IPv6 header. Next header = 44 (Fragment), payload len = 24.
+	0x60, 0x00, 0x00, 0x00, 0x00, 0x18, 0x2c, 0x40,
+	// Src: 2001::5
+	0x20, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05,
+	// Dst: 2001::1
+	0x20, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+	// Fragment header: NextHeader=UDP, Reserved, Offset=0 + M=1, Identification.
+	0x11, 0x00, 0x00, 0x01, 0xde, 0xad, 0xbe, 0xef,
+	// UDP header: sport 1234, dport 443.
+	0x04, 0xd2, 0x01, 0xbb, 0x00, 0x10, 0x00, 0x00,
+	// Payload.
+	0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
+}
+
+// udp6NonFirstFragment is a later fragment (nonzero offset, no transport
+// header) of an IPv6 datagram. decode6 classifies it as ipproto.Fragment,
+// which pre() passes through regardless of ACL, exactly as for IPv4.
+var udp6NonFirstFragment = []byte{
+	// IPv6 header. Next header = 44 (Fragment), payload len = 16.
+	0x60, 0x00, 0x00, 0x00, 0x00, 0x10, 0x2c, 0x40,
+	// Src: 2001::5
+	0x20, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05,
+	// Dst: 2001::1
+	0x20, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+	// Fragment header: NextHeader=UDP, Reserved, Offset=185 blocks + M=0, Identification.
+	0x11, 0x00, 0x05, 0xc8, 0xde, 0xad, 0xbe, 0xef,
+	// Payload continuation (no transport header).
+	0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
+}
+
 func TestPreFilter(t *testing.T) {
 	packets := []struct {
 		desc       string
@@ -393,6 +428,7 @@ func TestPreFilter(t *testing.T) {
 		{"short-junk", Drop, usermetric.ReasonTooShort, raw4default(ipproto.Unknown, 10)},
 		{"long-junk", Drop, usermetric.ReasonUnknownProtocol, raw4default(ipproto.Unknown, 21)},
 		{"fragment", Accept, "", raw4default(ipproto.Fragment, 40)},
+		{"fragment6", Accept, "", udp6NonFirstFragment},
 		{"tcp", noVerdict, "", raw4default(ipproto.TCP, 0)},
 		{"udp", noVerdict, "", raw4default(ipproto.UDP, 0)},
 		{"icmp", noVerdict, "", raw4default(ipproto.ICMPv4, 0)},
@@ -405,6 +441,26 @@ func TestPreFilter(t *testing.T) {
 		if got != testPacket.want || gotReason != testPacket.wantReason {
 			t.Errorf("%q got=%v want=%v gotReason=%s wantReason=%s packet:\n%s", testPacket.desc, got, testPacket.want, gotReason, testPacket.wantReason, packet.Hexdump(testPacket.b))
 		}
+	}
+}
+
+// TestRunInIPv6FirstFragment checks that the first fragment of a
+// source-fragmented IPv6 datagram is matched on its ports and accepted like an
+// unfragmented packet, rather than being dropped as an unknown protocol (the
+// bug where v6 fragments were silently counted as "acl" drops).
+func TestRunInIPv6FirstFragment(t *testing.T) {
+	f := newFilter(t.Logf)
+
+	var p packet.Parsed
+	p.Decode(udp6FirstFragment)
+	// The fragment header must be parsed through to the real sub-protocol;
+	// otherwise no ACL rule can match it.
+	if p.IPProto != ipproto.UDP {
+		t.Fatalf("decoded IPProto = %v, want UDP (fragment header not parsed)", p.IPProto)
+	}
+	// 2001::5 => [2001::1]:443 is permitted by the "::/0 => ::/0:443" rule.
+	if got := f.RunIn(&p, 0); got != Accept {
+		t.Errorf("RunIn(first fragment) = %v, want Accept", got)
 	}
 }
 
@@ -755,13 +811,13 @@ func ports(s string) PortRange {
 	}
 
 	var fs, ls string
-	i := strings.IndexByte(s, '-')
-	if i == -1 {
+	before, after, ok := strings.Cut(s, "-")
+	if !ok {
 		fs = s
 		ls = fs
 	} else {
-		fs = s[:i]
-		ls = s[i+1:]
+		fs = before
+		ls = after
 	}
 	first, err := strconv.ParseInt(fs, 10, 16)
 	if err != nil {
@@ -936,7 +992,7 @@ func TestPeerCaps(t *testing.T) {
 				Dsts: []netip.Prefix{
 					netip.MustParsePrefix("0.0.0.0/0"),
 				},
-				Caps: []tailcfg.PeerCapability{"is_ipv4"},
+				Caps: []peercap.Cap{"is_ipv4"},
 			}},
 		},
 		{
@@ -945,7 +1001,7 @@ func TestPeerCaps(t *testing.T) {
 				Dsts: []netip.Prefix{
 					netip.MustParsePrefix("::/0"),
 				},
-				Caps: []tailcfg.PeerCapability{"is_ipv6"},
+				Caps: []peercap.Cap{"is_ipv6"},
 			}},
 		},
 		{
@@ -954,7 +1010,7 @@ func TestPeerCaps(t *testing.T) {
 				Dsts: []netip.Prefix{
 					netip.MustParsePrefix("100.200.0.0/16"),
 				},
-				Caps: []tailcfg.PeerCapability{"some_super_admin"},
+				Caps: []peercap.Cap{"some_super_admin"},
 			}},
 		},
 	})
@@ -965,37 +1021,37 @@ func TestPeerCaps(t *testing.T) {
 	tests := []struct {
 		name     string
 		src, dst string // IP
-		want     []tailcfg.PeerCapability
+		want     []peercap.Cap
 	}{
 		{
 			name: "v4",
 			src:  "1.2.3.4",
 			dst:  "2.4.5.5",
-			want: []tailcfg.PeerCapability{"is_ipv4"},
+			want: []peercap.Cap{"is_ipv4"},
 		},
 		{
 			name: "v6",
 			src:  "1::1",
 			dst:  "2::2",
-			want: []tailcfg.PeerCapability{"is_ipv6"},
+			want: []peercap.Cap{"is_ipv6"},
 		},
 		{
 			name: "admin",
 			src:  "100.199.1.2",
 			dst:  "100.200.3.4",
-			want: []tailcfg.PeerCapability{"is_ipv4", "some_super_admin"},
+			want: []peercap.Cap{"is_ipv4", "some_super_admin"},
 		},
 		{
 			name: "not_admin_bad_src",
 			src:  "100.198.1.2", // 198, not 199
 			dst:  "100.200.3.4",
-			want: []tailcfg.PeerCapability{"is_ipv4"},
+			want: []peercap.Cap{"is_ipv4"},
 		},
 		{
 			name: "not_admin_bad_dst",
 			src:  "100.199.1.2",
 			dst:  "100.201.3.4", // 201, not 200
-			want: []tailcfg.PeerCapability{"is_ipv4"},
+			want: []peercap.Cap{"is_ipv4"},
 		},
 	}
 	for _, tt := range tests {
@@ -1069,6 +1125,192 @@ type benchOpt struct {
 	noLogs        bool
 	wantAccept    bool
 	udp, udpOpen  bool
+}
+
+func TestIngressAllowHooks(t *testing.T) {
+	matchSrc := func(ip string) PacketMatch {
+		return func(q packet.Parsed) (bool, string) {
+			return q.Src.Addr() == mustIP(ip), "match-src"
+		}
+	}
+	matchDst := func(ip string) PacketMatch {
+		return func(q packet.Parsed) (bool, string) {
+			return q.Dst.Addr() == mustIP(ip), "match-dst"
+		}
+	}
+	noMatch := func(q packet.Parsed) (bool, string) { return false, "" }
+
+	tests := []struct {
+		name  string
+		p     packet.Parsed
+		hooks []PacketMatch
+		want  Response
+	}{
+		{
+			name: "no_hooks_denied_src",
+			p:    parsed(ipproto.TCP, "99.99.99.99", "1.2.3.4", 0, 22),
+			want: Drop,
+		},
+		{
+			name:  "non_matching_hook",
+			p:     parsed(ipproto.TCP, "99.99.99.99", "1.2.3.4", 0, 22),
+			hooks: []PacketMatch{noMatch},
+			want:  Drop,
+		},
+		{
+			name:  "matching_hook_denied_src",
+			p:     parsed(ipproto.TCP, "99.99.99.99", "1.2.3.4", 0, 22),
+			hooks: []PacketMatch{matchSrc("99.99.99.99")},
+			want:  Accept,
+		},
+		{
+			name: "non_local_dst_no_hooks",
+			p:    parsed(ipproto.TCP, "8.1.1.1", "16.32.48.64", 0, 443),
+			want: Drop,
+		},
+		{
+			name:  "non_local_dst_with_hook",
+			p:     parsed(ipproto.TCP, "8.1.1.1", "16.32.48.64", 0, 443),
+			hooks: []PacketMatch{matchDst("16.32.48.64")},
+			want:  Accept,
+		},
+		{
+			name:  "first_match_wins",
+			p:     parsed(ipproto.TCP, "99.99.99.99", "1.2.3.4", 0, 22),
+			hooks: []PacketMatch{noMatch, matchSrc("99.99.99.99")},
+			want:  Accept,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			filt := newFilter(t.Logf)
+			filt.IngressAllowHooks = tt.hooks
+			if got := filt.RunIn(&tt.p, 0); got != tt.want {
+				t.Errorf("RunIn = %v; want %v", got, tt.want)
+			}
+		})
+	}
+
+	// Verify first-match-wins stops calling subsequent hooks.
+	t.Run("first_match_stops_iteration", func(t *testing.T) {
+		filt := newFilter(t.Logf)
+		p := parsed(ipproto.TCP, "99.99.99.99", "1.2.3.4", 0, 22)
+		var called []int
+		filt.IngressAllowHooks = []PacketMatch{
+			func(q packet.Parsed) (bool, string) {
+				called = append(called, 0)
+				return true, "first"
+			},
+			func(q packet.Parsed) (bool, string) {
+				called = append(called, 1)
+				return true, "second"
+			},
+		}
+		filt.RunIn(&p, 0)
+		if len(called) != 1 || called[0] != 0 {
+			t.Errorf("called = %v; want [0]", called)
+		}
+	})
+}
+
+func TestLinkLocalAllowHooks(t *testing.T) {
+	matchDst := func(ip string) PacketMatch {
+		return func(q packet.Parsed) (bool, string) {
+			return q.Dst.Addr() == mustIP(ip), "match-dst"
+		}
+	}
+	noMatch := func(q packet.Parsed) (bool, string) { return false, "" }
+
+	llPkt := func() packet.Parsed {
+		p := parsed(ipproto.UDP, "8.1.1.1", "169.254.1.2", 0, 53)
+		p.StuffForTesting(1024)
+		return p
+	}
+	gcpPkt := func() packet.Parsed {
+		p := parsed(ipproto.UDP, "8.1.1.1", "169.254.169.254", 0, 53)
+		p.StuffForTesting(1024)
+		return p
+	}
+
+	tests := []struct {
+		name  string
+		p     packet.Parsed
+		hooks []PacketMatch
+		dir   direction
+		want  Response
+	}{
+		{
+			name: "dropped_by_default",
+			p:    llPkt(),
+			dir:  in,
+			want: Drop,
+		},
+		{
+			name:  "non_matching_hook",
+			p:     llPkt(),
+			hooks: []PacketMatch{noMatch},
+			dir:   in,
+			want:  Drop,
+		},
+		{
+			name:  "matching_hook_allows",
+			p:     llPkt(),
+			hooks: []PacketMatch{matchDst("169.254.1.2")},
+			dir:   in,
+			want:  noVerdict,
+		},
+		{
+			name: "gcp_dns_always_allowed",
+			p:    gcpPkt(),
+			dir:  in,
+			want: noVerdict,
+		},
+		{
+			name:  "matching_hook_allows_egress",
+			p:     llPkt(),
+			hooks: []PacketMatch{matchDst("169.254.1.2")},
+			dir:   out,
+			want:  noVerdict,
+		},
+		{
+			name:  "first_match_wins",
+			p:     llPkt(),
+			hooks: []PacketMatch{noMatch, matchDst("169.254.1.2")},
+			dir:   in,
+			want:  noVerdict,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			filt := newFilter(t.Logf)
+			filt.LinkLocalAllowHooks = tt.hooks
+			got, reason := filt.pre(&tt.p, 0, tt.dir)
+			if got != tt.want {
+				t.Errorf("pre = %v (%s); want %v", got, reason, tt.want)
+			}
+		})
+	}
+
+	// Verify first-match-wins stops calling subsequent hooks.
+	t.Run("first_match_stops_iteration", func(t *testing.T) {
+		filt := newFilter(t.Logf)
+		p := llPkt()
+		var called []int
+		filt.LinkLocalAllowHooks = []PacketMatch{
+			func(q packet.Parsed) (bool, string) {
+				called = append(called, 0)
+				return true, "first"
+			},
+			func(q packet.Parsed) (bool, string) {
+				called = append(called, 1)
+				return true, "second"
+			},
+		}
+		filt.pre(&p, 0, in)
+		if len(called) != 1 || called[0] != 0 {
+			t.Errorf("called = %v; want [0]", called)
+		}
+	})
 }
 
 func benchmarkFile(b *testing.B, file string, opt benchOpt) {

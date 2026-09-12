@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package web
@@ -18,6 +18,7 @@ import (
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/peercap"
 )
 
 const (
@@ -37,6 +38,7 @@ type browserSession struct {
 	AuthURL       string // from tailcfg.WebClientAuthResponse
 	Created       time.Time
 	Authenticated bool
+	PendingAuth   bool
 }
 
 // isAuthorized reports true if the given session is authorized
@@ -172,12 +174,14 @@ func (s *Server) newSession(ctx context.Context, src *apitype.WhoIsResponse) (*b
 		}
 		session.AuthID = a.ID
 		session.AuthURL = a.URL
+		session.PendingAuth = true
 	} else {
 		// control does not support check mode, so there is no additional auth we can do.
 		session.Authenticated = true
 	}
 
 	s.browserSessions.Store(sid, session)
+
 	return session, nil
 }
 
@@ -192,11 +196,12 @@ func (s *Server) controlSupportsCheckMode(ctx context.Context) bool {
 	if err != nil {
 		return true
 	}
-	controlURL, err := url.Parse(prefs.ControlURLOrDefault())
+	controlURL, err := url.Parse(prefs.ControlURLOrDefault(s.polc))
 	if err != nil {
 		return true
 	}
-	return strings.HasSuffix(controlURL.Host, ".tailscale.com")
+	return strings.HasSuffix(controlURL.Host, ".tailscale.com") ||
+		controlURL.Host == "control.tailscale" // for natlab tests
 }
 
 // awaitUserAuth blocks until the given session auth has been completed
@@ -206,16 +211,24 @@ func (s *Server) awaitUserAuth(ctx context.Context, session *browserSession) err
 	if session.isAuthorized(s.timeNow()) {
 		return nil // already authorized
 	}
+
 	a, err := s.waitAuthURL(ctx, session.AuthID, session.SrcNode)
 	if err != nil {
-		// Clean up the session. Doing this on any error from control
-		// server to avoid the user getting stuck with a bad session
-		// cookie.
+		// Don't delete the session on context cancellation, as this is expected
+		// when users navigate away or refresh the page.
+		if errors.Is(err, context.Canceled) {
+			return err
+		}
+
+		// Clean up the session for non-cancellation errors from control server
+		// to avoid the user getting stuck with a bad session cookie.
 		s.browserSessions.Delete(session.ID)
 		return err
 	}
+
 	if a.Complete {
 		session.Authenticated = a.Complete
+		session.PendingAuth = false
 		s.browserSessions.Store(session.ID, session)
 	}
 	return nil
@@ -323,7 +336,7 @@ func toPeerCapabilities(status *ipnstate.Status, whois *apitype.WhoIsResponse) (
 
 	// For tagged nodes, we actually look at the granted capabilities.
 	caps := peerCapabilities{}
-	rules, err := tailcfg.UnmarshalCapJSON[capRule](whois.CapMap, tailcfg.PeerCapabilityWebUI)
+	rules, err := tailcfg.UnmarshalCapJSON[capRule](whois.CapMap, peercap.WebUI)
 	if err != nil {
 		return nil, fmt.Errorf("failed to unmarshal capability: %v", err)
 	}

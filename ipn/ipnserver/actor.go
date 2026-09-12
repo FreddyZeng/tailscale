@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package ipnserver
@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"time"
 
+	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnauth"
 	"tailscale.com/types/logger"
@@ -144,8 +145,12 @@ func (a *actor) Username() (string, error) {
 		}
 		defer tok.Close()
 		return tok.Username()
-	case "darwin", "linux", "illumos", "solaris":
-		uid, ok := a.ci.Creds().UserID()
+	case "darwin", "linux", "illumos", "solaris", "openbsd", "freebsd":
+		creds := a.ci.Creds()
+		if creds == nil {
+			return "", errors.New("peer credentials not implemented on this OS")
+		}
+		uid, ok := creds.UserID()
 		if !ok {
 			return "", errors.New("missing user ID")
 		}
@@ -232,7 +237,12 @@ func connIsLocalAdmin(logf logger.Logf, ci *ipnauth.ConnIdentity, operatorUID st
 		// This is a standalone tailscaled setup, use the same logic as on
 		// Linux.
 		fallthrough
-	case "linux":
+	case "linux", "solaris", "illumos":
+		if !buildfeatures.HasUnixSocketIdentity {
+			// Everybody is an admin if support for unix socket identities
+			// is omitted for the build.
+			return true
+		}
 		uid, ok := ci.Creds().UserID()
 		if !ok {
 			return false

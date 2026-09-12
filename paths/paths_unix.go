@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !windows && !wasm && !plan9 && !tamago
@@ -21,6 +21,9 @@ func init() {
 }
 
 func statePath() string {
+	if runtime.GOOS == "linux" && distro.Get() == distro.JetKVM {
+		return "/userdata/tailscale/var/tailscaled.state"
+	}
 	switch runtime.GOOS {
 	case "linux", "illumos", "solaris":
 		return "/var/lib/tailscale/tailscaled.state"

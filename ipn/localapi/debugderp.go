@@ -1,5 +1,7 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
+
+//go:build !ts_omit_debug
 
 package localapi
 
@@ -13,6 +15,7 @@ import (
 	"net/http"
 	"net/netip"
 	"strconv"
+	"strings"
 	"time"
 
 	"tailscale.com/derp/derphttp"
@@ -20,10 +23,27 @@ import (
 	"tailscale.com/net/netaddr"
 	"tailscale.com/net/netns"
 	"tailscale.com/net/stun"
+	"tailscale.com/net/tlsdial"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/types/nettype"
 )
+
+// tlsConfigForNode builds a *tls.Config for connecting to a DERP node,
+// mirroring the logic in derphttp.Client.tlsClient so that sha256-raw cert
+// pinning and domain-fronting CertName values are handled correctly.
+func tlsConfigForNode(node *tailcfg.DERPNode) *tls.Config {
+	conf := tlsdial.Config(nil, nil)
+	conf.ServerName = node.HostName
+	if node.CertName != "" {
+		if suf, ok := strings.CutPrefix(node.CertName, "sha256-raw:"); ok {
+			tlsdial.SetConfigExpectedCertHash(conf, suf)
+		} else {
+			tlsdial.SetConfigExpectedCert(conf, node.CertName)
+		}
+	}
+	return conf
+}
 
 func (h *Handler) serveDebugDERPRegion(w http.ResponseWriter, r *http.Request) {
 	if !h.PermitWrite {
@@ -48,7 +68,7 @@ func (h *Handler) serveDebugDERPRegion(w http.ResponseWriter, r *http.Request) {
 	}
 	regStr := r.FormValue("region")
 	var reg *tailcfg.DERPRegion
-	if id, err := strconv.Atoi(regStr); err == nil {
+	if id, err := tailcfg.ParseDERPRegionID(regStr); err == nil {
 		reg = dm.Regions[id]
 	} else {
 		for _, r := range dm.Regions {
@@ -98,9 +118,7 @@ func (h *Handler) serveDebugDERPRegion(w http.ResponseWriter, r *http.Request) {
 			defer conn.Close()
 
 			// Upgrade to TLS and verify that works properly.
-			tlsConn := tls.Client(conn, &tls.Config{
-				ServerName: cmp.Or(derpNode.CertName, derpNode.HostName),
-			})
+			tlsConn := tls.Client(conn, tlsConfigForNode(derpNode))
 			if err := tlsConn.HandshakeContext(ctx); err != nil {
 				st.Errors = append(st.Errors, fmt.Sprintf("Error upgrading connection to node %q @ %q to TLS over IPv4: %v", derpNode.HostName, addr, err))
 			} else {
@@ -117,12 +135,7 @@ func (h *Handler) serveDebugDERPRegion(w http.ResponseWriter, r *http.Request) {
 			defer conn.Close()
 
 			// Upgrade to TLS and verify that works properly.
-			tlsConn := tls.Client(conn, &tls.Config{
-				ServerName: cmp.Or(derpNode.CertName, derpNode.HostName),
-				// TODO(andrew-d): we should print more
-				// detailed failure information on if/why TLS
-				// verification fails
-			})
+			tlsConn := tls.Client(conn, tlsConfigForNode(derpNode))
 			if err := tlsConn.HandshakeContext(ctx); err != nil {
 				st.Errors = append(st.Errors, fmt.Sprintf("Error upgrading connection to node %q @ %q to TLS over IPv6: %v", derpNode.HostName, addr, err))
 			} else {
@@ -228,55 +241,59 @@ func (h *Handler) serveDebugDERPRegion(w http.ResponseWriter, r *http.Request) {
 
 	// Start by checking whether we can establish a HTTP connection
 	for _, derpNode := range reg.Nodes {
-		connSuccess := checkConn(derpNode)
+		if !derpNode.STUNOnly {
+			connSuccess := checkConn(derpNode)
 
-		// Verify that the /generate_204 endpoint works
-		captivePortalURL := fmt.Sprintf("http://%s/generate_204?t=%d", derpNode.HostName, time.Now().Unix())
-		req, err := http.NewRequest("GET", captivePortalURL, nil)
-		if err != nil {
-			st.Warnings = append(st.Warnings, fmt.Sprintf("Internal error creating request for captive portal check: %v", err))
-			continue
-		}
-		req.Header.Set("Cache-Control", "no-cache, no-store, must-revalidate, no-transform, max-age=0")
-		resp, err := client.Do(req)
-		if err != nil {
-			st.Warnings = append(st.Warnings, fmt.Sprintf("Error making request to the captive portal check %q; is port 80 blocked?", captivePortalURL))
-		} else {
-			resp.Body.Close()
-		}
+			// Verify that the /generate_204 endpoint works
+			captivePortalURL := fmt.Sprintf("http://%s/generate_204?t=%d", derpNode.HostName, time.Now().Unix())
+			req, err := http.NewRequest("GET", captivePortalURL, nil)
+			if err != nil {
+				st.Warnings = append(st.Warnings, fmt.Sprintf("Internal error creating request for captive portal check: %v", err))
+				continue
+			}
+			req.Header.Set("Cache-Control", "no-cache, no-store, must-revalidate, no-transform, max-age=0")
+			resp, err := client.Do(req)
+			if err != nil {
+				st.Warnings = append(st.Warnings, fmt.Sprintf("Error making request to the captive portal check %q; is port 80 blocked?", captivePortalURL))
+			} else {
+				resp.Body.Close()
+			}
 
-		if !connSuccess {
-			continue
-		}
+			if !connSuccess {
+				continue
+			}
 
-		fakePrivKey := key.NewNode()
+			fakePrivKey := key.NewNode()
 
-		// Next, repeatedly get the server key to see if the node is
-		// behind a load balancer (incorrectly).
-		serverPubKeys := make(map[key.NodePublic]bool)
-		for i := range 5 {
-			func() {
-				rc := derphttp.NewRegionClient(fakePrivKey, h.logf, h.b.NetMon(), func() *tailcfg.DERPRegion {
-					return &tailcfg.DERPRegion{
-						RegionID:   reg.RegionID,
-						RegionCode: reg.RegionCode,
-						RegionName: reg.RegionName,
-						Nodes:      []*tailcfg.DERPNode{derpNode},
+			// Next, repeatedly get the server key to see if the node is
+			// behind a load balancer (incorrectly).
+			serverPubKeys := make(map[key.NodePublic]bool)
+			for i := range 5 {
+				func() {
+					rc := derphttp.NewRegionClient(fakePrivKey, h.logf, h.b.NetMon(), func() *tailcfg.DERPRegion {
+						return &tailcfg.DERPRegion{
+							RegionID:   reg.RegionID,
+							RegionCode: reg.RegionCode,
+							RegionName: reg.RegionName,
+							Nodes:      []*tailcfg.DERPNode{derpNode},
+						}
+					})
+					if err := rc.Connect(ctx); err != nil {
+						st.Errors = append(st.Errors, fmt.Sprintf("Error connecting to node %q @ try %d: %v", derpNode.HostName, i, err))
+						return
 					}
-				})
-				if err := rc.Connect(ctx); err != nil {
-					st.Errors = append(st.Errors, fmt.Sprintf("Error connecting to node %q @ try %d: %v", derpNode.HostName, i, err))
-					return
-				}
 
-				if len(serverPubKeys) == 0 {
-					st.Info = append(st.Info, fmt.Sprintf("Successfully established a DERP connection with node %q", derpNode.HostName))
-				}
-				serverPubKeys[rc.ServerPublicKey()] = true
-			}()
-		}
-		if len(serverPubKeys) > 1 {
-			st.Errors = append(st.Errors, fmt.Sprintf("Received multiple server public keys (%d); is the DERP server behind a load balancer?", len(serverPubKeys)))
+					if len(serverPubKeys) == 0 {
+						st.Info = append(st.Info, fmt.Sprintf("Successfully established a DERP connection with node %q", derpNode.HostName))
+					}
+					serverPubKeys[rc.ServerPublicKey()] = true
+				}()
+			}
+			if len(serverPubKeys) > 1 {
+				st.Errors = append(st.Errors, fmt.Sprintf("Received multiple server public keys (%d); is the DERP server behind a load balancer?", len(serverPubKeys)))
+			}
+		} else {
+			st.Info = append(st.Info, fmt.Sprintf("Node %q is marked STUNOnly; skipped non-STUN checks", derpNode.HostName))
 		}
 
 		// Send a STUN query to this node to verify whether or not it

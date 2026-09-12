@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package tsconsensus
@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"slices"
 
-	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tsnet"
 	"tailscale.com/util/dnsname"
@@ -85,15 +84,15 @@ func (m *monitor) handleSummaryStatus(w http.ResponseWriter, r *http.Request) {
 			lines = append(lines, fmt.Sprintf("%s\t\t%d\t%d\t%t", name, p.RxBytes, p.TxBytes, p.Active))
 		}
 	}
-	_, err = w.Write([]byte(fmt.Sprintf("RaftState: %s\n", s.RaftState)))
+	_, err = w.Write(fmt.Appendf(nil, "RaftState: %s\n", s.RaftState))
 	if err != nil {
 		log.Printf("monitor: error writing status: %v", err)
 		return
 	}
 
 	slices.Sort(lines)
-	for _, l := range lines {
-		_, err = w.Write([]byte(fmt.Sprintf("%s\n", l)))
+	for _, ln := range lines {
+		_, err = w.Write(fmt.Appendf(nil, "%s\n", ln))
 		if err != nil {
 			log.Printf("monitor: error writing status: %v", err)
 			return
@@ -102,32 +101,22 @@ func (m *monitor) handleSummaryStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (m *monitor) handleNetmap(w http.ResponseWriter, r *http.Request) {
-	var mask ipn.NotifyWatchOpt = ipn.NotifyInitialNetMap
-	mask |= ipn.NotifyNoPrivateKeys
 	lc, err := m.ts.LocalClient()
 	if err != nil {
 		log.Printf("monitor: error LocalClient: %v", err)
 		http.Error(w, "", http.StatusInternalServerError)
 		return
 	}
-	watcher, err := lc.WatchIPNBus(r.Context(), mask)
+	st, err := lc.Status(r.Context())
 	if err != nil {
-		log.Printf("monitor: error WatchIPNBus: %v", err)
-		http.Error(w, "", http.StatusInternalServerError)
-		return
-	}
-	defer watcher.Close()
-
-	n, err := watcher.Next()
-	if err != nil {
-		log.Printf("monitor: error watcher.Next: %v", err)
+		log.Printf("monitor: error fetching status: %v", err)
 		http.Error(w, "", http.StatusInternalServerError)
 		return
 	}
 	encoder := json.NewEncoder(w)
 	encoder.SetIndent("", "\t")
-	if err := encoder.Encode(n); err != nil {
-		log.Printf("monitor: error encoding netmap: %v", err)
+	if err := encoder.Encode(st); err != nil {
+		log.Printf("monitor: error encoding status: %v", err)
 		return
 	}
 }

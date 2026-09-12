@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package main
@@ -19,26 +19,17 @@ import (
 	"tailscale.com/tsd"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
-	"tailscale.com/types/netmap"
 	"tailscale.com/wgengine"
 	"tailscale.com/wgengine/filter"
 	"tailscale.com/wgengine/router"
 	"tailscale.com/wgengine/wgcfg"
 )
 
-func epFromTyped(eps []tailcfg.Endpoint) (ret []netip.AddrPort) {
-	for _, ep := range eps {
-		ret = append(ret, ep.Addr)
-	}
-	return
-}
-
 func setupWGTest(b *testing.B, logf logger.Logf, traf *TrafficGen, a1, a2 netip.Prefix) {
 	l1 := logger.WithPrefix(logf, "e1: ")
 	k1 := key.NewNode()
 
 	c1 := wgcfg.Config{
-		Name:       "e1",
 		PrivateKey: k1,
 		Addresses:  []netip.Prefix{a1},
 	}
@@ -53,7 +44,7 @@ func setupWGTest(b *testing.B, logf logger.Logf, traf *TrafficGen, a1, a2 netip.
 		ListenPort:    0,
 		Tun:           t1,
 		SetSubsystem:  s1.Set,
-		HealthTracker: s1.HealthTracker(),
+		HealthTracker: s1.HealthTracker.Get(),
 	})
 	if err != nil {
 		log.Fatalf("e1 init: %v", err)
@@ -65,7 +56,6 @@ func setupWGTest(b *testing.B, logf logger.Logf, traf *TrafficGen, a1, a2 netip.
 	l2 := logger.WithPrefix(logf, "e2: ")
 	k2 := key.NewNode()
 	c2 := wgcfg.Config{
-		Name:       "e2",
 		PrivateKey: k2,
 		Addresses:  []netip.Prefix{a2},
 	}
@@ -80,7 +70,7 @@ func setupWGTest(b *testing.B, logf logger.Logf, traf *TrafficGen, a1, a2 netip.
 		ListenPort:    0,
 		Tun:           t2,
 		SetSubsystem:  s2.Set,
-		HealthTracker: s2.HealthTracker(),
+		HealthTracker: s2.HealthTracker.Get(),
 	})
 	if err != nil {
 		log.Fatalf("e2 init: %v", err)
@@ -91,6 +81,29 @@ func setupWGTest(b *testing.B, logf logger.Logf, traf *TrafficGen, a1, a2 netip.
 
 	e1.SetFilter(filter.NewAllowAllForTest(l1))
 	e2.SetFilter(filter.NewAllowAllForTest(l2))
+
+	// There is no LocalBackend in this benchmark, so install trivial
+	// outbound peer lookups and per-peer config sources; without them,
+	// outbound packets can't lazily create their WireGuard peer.
+	k1pub, k2pub := k1.Public(), k2.Public()
+	e1.SetPeerByIPPacketFunc(func(dst netip.Addr) (_ key.NodePublic, ok bool) {
+		return k2pub, a2.Contains(dst)
+	})
+	e2.SetPeerByIPPacketFunc(func(dst netip.Addr) (_ key.NodePublic, ok bool) {
+		return k1pub, a1.Contains(dst)
+	})
+	e1.SetPeerConfigFunc(func(pubk key.NodePublic) (_ wgcfg.PeerConfig, ok bool) {
+		if pubk == k2pub {
+			return wgcfg.PeerConfig{AllowedIPs: []netip.Prefix{a2}}, true
+		}
+		return wgcfg.PeerConfig{}, false
+	})
+	e2.SetPeerConfigFunc(func(pubk key.NodePublic) (_ wgcfg.PeerConfig, ok bool) {
+		if pubk == k1pub {
+			return wgcfg.PeerConfig{AllowedIPs: []netip.Prefix{a1}}, true
+		}
+		return wgcfg.PeerConfig{}, false
+	})
 
 	var wait sync.WaitGroup
 	wait.Add(2)
@@ -105,24 +118,7 @@ func setupWGTest(b *testing.B, logf logger.Logf, traf *TrafficGen, a1, a2 netip.
 		}
 		logf("e1 status: %v", *st)
 
-		n := &tailcfg.Node{
-			ID:         tailcfg.NodeID(0),
-			Name:       "n1",
-			Addresses:  []netip.Prefix{a1},
-			AllowedIPs: []netip.Prefix{a1},
-			Endpoints:  epFromTyped(st.LocalAddrs),
-		}
-		e2.SetNetworkMap(&netmap.NetworkMap{
-			NodeKey:    k2.Public(),
-			PrivateKey: k2,
-			Peers:      []tailcfg.NodeView{n.View()},
-		})
-
-		p := wgcfg.Peer{
-			PublicKey:  c1.PrivateKey.Public(),
-			AllowedIPs: []netip.Prefix{a1},
-		}
-		c2.Peers = []wgcfg.Peer{p}
+		e2.SetSelfNode(tailcfg.NodeView{})
 		e2.Reconfig(&c2, &router.Config{}, new(dns.Config))
 		e1waitDoneOnce.Do(wait.Done)
 	})
@@ -137,24 +133,7 @@ func setupWGTest(b *testing.B, logf logger.Logf, traf *TrafficGen, a1, a2 netip.
 		}
 		logf("e2 status: %v", *st)
 
-		n := &tailcfg.Node{
-			ID:         tailcfg.NodeID(0),
-			Name:       "n2",
-			Addresses:  []netip.Prefix{a2},
-			AllowedIPs: []netip.Prefix{a2},
-			Endpoints:  epFromTyped(st.LocalAddrs),
-		}
-		e1.SetNetworkMap(&netmap.NetworkMap{
-			NodeKey:    k1.Public(),
-			PrivateKey: k1,
-			Peers:      []tailcfg.NodeView{n.View()},
-		})
-
-		p := wgcfg.Peer{
-			PublicKey:  c2.PrivateKey.Public(),
-			AllowedIPs: []netip.Prefix{a2},
-		}
-		c1.Peers = []wgcfg.Peer{p}
+		e1.SetSelfNode(tailcfg.NodeView{})
 		e1.Reconfig(&c1, &router.Config{}, new(dns.Config))
 		e2waitDoneOnce.Do(wait.Done)
 	})
@@ -186,16 +165,15 @@ func (t *sourceTun) Write(b [][]byte, ofs int) (int, error) {
 	return len(b), nil
 }
 
-func (t *sourceTun) Read(b [][]byte, sizes []int, ofs int) (int, error) {
-	for i, b := range b {
-		// Continually generate "input" packets
-		n := t.traf.Generate(b, ofs)
-		sizes[i] = n
-		if n == 0 {
-			return 0, io.EOF
-		}
+func (t *sourceTun) Read(slab []byte, packets []tun.ReadPacket) (int, error) {
+	// Continually generate "input" packets.
+	n := t.traf.Generate(slab, tun.ReadPacketSpacing)
+	packets[0].Size = n
+	packets[0].Offset = tun.ReadPacketSpacing
+	if n == 0 {
+		return 0, io.EOF
 	}
-	return len(b), nil
+	return 1, nil
 }
 
 type sinkTun struct {
@@ -210,7 +188,7 @@ func (t *sinkTun) Flush() error             { return nil }
 func (t *sinkTun) MTU() (int, error)        { return 1500, nil }
 func (t *sinkTun) Name() (string, error)    { return "sink", nil }
 
-func (t *sinkTun) Read(b [][]byte, sizes []int, ofs int) (int, error) {
+func (t *sinkTun) Read(slab []byte, packets []tun.ReadPacket) (int, error) {
 	// Never returns
 	select {}
 }

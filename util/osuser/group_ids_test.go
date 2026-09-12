@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package osuser
@@ -15,7 +15,9 @@ func TestParseGroupIds(t *testing.T) {
 	}{
 		{"5000\x005001\n", []string{"5000", "5001"}},
 		{"5000\n", []string{"5000"}},
-		{"\n", []string{""}},
+		{"\n", []string{}},
+		{"5000 5001 5002\n", []string{"5000", "5001", "5002"}},
+		{"5000\t5001\n", []string{"5000", "5001"}},
 	}
 	for _, test := range tests {
 		actual := parseGroupIds([]byte(test.in))

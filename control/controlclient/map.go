@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package controlclient
@@ -9,9 +9,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"maps"
 	"net"
+	"net/netip"
 	"reflect"
 	"runtime"
 	"runtime/debug"
@@ -24,11 +26,11 @@ import (
 	"tailscale.com/envknob"
 	"tailscale.com/hostinfo"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/tstime"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
-	"tailscale.com/types/ptr"
 	"tailscale.com/types/views"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/mak"
@@ -57,6 +59,9 @@ type mapSession struct {
 	altClock       tstime.Clock       // if nil, regular time is used
 	cancel         context.CancelFunc // always non-nil, shuts down caller's base long poll context
 
+	keepAliveZ        []byte // if non-nil, the learned zstd encoding of the just-KeepAlive message for this session
+	ztdDecodesForTest int    // for testing
+
 	// sessionAliveCtx is a Background-based context that's alive for the
 	// duration of the mapSession that we own the lifetime of. It's closed by
 	// sessionAliveCtxClose.
@@ -77,8 +82,7 @@ type mapSession struct {
 	// Fields storing state over the course of multiple MapResponses.
 	lastPrintMap           time.Time
 	lastNode               tailcfg.NodeView
-	lastCapSet             set.Set[tailcfg.NodeCapability]
-	peers                  map[tailcfg.NodeID]tailcfg.NodeView
+	lastCapSet             set.Set[nodecap.Cap]
 	lastDNSConfig          *tailcfg.DNSConfig
 	lastDERPMap            *tailcfg.DERPMap
 	lastUserProfile        map[tailcfg.UserID]tailcfg.UserProfileView
@@ -90,9 +94,14 @@ type mapSession struct {
 	lastDomain             string
 	lastDomainAuditLogID   string
 	lastHealth             []string
+	lastDisplayMessages    map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage
 	lastPopBrowserURL      string
 	lastTKAInfo            *tailcfg.TKAInfo
 	lastNetmapSummary      string // from NetworkMap.VeryConcise
+
+	// mu protects the peers map.
+	peersMu sync.RWMutex
+	peers   map[tailcfg.NodeID]tailcfg.NodeView
 }
 
 // newMapSession returns a mostly unconfigured new mapSession.
@@ -142,11 +151,16 @@ func (ms *mapSession) Close() {
 	ms.sessionAliveCtxClose()
 }
 
+var ErrChangeQueueClosed = errors.New("change queue closed")
+
 // HandleNonKeepAliveMapResponse handles a non-KeepAlive MapResponse (full or
 // incremental).
 //
 // All fields that are valid on a KeepAlive MapResponse have already been
 // handled.
+//
+// Debug messages are handled first, followed by pushing the response onto a
+// queue for new updates handled sequentially.
 //
 // TODO(bradfitz): make this handle all fields later. For now (2023-08-20) this
 // is [re]factoring progress enough.
@@ -156,7 +170,6 @@ func (ms *mapSession) HandleNonKeepAliveMapResponse(ctx context.Context, resp *t
 			return err
 		}
 	}
-
 	if DevKnob.StripEndpoints() {
 		for _, p := range resp.Peers {
 			p.Endpoints = nil
@@ -199,9 +212,11 @@ func (ms *mapSession) HandleNonKeepAliveMapResponse(ctx context.Context, resp *t
 	ms.updateStateFromResponse(resp)
 
 	if ms.tryHandleIncrementally(resp) {
+		metricMapResponseHandledIncrementally.Add(1)
 		ms.occasionallyPrintSummary(ms.lastNetmapSummary)
 		return nil
 	}
+	metricMapResponseHandledFullRebuild.Add(1)
 
 	// We have to rebuild the whole netmap (lots of garbage & work downstream of
 	// our UpdateFullNetmap call). This is the part we tried to avoid but
@@ -238,7 +253,7 @@ func upgradeNode(n *tailcfg.Node) {
 			if ip == tailcfg.DerpMagicIP && err == nil {
 				port, err := strconv.Atoi(portStr)
 				if err == nil {
-					n.HomeDERP = port
+					n.HomeDERP = tailcfg.DERPRegionID(port)
 				}
 			}
 		}
@@ -251,6 +266,12 @@ func upgradeNode(n *tailcfg.Node) {
 	if n.AllowedIPs == nil {
 		n.AllowedIPs = slices.Clone(n.Addresses)
 	}
+	// Unsigned peers aren't covered by tailnet lock, so a (possibly malicious)
+	// control server must not grant them network access via advertised routes.
+	// Strip any AllowedIPs beyond their own addresses.
+	if n.UnsignedPeerAPIOnly && !slices.Equal(n.AllowedIPs, n.Addresses) {
+		n.AllowedIPs = slices.Clone(n.Addresses)
+	}
 }
 
 func (ms *mapSession) tryHandleIncrementally(res *tailcfg.MapResponse) bool {
@@ -261,11 +282,76 @@ func (ms *mapSession) tryHandleIncrementally(res *tailcfg.MapResponse) bool {
 	if !ok {
 		return false
 	}
-	mutations, ok := netmap.MutationsFromMapResponse(res, time.Now())
-	if ok && len(mutations) > 0 {
+	// If the response carries a new packet filter, the updater must
+	// support pushing it narrowly; otherwise fall back to a full netmap
+	// rebuild. PacketFilter/PacketFilters are no longer in
+	// mapResponseContainsNonPatchFields, so MutationsFromMapResponse will
+	// happily return mutations alongside a filter change — we need to
+	// deliver the filter separately before those mutations land.
+	if res.PacketFilter != nil || res.PacketFilters != nil {
+		pfu, ok := ms.netmapUpdater.(PacketFilterUpdater)
+		if !ok {
+			return false
+		}
+		if !pfu.UpdatePacketFilter(ms.lastPacketFilterRules, ms.lastParsedPacketFilter) {
+			return false
+		}
+	}
+	mutations, mutationsOK := netmap.MutationsFromMapResponse(res, time.Now())
+
+	// Same shape for UserProfiles: deliver profiles before the peer
+	// mutations that may reference them, so bus consumers never see a
+	// UserID for which a profile hasn't been published.
+	//
+	// Besides the new/updated profiles carried by the response, also
+	// replay the profiles of upserted peers' users from
+	// ms.lastUserProfile. A full netmap keeps only the profiles of users
+	// with a currently visible peer (see [mapSession.addUserProfile]), so
+	// a peer returning via delta upsert can reference a user the updater
+	// has since dropped, and control (mapver 5+) does not resend
+	// unchanged profiles. Without the replay, WhoIs on the returned peer
+	// fails at the user profile lookup until the next full netmap.
+	//
+	// The values are read from ms.lastUserProfile (just populated by
+	// updateStateFromResponse) so views are shared with mapSession's
+	// store; downstream consumers can use [UserProfileView.Equal] for
+	// dedup without copying.
+	var profiles map[tailcfg.UserID]tailcfg.UserProfileView
+	addProfile := func(id tailcfg.UserID) {
+		if id == 0 {
+			return
+		}
+		if up, ok := ms.lastUserProfile[id]; ok {
+			mak.Set(&profiles, id, up)
+		}
+	}
+	for _, up := range res.UserProfiles {
+		addProfile(up.ID)
+	}
+	if mutationsOK {
+		for _, m := range mutations {
+			if up, ok := m.(netmap.NodeMutationUpsert); ok {
+				addProfile(up.Node.User())
+				addProfile(up.Node.Sharer())
+			}
+		}
+	}
+	if len(profiles) > 0 {
+		upu, ok := ms.netmapUpdater.(UserProfileUpdater)
+		if !ok {
+			return false
+		}
+		if !upu.UpdateUserProfiles(profiles) {
+			return false
+		}
+	}
+	if !mutationsOK {
+		return false
+	}
+	if len(mutations) > 0 {
 		return nud.UpdateNetmapDelta(mutations)
 	}
-	return ok
+	return true
 }
 
 // updateStats are some stats from updateStateFromResponse, primarily for
@@ -285,7 +371,7 @@ func (ms *mapSession) updateStateFromResponse(resp *tailcfg.MapResponse) {
 	if resp.Node != nil {
 		ms.lastNode = resp.Node.View()
 
-		capSet := set.Set[tailcfg.NodeCapability]{}
+		capSet := set.Set[nodecap.Cap]{}
 		for _, c := range resp.Node.Capabilities {
 			capSet.Add(c)
 		}
@@ -319,7 +405,7 @@ func (ms *mapSession) updateStateFromResponse(resp *tailcfg.MapResponse) {
 		// really the control plane should pick this. This is only a fallback.
 		if hostinfo.IsInVM86() {
 			numCanMeasure := 0
-			lowest := 0
+			var lowest tailcfg.DERPRegionID
 			for rid, r := range dm.Regions {
 				if !r.NoMeasureNoHome {
 					numCanMeasure++
@@ -412,6 +498,21 @@ func (ms *mapSession) updateStateFromResponse(resp *tailcfg.MapResponse) {
 	if resp.Health != nil {
 		ms.lastHealth = resp.Health
 	}
+	if resp.DisplayMessages != nil {
+		if v, ok := resp.DisplayMessages["*"]; ok && v == nil {
+			ms.lastDisplayMessages = nil
+		}
+		for k, v := range resp.DisplayMessages {
+			if k == "*" {
+				continue
+			}
+			if v != nil {
+				mak.Set(&ms.lastDisplayMessages, k, *v)
+			} else {
+				delete(ms.lastDisplayMessages, k)
+			}
+		}
+	}
 	if resp.TKAInfo != nil {
 		ms.lastTKAInfo = resp.TKAInfo
 	}
@@ -431,11 +532,25 @@ var (
 
 	patchifiedPeer      = clientmetric.NewCounter("controlclient_patchified_peer")
 	patchifiedPeerEqual = clientmetric.NewCounter("controlclient_patchified_peer_equal")
+
+	// metricMapResponseHandledIncrementally counts non-keepalive MapResponses
+	// that were processed via [mapSession.tryHandleIncrementally] (i.e. the
+	// "fast" delta path that avoids rebuilding the full netmap).
+	metricMapResponseHandledIncrementally = clientmetric.NewCounter("controlclient_map_response_handled_incrementally")
+
+	// metricMapResponseHandledFullRebuild counts non-keepalive MapResponses
+	// that fell through to the full netmap rebuild path because they
+	// carried a field that the incremental path can't handle. See
+	// [netmap.mapResponseContainsNonPatchFields].
+	metricMapResponseHandledFullRebuild = clientmetric.NewCounter("controlclient_map_response_handled_full_rebuild")
 )
 
 // updatePeersStateFromResponseres updates ms.peers from resp.
 // It takes ownership of resp.
 func (ms *mapSession) updatePeersStateFromResponse(resp *tailcfg.MapResponse) (stats updateStats) {
+	ms.peersMu.Lock()
+	defer ms.peersMu.Unlock()
+
 	if ms.peers == nil {
 		ms.peers = make(map[tailcfg.NodeID]tailcfg.NodeView)
 	}
@@ -485,7 +600,7 @@ func (ms *mapSession) updatePeersStateFromResponse(resp *tailcfg.MapResponse) (s
 		if vp, ok := ms.peers[nodeID]; ok {
 			mut := vp.AsStruct()
 			if seen {
-				mut.LastSeen = ptr.To(clock.Now())
+				mut.LastSeen = new(clock.Now())
 			} else {
 				mut.LastSeen = nil
 			}
@@ -497,7 +612,7 @@ func (ms *mapSession) updatePeersStateFromResponse(resp *tailcfg.MapResponse) (s
 	for nodeID, online := range resp.OnlineChange {
 		if vp, ok := ms.peers[nodeID]; ok {
 			mut := vp.AsStruct()
-			mut.Online = ptr.To(online)
+			mut.Online = new(online)
 			ms.peers[nodeID] = mut.View()
 			stats.changed++
 		}
@@ -531,11 +646,11 @@ func (ms *mapSession) updatePeersStateFromResponse(resp *tailcfg.MapResponse) (s
 			patchDiscoKey.Add(1)
 		}
 		if v := pc.Online; v != nil {
-			mut.Online = ptr.To(*v)
+			mut.Online = new(*v)
 			patchOnline.Add(1)
 		}
 		if v := pc.LastSeen; v != nil {
-			mut.LastSeen = ptr.To(*v)
+			mut.LastSeen = new(*v)
 			patchLastSeen.Add(1)
 		}
 		if v := pc.KeyExpiry; v != nil {
@@ -570,13 +685,22 @@ func (ms *mapSession) addUserProfile(nm *netmap.NetworkMap, userID tailcfg.UserI
 }
 
 var debugPatchifyPeer = envknob.RegisterBool("TS_DEBUG_PATCHIFY_PEER")
+var debugPatchifyPeerMiss = envknob.RegisterBool("TS_DEBUG_PATCHIFY_PEER_MISS")
+
+// patchifyMissOnFalse, if non-nil, is called with the field name when
+// patchifyPeer fails. It is set by an init func in map_debug.go.
+var patchifyMissOnFalse func(string)
 
 // patchifyPeersChanged mutates resp to promote PeersChanged entries to PeersChangedPatch
 // when possible.
 func (ms *mapSession) patchifyPeersChanged(resp *tailcfg.MapResponse) {
+	var onFalse func(string)
+	if debugPatchifyPeerMiss() {
+		onFalse = patchifyMissOnFalse
+	}
 	filtered := resp.PeersChanged[:0]
 	for _, n := range resp.PeersChanged {
-		if p, ok := ms.patchifyPeer(n); ok {
+		if p, ok := ms.patchifyPeer(n, onFalse); ok {
 			patchifiedPeer.Add(1)
 			if debugPatchifyPeer() {
 				patchj, _ := json.Marshal(p)
@@ -599,12 +723,12 @@ func (ms *mapSession) patchifyPeersChanged(resp *tailcfg.MapResponse) {
 
 var nodeFields = sync.OnceValue(getNodeFields)
 
-// getNodeFields returns the fails of tailcfg.Node.
+// getNodeFields returns the fields of tailcfg.Node.
 func getNodeFields() []string {
 	rt := reflect.TypeFor[tailcfg.Node]()
-	ret := make([]string, rt.NumField())
-	for i := range rt.NumField() {
-		ret[i] = rt.Field(i).Name
+	ret := make([]string, 0, rt.NumField())
+	for f := range rt.Fields() {
+		ret = append(ret, f.Name)
 	}
 	return ret
 }
@@ -614,18 +738,27 @@ func getNodeFields() []string {
 //
 // It returns ok=false if a patch can't be made, (V, ok) on a delta, or (nil,
 // true) if all the fields were identical (a zero change).
-func (ms *mapSession) patchifyPeer(n *tailcfg.Node) (_ *tailcfg.PeerChange, ok bool) {
+func (ms *mapSession) patchifyPeer(n *tailcfg.Node, onFalse func(string)) (_ *tailcfg.PeerChange, ok bool) {
+	ms.peersMu.RLock()
+	defer ms.peersMu.RUnlock()
+
 	was, ok := ms.peers[n.ID]
 	if !ok {
+		if onFalse != nil {
+			onFalse("peer_not_found")
+		}
 		return nil, false
 	}
-	return peerChangeDiff(was, n)
+	return peerChangeDiff(was, n, onFalse)
 }
 
 // peerChangeDiff returns the difference from 'was' to 'n', if possible.
 //
 // It returns (nil, true) if the fields were identical.
-func peerChangeDiff(was tailcfg.NodeView, n *tailcfg.Node) (_ *tailcfg.PeerChange, ok bool) {
+func peerChangeDiff(was tailcfg.NodeView, n *tailcfg.Node, onFalse func(string)) (_ *tailcfg.PeerChange, ok bool) {
+	if onFalse == nil {
+		onFalse = func(string) {}
+	}
 	var ret *tailcfg.PeerChange
 	pc := func() *tailcfg.PeerChange {
 		if ret == nil {
@@ -649,31 +782,36 @@ func peerChangeDiff(was tailcfg.NodeView, n *tailcfg.Node) (_ *tailcfg.PeerChang
 			// And it was never sent by any known control server.
 		case "ID":
 			if was.ID() != n.ID {
+				onFalse(field)
 				return nil, false
 			}
 		case "StableID":
 			if was.StableID() != n.StableID {
+				onFalse(field)
 				return nil, false
 			}
 		case "Name":
 			if was.Name() != n.Name {
+				onFalse(field)
 				return nil, false
 			}
 		case "User":
 			if was.User() != n.User {
+				onFalse(field)
 				return nil, false
 			}
 		case "Sharer":
 			if was.Sharer() != n.Sharer {
+				onFalse(field)
 				return nil, false
 			}
 		case "Key":
 			if was.Key() != n.Key {
-				pc().Key = ptr.To(n.Key)
+				pc().Key = new(n.Key)
 			}
 		case "KeyExpiry":
 			if !was.KeyExpiry().Equal(n.KeyExpiry) {
-				pc().KeyExpiry = ptr.To(n.KeyExpiry)
+				pc().KeyExpiry = new(n.KeyExpiry)
 			}
 		case "KeySignature":
 			if !was.KeySignature().Equal(n.KeySignature) {
@@ -681,18 +819,21 @@ func peerChangeDiff(was tailcfg.NodeView, n *tailcfg.Node) (_ *tailcfg.PeerChang
 			}
 		case "Machine":
 			if was.Machine() != n.Machine {
+				onFalse(field)
 				return nil, false
 			}
 		case "DiscoKey":
 			if was.DiscoKey() != n.DiscoKey {
-				pc().DiscoKey = ptr.To(n.DiscoKey)
+				pc().DiscoKey = new(n.DiscoKey)
 			}
 		case "Addresses":
 			if !views.SliceEqual(was.Addresses(), views.SliceOf(n.Addresses)) {
+				onFalse(field)
 				return nil, false
 			}
 		case "AllowedIPs":
 			if !views.SliceEqual(was.AllowedIPs(), views.SliceOf(n.AllowedIPs)) {
+				onFalse(field)
 				return nil, false
 			}
 		case "Endpoints":
@@ -712,13 +853,16 @@ func peerChangeDiff(was tailcfg.NodeView, n *tailcfg.Node) (_ *tailcfg.PeerChang
 				continue
 			}
 			if !was.Hostinfo().Valid() || !n.Hostinfo.Valid() {
+				onFalse(field)
 				return nil, false
 			}
 			if !was.Hostinfo().Equal(n.Hostinfo) {
+				onFalse(field)
 				return nil, false
 			}
 		case "Created":
 			if !was.Created().Equal(n.Created) {
+				onFalse(field)
 				return nil, false
 			}
 		case "Cap":
@@ -746,38 +890,45 @@ func peerChangeDiff(was tailcfg.NodeView, n *tailcfg.Node) (_ *tailcfg.PeerChang
 			}
 		case "Tags":
 			if !views.SliceEqual(was.Tags(), views.SliceOf(n.Tags)) {
+				onFalse(field)
 				return nil, false
 			}
 		case "PrimaryRoutes":
 			if !views.SliceEqual(was.PrimaryRoutes(), views.SliceOf(n.PrimaryRoutes)) {
+				onFalse(field)
 				return nil, false
 			}
 		case "Online":
 			if wasOnline, ok := was.Online().GetOk(); ok && n.Online != nil && *n.Online != wasOnline {
-				pc().Online = ptr.To(*n.Online)
+				pc().Online = new(*n.Online)
 			}
 		case "LastSeen":
 			if wasSeen, ok := was.LastSeen().GetOk(); ok && n.LastSeen != nil && !wasSeen.Equal(*n.LastSeen) {
-				pc().LastSeen = ptr.To(*n.LastSeen)
+				pc().LastSeen = new(*n.LastSeen)
 			}
 		case "MachineAuthorized":
 			if was.MachineAuthorized() != n.MachineAuthorized {
+				onFalse(field)
 				return nil, false
 			}
 		case "UnsignedPeerAPIOnly":
 			if was.UnsignedPeerAPIOnly() != n.UnsignedPeerAPIOnly {
+				onFalse(field)
 				return nil, false
 			}
 		case "IsWireGuardOnly":
 			if was.IsWireGuardOnly() != n.IsWireGuardOnly {
+				onFalse(field)
 				return nil, false
 			}
 		case "IsJailed":
 			if was.IsJailed() != n.IsJailed {
+				onFalse(field)
 				return nil, false
 			}
 		case "Expired":
 			if was.Expired() != n.Expired {
+				onFalse(field)
 				return nil, false
 			}
 		case "SelfNodeV4MasqAddrForThisPeer":
@@ -786,6 +937,7 @@ func peerChangeDiff(was tailcfg.NodeView, n *tailcfg.Node) (_ *tailcfg.PeerChang
 				continue
 			}
 			if va, ok := va.GetOk(); !ok || vb == nil || va != *vb {
+				onFalse(field)
 				return nil, false
 			}
 		case "SelfNodeV6MasqAddrForThisPeer":
@@ -794,17 +946,20 @@ func peerChangeDiff(was tailcfg.NodeView, n *tailcfg.Node) (_ *tailcfg.PeerChang
 				continue
 			}
 			if va, ok := va.GetOk(); !ok || vb == nil || va != *vb {
+				onFalse(field)
 				return nil, false
 			}
 		case "ExitNodeDNSResolvers":
 			va, vb := was.ExitNodeDNSResolvers(), views.SliceOfViews(n.ExitNodeDNSResolvers)
 
 			if va.Len() != vb.Len() {
+				onFalse(field)
 				return nil, false
 			}
 
 			for i := range va.Len() {
 				if !va.At(i).Equal(vb.At(i)) {
+					onFalse(field)
 					return nil, false
 				}
 			}
@@ -817,7 +972,28 @@ func peerChangeDiff(was tailcfg.NodeView, n *tailcfg.Node) (_ *tailcfg.PeerChang
 	return ret, true
 }
 
+// PeerIDAndKeyByTailscaleIP returns the node ID and node Key from the peers
+// map without touching the netmap itself. The implementation mirrors the
+// implementation of [netmap.PeerByTailscaleIP].
+func (ms *mapSession) PeerIDAndKeyByTailscaleIP(ip netip.Addr) (tailcfg.NodeID, key.NodePublic, bool) {
+	ms.peersMu.RLock()
+	defer ms.peersMu.RUnlock()
+	for _, n := range ms.peers {
+		ad := n.Addresses()
+		for i := range ad.Len() {
+			a := ad.At(i)
+			if a.Addr() == ip {
+				return n.ID(), n.Key(), true
+			}
+		}
+	}
+	return 0, key.NodePublic{}, false
+}
+
 func (ms *mapSession) sortedPeers() []tailcfg.NodeView {
+	ms.peersMu.RLock()
+	defer ms.peersMu.RUnlock()
+
 	ret := slicesx.MapValues(ms.peers)
 	slices.SortFunc(ret, func(a, b tailcfg.NodeView) int {
 		return cmp.Compare(a.ID(), b.ID())
@@ -831,19 +1007,23 @@ func (ms *mapSession) sortedPeers() []tailcfg.NodeView {
 func (ms *mapSession) netmap() *netmap.NetworkMap {
 	peerViews := ms.sortedPeers()
 
-	// Convert all ms.lastHealth to the new [netmap.NetworkMap.DisplayMessages].
 	var msgs map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage
-	for _, h := range ms.lastHealth {
-		mak.Set(&msgs, tailcfg.DisplayMessageID("control-health-"+strhash(h)), tailcfg.DisplayMessage{
-			Title:    "Coordination server reports an issue",
-			Severity: tailcfg.SeverityMedium,
-			Text:     "The coordination server is reporting a health issue: " + h,
-		})
+	if len(ms.lastDisplayMessages) != 0 {
+		msgs = ms.lastDisplayMessages
+	} else if len(ms.lastHealth) > 0 {
+		// Convert all ms.lastHealth to the new [netmap.NetworkMap.DisplayMessages]
+		for _, h := range ms.lastHealth {
+			id := "health-" + strhash(h) // Unique ID in case there is more than one health message
+			mak.Set(&msgs, tailcfg.DisplayMessageID(id), tailcfg.DisplayMessage{
+				Title:    "Coordination server reports an issue",
+				Severity: tailcfg.SeverityMedium,
+				Text:     "The coordination server is reporting a health issue: " + h,
+			})
+		}
 	}
 
 	nm := &netmap.NetworkMap{
 		NodeKey:           ms.publicNodeKey,
-		PrivateKey:        ms.privateNodeKey,
 		MachineKey:        ms.machinePubKey,
 		Peers:             peerViews,
 		UserProfiles:      make(map[tailcfg.UserID]tailcfg.UserProfileView),
@@ -868,8 +1048,6 @@ func (ms *mapSession) netmap() *netmap.NetworkMap {
 
 	if node := ms.lastNode; node.Valid() {
 		nm.SelfNode = node
-		nm.Expiry = node.KeyExpiry()
-		nm.Name = node.Name()
 		nm.AllCaps = ms.lastCapSet
 	}
 

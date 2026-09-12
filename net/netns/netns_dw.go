@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build darwin || windows
@@ -24,4 +24,8 @@ func parseAddress(address string) (addr netip.Addr, err error) {
 	}
 
 	return netip.ParseAddr(host)
+}
+
+func UseSocketMark() bool {
+	return false
 }

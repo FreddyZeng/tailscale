@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package tstest
@@ -17,8 +17,14 @@ import (
 type ClockOpts struct {
 	// Start is the starting time for the Clock. When FollowRealTime is false,
 	// Start is also the value that will be returned by the first call
-	// to Clock.Now.
+	// to Clock.Now. If you are passing a value here, set an explicit
+	// timezone, otherwise the test may be non-deterministic when TZ environment
+	// variable is set to different values. The default time is in UTC.
+	//
+	// If you do not pass an explicit Start time, the clock will start at the
+	// current UTC time.
 	Start time.Time
+
 	// Step is the amount of time the Clock will advance whenever Clock.Now is
 	// called. If set to zero, the Clock will only advance when Clock.Advance is
 	// called and/or if FollowRealTime is true.
@@ -119,7 +125,7 @@ func (c *Clock) init() {
 		}
 		if c.start.IsZero() {
 			if c.realTime.IsZero() {
-				c.start = time.Now()
+				c.start = time.Now().UTC()
 			} else {
 				c.start = c.realTime
 			}
@@ -334,8 +340,15 @@ type eventManager struct {
 	// timer triggers.
 	clock tstime.Clock
 
-	mu            sync.Mutex
-	now           time.Time
+	mu  sync.Mutex
+	now time.Time
+
+	// advanceTo is the target time of the in-progress processEventsLocked
+	// call. Event handlers fired during that call may read it (they run
+	// with mu held) to coalesce work that would otherwise repeat once per
+	// period between now and advanceTo.
+	advanceTo time.Time
+
 	heap          []*event
 	reverseLookup map[eventHandler]*event
 
@@ -462,6 +475,7 @@ func (em *eventManager) Now() time.Time {
 }
 
 func (em *eventManager) processEventsLocked(tm time.Time) {
+	em.advanceTo = tm
 	for len(em.heap) > 0 && !em.heap[0].when.After(tm) {
 		// Ideally some jitter would be added here but it's difficult to do so
 		// in a deterministic fashion.
@@ -542,11 +556,24 @@ func (t *Ticker) Fire(curTime time.Time) time.Time {
 	if t.nextTrigger.IsZero() {
 		return time.Time{}
 	}
+	sent := false
 	select {
 	case t.c <- curTime:
+		sent = true
 	default:
 	}
 	t.nextTrigger = t.nextTrigger.Add(t.period)
+	// If the channel is full and the clock is being advanced far past this
+	// ticker's next trigger, the intermediate ticks would all be dropped
+	// anyway, so skip them in one step rather than firing once per period.
+	// This keeps ticks aligned to the original schedule and still fires the
+	// final tick at or before the advance target.
+	if !sent {
+		if target := t.em.advanceTo; t.nextTrigger.Before(target) {
+			skipped := target.Sub(t.nextTrigger) / t.period
+			t.nextTrigger = t.nextTrigger.Add(skipped * t.period)
+		}
+	}
 
 	return t.nextTrigger
 }

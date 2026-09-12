@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // TSMP is our ICMP-like "Tailscale Message Protocol" for signaling
@@ -15,9 +15,12 @@ import (
 	"fmt"
 	"net/netip"
 
-	"tailscale.com/net/flowtrack"
+	"go4.org/mem"
 	"tailscale.com/types/ipproto"
+	"tailscale.com/types/key"
 )
+
+const minTSMPSize = 7 // the rejected body is 7 bytes
 
 // TailscaleRejectedHeader is a TSMP message that says that one
 // Tailscale node has rejected the connection from another. Unlike a
@@ -26,7 +29,7 @@ import (
 // On the wire, after the IP header, it's currently 7 or 8 bytes:
 //   - '!'
 //   - IPProto byte (IANA protocol number: TCP or UDP)
-//   - 'A' or 'S' (RejectedDueToACLs, RejectedDueToShieldsUp)
+//   - byte stating rejection reason (see [TailscaleRejectReason] for valid values)
 //   - srcPort big endian uint16
 //   - dstPort big endian uint16
 //   - [optional] byte of flag bits:
@@ -56,25 +59,25 @@ type TailscaleRejectedHeader struct {
 
 const rejectFlagBitMaybeBroken = 0x1
 
-func (rh TailscaleRejectedHeader) Flow() flowtrack.Tuple {
-	return flowtrack.MakeTuple(rh.Proto, rh.Src, rh.Dst)
-}
-
 func (rh TailscaleRejectedHeader) String() string {
 	return fmt.Sprintf("TSMP-reject-flow{%s %s > %s}: %s", rh.Proto, rh.Src, rh.Dst, rh.Reason)
 }
 
+// TSMPType is the type byte of a TSMP message. It follows the IPv4 or IPv6 header.
 type TSMPType uint8
 
 const (
-	// TSMPTypeRejectedConn is the type byte for a TailscaleRejectedHeader.
+	// TSMPTypeRejectedConn is the type byte for a [TailscaleRejectedHeader].
 	TSMPTypeRejectedConn TSMPType = '!'
 
-	// TSMPTypePing is the type byte for a TailscalePingRequest.
+	// TSMPTypePing is the type byte for a [TSMPPingRequest].
 	TSMPTypePing TSMPType = 'p'
 
-	// TSMPTypePong is the type byte for a TailscalePongResponse.
+	// TSMPTypePong is the type byte for a [TSMPPongReply].
 	TSMPTypePong TSMPType = 'o'
+
+	// TSMPTypeDiscoAdvertisement is the type byte for a [TSMPDiscoKeyAdvertisement].
+	TSMPTypeDiscoAdvertisement TSMPType = 'a'
 )
 
 type TailscaleRejectReason byte
@@ -99,6 +102,11 @@ const (
 	// RejectedDueToHostFirewall means that the target host's
 	// firewall is blocking the traffic.
 	RejectedDueToHostFirewall TailscaleRejectReason = 'W'
+
+	// RejectedDueToUnknownAppConnectorTransitIP means that the connector host has no real IP
+	// mapping that matches the provided transit IP for this client, so the
+	// connector has no destination to forward the connection to.
+	RejectedDueToUnknownAppConnectorTransitIP TailscaleRejectReason = 'T'
 )
 
 func (r TailscaleRejectReason) String() string {
@@ -111,6 +119,8 @@ func (r TailscaleRejectReason) String() string {
 		return "host-ip-forwarding-unavailable"
 	case RejectedDueToHostFirewall:
 		return "host-firewall"
+	case RejectedDueToUnknownAppConnectorTransitIP:
+		return "app-connector-transit-ip-unknown"
 	}
 	return fmt.Sprintf("0x%02x", byte(r))
 }
@@ -261,4 +271,61 @@ func (h TSMPPongReply) Marshal(buf []byte) error {
 	copy(buf[1:], h.Data[:])
 	binary.BigEndian.PutUint16(buf[9:11], h.PeerAPIPort)
 	return nil
+}
+
+// TSMPDiscoKeyAdvertisement is a TSMP message that's used for distributing
+// [key.DiscoPublic]. It is sent immediately following eligible WireGuard
+// session establishment starting at [tailscale.com/tailcfg.CapabilityVersion] 144.
+//
+// On the wire, after the IP header, it's currently 33 bytes:
+//   - 'a' (TSMPTypeDiscoAdvertisement)
+//   - 32 disco key bytes
+type TSMPDiscoKeyAdvertisement struct {
+	Src, Dst netip.Addr // Src and Dst are set from the parent IP Header when parsing.
+	Key      key.DiscoPublic
+}
+
+// Marshal marshals ka to a wire representation appropriate for transmission
+// over WireGuard to a remote client. A marshaled [TSMPDiscoKeyAdvertisement]
+// must not exceed [github.com/tailscale/wireguard-go/device.MaxPriorityMessageContentSize],
+// or wireguard-go will reject and discard the payload.
+func (ka *TSMPDiscoKeyAdvertisement) Marshal() ([]byte, error) {
+	var iph Header
+	if ka.Src.Is4() {
+		iph = IP4Header{
+			IPProto: ipproto.TSMP,
+			Src:     ka.Src,
+			Dst:     ka.Dst,
+		}
+	} else {
+		iph = IP6Header{
+			IPProto: ipproto.TSMP,
+			Src:     ka.Src,
+			Dst:     ka.Dst,
+		}
+	}
+	payload := make([]byte, 0, 1+key.DiscoPublicRawLen)
+	payload = append(payload, byte(TSMPTypeDiscoAdvertisement))
+	payload = ka.Key.AppendTo(payload)
+	if len(payload) != 33 {
+		// Mostly to safeguard against ourselves changing this in the future.
+		return []byte{}, fmt.Errorf("expected payload length 33, got %d", len(payload))
+	}
+
+	return Generate(iph, payload[:]), nil
+}
+
+func (pp *Parsed) AsTSMPDiscoAdvertisement() (tka TSMPDiscoKeyAdvertisement, ok bool) {
+	if pp.IPProto != ipproto.TSMP {
+		return
+	}
+	p := pp.Payload()
+	if len(p) < 33 || p[0] != byte(TSMPTypeDiscoAdvertisement) {
+		return
+	}
+	tka.Src = pp.Src.Addr()
+	tka.Dst = pp.Dst.Addr()
+	tka.Key = key.DiscoPublicFromRaw32(mem.B(p[1:33]))
+
+	return tka, true
 }

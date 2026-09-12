@@ -1,12 +1,17 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package words
 
 import (
+	"slices"
 	"strings"
 	"testing"
 )
+
+var nopes = []string{
+	"chub", "bangus", "hellbender",
+}
 
 func TestWords(t *testing.T) {
 	test := func(t *testing.T, words []string) {
@@ -22,6 +27,9 @@ func TestWords(t *testing.T) {
 			seen[w] = true
 			if w == "" || strings.IndexFunc(w, nonASCIILower) != -1 {
 				t.Errorf("malformed word %q", w)
+			}
+			if slices.Contains(nopes, w) {
+				t.Errorf("word %q has been previously rejected/removed and should not be added", w)
 			}
 		}
 	}

@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !plan9
@@ -15,6 +15,7 @@ import (
 	"go.uber.org/zap"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/peercap"
 	"tailscale.com/util/must"
 )
 
@@ -51,7 +52,7 @@ func TestImpersonationHeaders(t *testing.T) {
 			name:     "user-with-cap",
 			emailish: "foo@example.com",
 			capMap: tailcfg.PeerCapMap{
-				tailcfg.PeerCapabilityKubernetes: {
+				peercap.Kubernetes: {
 					tailcfg.RawMessage(`{"impersonate":{"groups":["group1","group2"]}}`),
 					tailcfg.RawMessage(`{"impersonate":{"groups":["group1","group3"]}}`), // One group is duplicated.
 					tailcfg.RawMessage(`{"impersonate":{"groups":["group4"]}}`),
@@ -73,7 +74,7 @@ func TestImpersonationHeaders(t *testing.T) {
 			emailish: "tagged-device",
 			tags:     []string{"tag:foo", "tag:bar"},
 			capMap: tailcfg.PeerCapMap{
-				tailcfg.PeerCapabilityKubernetes: {
+				peercap.Kubernetes: {
 					tailcfg.RawMessage(`{"impersonate":{"groups":["group1"]}}`),
 				},
 			},
@@ -87,7 +88,7 @@ func TestImpersonationHeaders(t *testing.T) {
 			emailish: "tagged-device",
 			tags:     []string{"tag:foo", "tag:bar"},
 			capMap: tailcfg.PeerCapMap{
-				tailcfg.PeerCapabilityKubernetes: {
+				peercap.Kubernetes: {
 					tailcfg.RawMessage(`{"impersonate":{"groups":["group1"]},"recorder":["tag:foo"],"enforceRecorder":true}`),
 				},
 			},
@@ -101,7 +102,7 @@ func TestImpersonationHeaders(t *testing.T) {
 			emailish: "tagged-device",
 			tags:     []string{"tag:foo", "tag:bar"},
 			capMap: tailcfg.PeerCapMap{
-				tailcfg.PeerCapabilityKubernetes: {
+				peercap.Kubernetes: {
 					tailcfg.RawMessage(`[]`),
 				},
 			},
@@ -139,18 +140,18 @@ func Test_determineRecorderConfig(t *testing.T) {
 	}{
 		{
 			name:                  "two_ips_fail_closed",
-			who:                   whoResp(map[string][]string{string(tailcfg.PeerCapabilityKubernetes): {`{"recorderAddrs":["[fd7a:115c:a1e0:ab12:4843:cd96:626b:628b]:80","100.99.99.99:80"],"enforceRecorder":true}`}}),
+			who:                   whoResp(map[string][]string{string(peercap.Kubernetes): {`{"recorderAddrs":["[fd7a:115c:a1e0:ab12:4843:cd96:626b:628b]:80","100.99.99.99:80"],"enforceRecorder":true}`}}),
 			wantRecorderAddresses: []netip.AddrPort{addr1, addr2},
 		},
 		{
 			name:                  "two_ips_fail_open",
-			who:                   whoResp(map[string][]string{string(tailcfg.PeerCapabilityKubernetes): {`{"recorderAddrs":["[fd7a:115c:a1e0:ab12:4843:cd96:626b:628b]:80","100.99.99.99:80"]}`}}),
+			who:                   whoResp(map[string][]string{string(peercap.Kubernetes): {`{"recorderAddrs":["[fd7a:115c:a1e0:ab12:4843:cd96:626b:628b]:80","100.99.99.99:80"]}`}}),
 			wantRecorderAddresses: []netip.AddrPort{addr1, addr2},
 			wantFailOpen:          true,
 		},
 		{
 			name:                  "odd_rule_combination_fail_closed",
-			who:                   whoResp(map[string][]string{string(tailcfg.PeerCapabilityKubernetes): {`{"recorderAddrs":["100.99.99.99:80"],"enforceRecorder":false}`, `{"recorderAddrs":["[fd7a:115c:a1e0:ab12:4843:cd96:626b:628b]:80"]}`, `{"enforceRecorder":true,"impersonate":{"groups":["system:masters"]}}`}}),
+			who:                   whoResp(map[string][]string{string(peercap.Kubernetes): {`{"recorderAddrs":["100.99.99.99:80"],"enforceRecorder":false}`, `{"recorderAddrs":["[fd7a:115c:a1e0:ab12:4843:cd96:626b:628b]:80"]}`, `{"enforceRecorder":true,"impersonate":{"groups":["system:masters"]}}`}}),
 			wantRecorderAddresses: []netip.AddrPort{addr2, addr1},
 		},
 		{
@@ -160,21 +161,21 @@ func Test_determineRecorderConfig(t *testing.T) {
 		},
 		{
 			name:         "no_recorder_caps",
-			who:          whoResp(map[string][]string{"foo": {`{"x":"y"}`}, string(tailcfg.PeerCapabilityKubernetes): {`{"impersonate":{"groups":["system:masters"]}}`}}),
+			who:          whoResp(map[string][]string{"foo": {`{"x":"y"}`}, string(peercap.Kubernetes): {`{"impersonate":{"groups":["system:masters"]}}`}}),
 			wantFailOpen: true,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotFailOpen, gotRecorderAddresses, err := determineRecorderConfig(tt.who)
+			c, err := determineRecorderConfig(tt.who)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if gotFailOpen != tt.wantFailOpen {
-				t.Errorf("determineRecorderConfig() gotFailOpen = %v, want %v", gotFailOpen, tt.wantFailOpen)
+			if c.failOpen != tt.wantFailOpen {
+				t.Errorf("determineRecorderConfig() gotFailOpen = %v, want %v", c.failOpen, tt.wantFailOpen)
 			}
-			if !reflect.DeepEqual(gotRecorderAddresses, tt.wantRecorderAddresses) {
-				t.Errorf("determineRecorderConfig() gotRecorderAddresses = %v, want %v", gotRecorderAddresses, tt.wantRecorderAddresses)
+			if !reflect.DeepEqual(c.recorderAddresses, tt.wantRecorderAddresses) {
+				t.Errorf("determineRecorderConfig() gotRecorderAddresses = %v, want %v", c.recorderAddresses, tt.wantRecorderAddresses)
 			}
 		})
 	}
@@ -185,7 +186,7 @@ func whoResp(capMap map[string][]string) *apitype.WhoIsResponse {
 		CapMap: tailcfg.PeerCapMap{},
 	}
 	for cap, rules := range capMap {
-		resp.CapMap[tailcfg.PeerCapability(cap)] = raw(rules...)
+		resp.CapMap[peercap.Cap(cap)] = raw(rules...)
 	}
 	return resp
 }

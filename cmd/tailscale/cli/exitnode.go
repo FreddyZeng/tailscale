@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package cli
@@ -16,8 +16,10 @@ import (
 	"github.com/kballard/go-shellquote"
 	"github.com/peterbourgon/ff/v3/ffcli"
 	"tailscale.com/envknob"
+	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/util/slicesx"
 )
 
@@ -43,6 +45,13 @@ func exitNodeCmd() *ffcli.Command {
 				ShortUsage: "tailscale exit-node suggest",
 				ShortHelp:  "Suggest the best available exit node",
 				Exec:       runExitNodeSuggest,
+				FlagSet: (func() *flag.FlagSet {
+					fs := newFlagSet("suggest")
+					if buildfeatures.HasRouteCheck {
+						fs.BoolVar(&exitNodeArgs.probe, "force-probe", false, hidden+"perform a routecheck probe before suggesting")
+					}
+					return fs
+				})(),
 			}},
 			(func() []*ffcli.Command {
 				if !envknob.UseWIPCode() {
@@ -68,6 +77,7 @@ func exitNodeCmd() *ffcli.Command {
 
 var exitNodeArgs struct {
 	filter string
+	probe  bool
 }
 
 func exitNodeSetUse(wantOn bool) func(ctx context.Context, args []string) error {
@@ -131,14 +141,14 @@ func runExitNodeList(ctx context.Context, args []string) error {
 	for _, country := range filteredPeers.Countries {
 		for _, city := range country.Cities {
 			for _, peer := range city.Peers {
-				fmt.Fprintf(w, "\n %s\t%s\t%s\t%s\t%s\t", peer.TailscaleIPs[0], strings.Trim(peer.DNSName, "."), country.Name, city.Name, peerStatus(peer))
+				fmt.Fprintf(w, "\n %s\t%s\t%s\t%s\t%s\t", peer.TailscaleIPs[0], strings.Trim(peer.DNSName, "."), cmp.Or(country.Name, "-"), cmp.Or(city.Name, "-"), peerStatus(peer))
 			}
 		}
 	}
 	fmt.Fprintln(w)
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "# To view the complete list of exit nodes for a country, use `tailscale exit-node list --filter=` followed by the country name.")
-	fmt.Fprintln(w, "# To use an exit node, use `tailscale set --exit-node=` followed by the hostname or IP.")
+	fmt.Fprintln(w, "# To use an exit node, use `tailscale set --exit-node=` followed by the IP or hostname.")
 	if hasAnyExitNodeSuggestions(peers) {
 		fmt.Fprintln(w, "# To have Tailscale suggest an exit node, use `tailscale exit-node suggest`.")
 	}
@@ -148,7 +158,11 @@ func runExitNodeList(ctx context.Context, args []string) error {
 // runExitNodeSuggest returns a suggested exit node ID to connect to and shows the chosen exit node tailcfg.StableNodeID.
 // If there are no derp based exit nodes to choose from or there is a failure in finding a suggestion, the command will return an error indicating so.
 func runExitNodeSuggest(ctx context.Context, args []string) error {
-	res, err := localClient.SuggestExitNode(ctx)
+	suggestExitNode := localClient.SuggestExitNode
+	if exitNodeArgs.probe {
+		suggestExitNode = localClient.SuggestExitNodeWithProbe
+	}
+	res, err := suggestExitNode(ctx)
 	if err != nil {
 		return fmt.Errorf("suggest exit node: %w", err)
 	}
@@ -162,7 +176,7 @@ func runExitNodeSuggest(ctx context.Context, args []string) error {
 
 func hasAnyExitNodeSuggestions(peers []*ipnstate.PeerStatus) bool {
 	for _, peer := range peers {
-		if peer.HasCap(tailcfg.NodeAttrSuggestExitNode) {
+		if peer.HasCap(nodecap.SuggestExitNode) {
 			return true
 		}
 	}
@@ -173,11 +187,13 @@ func hasAnyExitNodeSuggestions(peers []*ipnstate.PeerStatus) bool {
 // a peer. If there is no notable state, a - is returned.
 func peerStatus(peer *ipnstate.PeerStatus) string {
 	if !peer.Active {
+		lastseen := lastSeenFmt(peer.LastSeen)
+
 		if peer.ExitNode {
-			return "selected but offline"
+			return "selected but offline" + lastseen
 		}
 		if !peer.Online {
-			return "offline"
+			return "offline" + lastseen
 		}
 	}
 
@@ -202,23 +218,16 @@ type filteredCity struct {
 	Peers []*ipnstate.PeerStatus
 }
 
-const noLocationData = "-"
-
-var noLocation = &tailcfg.Location{
-	Country:     noLocationData,
-	CountryCode: noLocationData,
-	City:        noLocationData,
-	CityCode:    noLocationData,
-}
-
 // filterFormatAndSortExitNodes filters and sorts exit nodes into
 // alphabetical order, by country, city and then by priority if
 // present.
+//
 // If an exit node has location data, and the country has more than
 // one city, an `Any` city is added to the country that contains the
 // highest priority exit node within that country.
+//
 // For exit nodes without location data, their country fields are
-// defined as '-' to indicate that the data is not available.
+// defined as the empty string to indicate that the data is not available.
 func filterFormatAndSortExitNodes(peers []*ipnstate.PeerStatus, filterBy string) filteredExitNodes {
 	// first get peers into some fixed order, as code below doesn't break ties
 	// and our input comes from a random range-over-map.
@@ -229,7 +238,10 @@ func filterFormatAndSortExitNodes(peers []*ipnstate.PeerStatus, filterBy string)
 	countries := make(map[string]*filteredCountry)
 	cities := make(map[string]*filteredCity)
 	for _, ps := range peers {
-		loc := cmp.Or(ps.Location, noLocation)
+		loc := ps.Location
+		if loc == nil {
+			loc = &tailcfg.Location{}
+		}
 
 		if filterBy != "" && !strings.EqualFold(loc.Country, filterBy) {
 			continue
@@ -259,7 +271,7 @@ func filterFormatAndSortExitNodes(peers []*ipnstate.PeerStatus, filterBy string)
 	}
 
 	for _, country := range filteredExitNodes.Countries {
-		if country.Name == noLocationData {
+		if country.Name == "" {
 			// Countries without location data should not
 			// be filtered further.
 			continue

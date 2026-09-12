@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // mkpkg builds the Tailscale rpm and deb packages.
@@ -24,7 +24,7 @@ func parseFiles(s string, typ string) (files.Contents, error) {
 		return nil, nil
 	}
 	var contents files.Contents
-	for _, f := range strings.Split(s, ",") {
+	for f := range strings.SplitSeq(s, ",") {
 		fs := strings.Split(f, ":")
 		if len(fs) != 2 {
 			return nil, fmt.Errorf("unparseable file field %q", f)
@@ -41,7 +41,7 @@ func parseEmptyDirs(s string) files.Contents {
 		return nil
 	}
 	var contents files.Contents
-	for _, d := range strings.Split(s, ",") {
+	for d := range strings.SplitSeq(s, ",") {
 		contents = append(contents, &files.Content{Type: files.TypeDir, Destination: d})
 	}
 	return contents

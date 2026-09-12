@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build go1.19
@@ -123,7 +123,7 @@ func installSystemDaemonDarwin(args []string) (err error) {
 		return err
 	}
 
-	// Do not overwrite targetBin with the binary file if it it's already
+	// Do not overwrite targetBin with the binary file if it's already
 	// pointing to it. This is primarily to handle Homebrew that writes
 	// /usr/local/bin/tailscaled is a symlink to the actual binary.
 	if !same {

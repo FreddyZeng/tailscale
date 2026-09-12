@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package metrics
@@ -10,13 +10,14 @@ import (
 	"tailscale.com/types/lazy"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/syspolicy/internal"
+	"tailscale.com/util/syspolicy/pkey"
 	"tailscale.com/util/syspolicy/setting"
 )
 
 func TestSettingMetricNames(t *testing.T) {
 	tests := []struct {
 		name           string
-		key            setting.Key
+		key            pkey.Key
 		scope          setting.Scope
 		suffix         string
 		typ            clientmetric.Type

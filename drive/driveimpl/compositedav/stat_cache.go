@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package compositedav
@@ -8,16 +8,29 @@ import (
 	"encoding/xml"
 	"log"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
 
 	"github.com/jellydator/ttlcache/v3"
+	"golang.org/x/text/unicode/norm"
 	"tailscale.com/drive/driveimpl/shared"
 )
 
 var (
 	notFound = newCacheEntry(http.StatusNotFound, nil)
 )
+
+// normalize converts the given path into a canonical form for use as a cache
+// key. In addition to path cleanup, it applies Unicode NFC normalization so
+// that canonically equivalent names (e.g. the NFC name on disk and the NFD
+// name requested by a macOS WebDAV client) share a single cache entry.
+// Without this, a depth 0 lookup for the NFD form of a name would miss the
+// entry cached from the NFC href in the parent directory's listing, and get
+// would wrongly infer that the file doesn't exist.
+func normalize(p string) string {
+	return norm.NFC.String(shared.Normalize(p))
+}
 
 // StatCache provides a cache for directory listings and file metadata.
 // Especially when used from the command-line, mapped WebDAV drives can
@@ -88,7 +101,7 @@ func (c *StatCache) get(name string, depth int) *cacheEntry {
 		return nil
 	}
 
-	name = shared.Normalize(name)
+	name = normalize(name)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -141,7 +154,7 @@ func (c *StatCache) set(name string, depth int, ce *cacheEntry) {
 		return
 	}
 
-	name = shared.Normalize(name)
+	name = normalize(name)
 
 	var self *cacheEntry
 	var children map[string]*cacheEntry
@@ -165,7 +178,12 @@ func (c *StatCache) set(name string, depth int, ce *cacheEntry) {
 			children = make(map[string]*cacheEntry, len(ms.Responses)-1)
 			for i := 0; i < len(ms.Responses); i++ {
 				response := ms.Responses[i]
-				name := shared.Normalize(response.Href)
+				name, err := url.PathUnescape(response.Href)
+				if err != nil {
+					log.Printf("statcache.set child parse error: %s", err)
+					return
+				}
+				name = normalize(name)
 				raw := marshalMultiStatus(response)
 				entry := newCacheEntry(ce.Status, raw)
 				if i == 0 {

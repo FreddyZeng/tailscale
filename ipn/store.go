@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package ipn
@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+
+	"tailscale.com/health"
 )
 
 // ErrStateNotExist is returned by StateStore.ReadState when the
@@ -60,6 +62,19 @@ const (
 	TaildropReceivedKey = StateKey("_taildrop-received")
 )
 
+// StateStoreHealth is a Warnable set when store.New fails at startup. If
+// unhealthy, we block all login attempts and return a health message in status
+// responses.
+var StateStoreHealth = health.Register(&health.Warnable{
+	Code:     "state-store-health",
+	Severity: health.SeverityHigh,
+	Title:    "Tailscale state store failed to initialize",
+	Text: func(args health.Args) string {
+		return fmt.Sprintf("State store failed to initialize, Tailscale will not work until this is resolved. See https://tailscale.com/s/state-store-init-error. Error: %s", args[health.ArgError])
+	},
+	ImpactsConnectivity: true,
+})
+
 // CurrentProfileID returns the StateKey that stores the
 // current profile ID. The value is a JSON-encoded LoginProfile.
 // If the userID is empty, the key returned is CurrentProfileStateKey,
@@ -77,7 +92,9 @@ type StateStore interface {
 	// ReadState returns the bytes associated with ID. Returns (nil,
 	// ErrStateNotExist) if the ID doesn't have associated state.
 	ReadState(id StateKey) ([]byte, error)
-	// WriteState saves bs as the state associated with ID.
+	// WriteState saves bs as the state associated with ID. If bs is nil,
+	// the state associated with ID is deleted, and a subsequent ReadState
+	// for ID will return ErrStateNotExist.
 	//
 	// Callers should generally use the ipn.WriteState wrapper func
 	// instead, which only writes if the value is different from what's
@@ -112,4 +129,10 @@ func ReadStoreInt(store StateStore, id StateKey) (int64, error) {
 // PutStoreInt puts an integer into a StateStore.
 func PutStoreInt(store StateStore, id StateKey, val int64) error {
 	return WriteState(store, id, fmt.Appendf(nil, "%d", val))
+}
+
+// EncryptedStateStore is a marker interface implemented by StateStores that
+// encrypt data at rest.
+type EncryptedStateStore interface {
+	stateStoreIsEncrypted()
 }

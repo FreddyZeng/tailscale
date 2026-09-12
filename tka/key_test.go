@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package tka
@@ -42,7 +42,7 @@ func TestVerify25519(t *testing.T) {
 	aum := AUM{
 		MessageKind: AUMRemoveKey,
 		KeyID:       []byte{1, 2, 3, 4},
-		// Signatures is set to crap so we are sure its ignored in the sigHash computation.
+		// Signatures is set to crap so we are sure it's ignored in the sigHash computation.
 		Signatures: []tkatype.Signature{{KeyID: []byte{45, 42}}},
 	}
 	sigHash := aum.SigHash()
@@ -72,10 +72,8 @@ func TestNLPrivate(t *testing.T) {
 	// Test that key.NLPrivate implements Signer by making a new
 	// authority.
 	k := Key{Kind: Key25519, Public: pub.Verifier(), Votes: 1}
-	_, aum, err := Create(&Mem{}, State{
-		Keys:               []Key{k},
-		DisablementSecrets: [][]byte{bytes.Repeat([]byte{1}, 32)},
-	}, p)
+	state := CreateStateForTest(k)
+	_, aum, err := Create(ChonkMem(), state, p)
 	if err != nil {
 		t.Fatalf("Create() failed: %v", err)
 	}
@@ -89,7 +87,7 @@ func TestNLPrivate(t *testing.T) {
 		t.Error("signature did not verify")
 	}
 
-	// We manually compute the keyID, so make sure its consistent with
+	// We manually compute the keyID, so make sure it's consistent with
 	// tka.Key.ID().
 	if !bytes.Equal(k.MustID(), p.KeyID()) {
 		t.Errorf("private.KeyID() & tka KeyID differ: %x != %x", k.MustID(), p.KeyID())

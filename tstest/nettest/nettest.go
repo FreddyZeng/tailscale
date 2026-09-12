@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package nettest contains additional test helpers related to network state
@@ -91,8 +91,8 @@ func NewUnstartedHTTPServer(nw netx.Network, handler http.Handler) *httptest.Ser
 				c.Transport = &http.Transport{}
 			}
 			tr := c.Transport.(*http.Transport)
-			if tr.Dial != nil || tr.DialContext != nil {
-				panic("unexpected non-nil Dial or DialContext in httptest.Server.Client.Transport")
+			if tr.Dial != nil {
+				panic("unexpected non-nil Dial in httptest.Server.Client.Transport")
 			}
 			tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 				return nw.Dial(ctx, network, addr)

@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package cloudenv reports which known cloud environment we're running in.
@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/syncs"
 	"tailscale.com/types/lazy"
 )
@@ -46,11 +47,15 @@ const (
 	Azure        = Cloud("azure")        // Microsoft Azure
 	GCP          = Cloud("gcp")          // Google Cloud
 	DigitalOcean = Cloud("digitalocean") // DigitalOcean
+	Hetzner      = Cloud("hetzner")      // Hetzner Cloud
 )
 
 // ResolverIP returns the cloud host's recursive DNS server or the
 // empty string if not available.
 func (c Cloud) ResolverIP() string {
+	if !buildfeatures.HasCloud {
+		return ""
+	}
 	switch c {
 	case GCP:
 		return GoogleMetadataAndDNSIP
@@ -60,6 +65,8 @@ func (c Cloud) ResolverIP() string {
 		return AzureResolverIP
 	case DigitalOcean:
 		return getDigitalOceanResolver()
+	case Hetzner:
+		return getHetznerResolver()
 	}
 	return ""
 }
@@ -78,6 +85,21 @@ func getDigitalOceanResolver() string {
 	})
 }
 
+var (
+	// https://docs.hetzner.com/robot/dedicated-server/general-information/recursive-name-servers/
+	// IPv6 resolvers also exist: 2a01:4ff:ff00::add:1, 2a01:4ff:ff00::add:2.
+	hetznerResolvers = []string{"185.12.64.1", "185.12.64.2"}
+	hetznerResolver  lazy.SyncValue[string]
+)
+
+func getHetznerResolver() string {
+	// Randomly select one of the available resolvers so we don't overload
+	// one of them by sending all traffic there.
+	return hetznerResolver.Get(func() string {
+		return hetznerResolvers[rand.IntN(len(hetznerResolvers))]
+	})
+}
+
 // HasInternalTLD reports whether c is a cloud environment
 // whose ResolverIP serves *.internal records.
 func (c Cloud) HasInternalTLD() bool {
@@ -92,6 +114,9 @@ var cloudAtomic syncs.AtomicValue[Cloud]
 
 // Get returns the current cloud, or the empty string if unknown.
 func Get() Cloud {
+	if !buildfeatures.HasCloud {
+		return ""
+	}
 	if c, ok := cloudAtomic.LoadOk(); ok {
 		return c
 	}
@@ -120,6 +145,9 @@ func getCloud() Cloud {
 		sysVendor := readFileTrimmed("/sys/class/dmi/id/sys_vendor")
 		if sysVendor == "DigitalOcean" {
 			return DigitalOcean
+		}
+		if sysVendor == "Hetzner" {
+			return Hetzner
 		}
 		// TODO(andrew): "Vultr" is also valid if we need it
 

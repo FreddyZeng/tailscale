@@ -1,7 +1,7 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
-//go:build !ios && !android
+//go:build !android && !ts_omit_webclient
 
 package ipnlocal
 
@@ -19,14 +19,15 @@ import (
 
 	"tailscale.com/client/local"
 	"tailscale.com/client/web"
-	"tailscale.com/logtail/backoff"
 	"tailscale.com/net/netutil"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tsconst"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/backoff"
 	"tailscale.com/util/mak"
 )
 
-const webClientPort = web.ListenPort
+const webClientPort = tsconst.WebListenPort
 
 // webClient holds state for the web interface for managing this
 // tailscale instance. The web interface is not used by default,
@@ -172,7 +173,7 @@ func (b *LocalBackend) waitWebClientAuthURL(ctx context.Context, id string, src 
 // one to be completed, based on the presence or absence of the
 // provided id value.
 func (b *LocalBackend) doWebClientNoiseRequest(ctx context.Context, id string, src tailcfg.NodeID) (*tailcfg.WebClientAuthResponse, error) {
-	nm := b.NetMap()
+	nm := b.NetMapNoPeers()
 	if nm == nil || !nm.SelfNode.Valid() {
 		return nil, errors.New("[unexpected] no self node")
 	}

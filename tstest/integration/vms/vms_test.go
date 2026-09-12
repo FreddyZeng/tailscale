@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !windows && !plan9
@@ -15,7 +15,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -43,11 +42,6 @@ var (
 	useVNC            = flag.Bool("use-vnc", false, "if set, display guest vms over VNC")
 	verboseLogcatcher = flag.Bool("verbose-logcatcher", true, "if set, print logcatcher to t.Logf")
 	verboseQemu       = flag.Bool("verbose-qemu", true, "if set, print qemu console to t.Logf")
-	distroRex         = func() *regexValue {
-		result := &regexValue{r: regexp.MustCompile(`.*`)}
-		flag.Var(result, "distro-regex", "The regex that matches what distros should be run")
-		return result
-	}()
 )
 
 func TestDownloadImages(t *testing.T) {
@@ -59,9 +53,6 @@ func TestDownloadImages(t *testing.T) {
 		distro := d
 		t.Run(distro.Name, func(t *testing.T) {
 			t.Parallel()
-			if !distroRex.Unwrap().MatchString(distro.Name) {
-				t.Skipf("distro name %q doesn't match regex: %s", distro.Name, distroRex)
-			}
 			if strings.HasPrefix(distro.Name, "nixos") {
 				t.Skip("NixOS is built on the fly, no need to download it")
 			}
@@ -175,10 +166,6 @@ func mkSeed(t *testing.T, d Distro, sshKey, hostURL, tdir string, port int) {
 		filepath.Join(dir, "user-data"),
 	}
 
-	if hackOpenSUSE151UserData(t, d, dir) {
-		args = append(args, filepath.Join(dir, "openstack"))
-	}
-
 	run(t, tdir, "genisoimage", args...)
 }
 
@@ -197,14 +184,14 @@ type ipMapping struct {
 // it is difficult to be 100% sure. This function should be used with care. It
 // will probably do what you want, but it is very easy to hold this wrong.
 func getProbablyFreePortNumber() (int, error) {
-	l, err := net.Listen("tcp", ":0")
+	ln, err := net.Listen("tcp", ":0")
 	if err != nil {
 		return 0, err
 	}
 
-	defer l.Close()
+	defer ln.Close()
 
-	_, port, err := net.SplitHostPort(l.Addr().String())
+	_, port, err := net.SplitHostPort(ln.Addr().String())
 	if err != nil {
 		return 0, err
 	}
@@ -246,12 +233,6 @@ var ramsem struct {
 
 func testOneDistribution(t *testing.T, n int, distro Distro) {
 	setupTests(t)
-
-	if distroRex.Unwrap().MatchString(distro.Name) {
-		t.Logf("%s matches %s", distro.Name, distroRex.Unwrap())
-	} else {
-		t.Skip("regex not matched")
-	}
 
 	ctx, done := context.WithCancel(context.Background())
 	t.Cleanup(done)
@@ -374,7 +355,7 @@ func (h *Harness) testDistro(t *testing.T, d Distro, ipm ipMapping) {
 		})
 	})
 
-	t.Run("tailscale status", func(t *testing.T) {
+	t.Run("tailscale-status", func(t *testing.T) {
 		dur := 100 * time.Millisecond
 		var outp []byte
 		var err error
@@ -383,7 +364,7 @@ func (h *Harness) testDistro(t *testing.T, d Distro, ipm ipMapping) {
 		// starts with testcontrol sometimes there can be up to a few seconds where
 		// tailscaled is in an unknown state on these virtual machines. This exponential
 		// delay loop should delay long enough for tailscaled to be ready.
-		for count := 0; count < 10; count++ {
+		for range 10 {
 			sess := getSession(t, cli)
 
 			outp, err = sess.CombinedOutput("tailscale status")
@@ -402,7 +383,7 @@ func (h *Harness) testDistro(t *testing.T, d Distro, ipm ipMapping) {
 		t.Fatalf("error: %v", err)
 	})
 
-	t.Run("dump routes", func(t *testing.T) {
+	t.Run("dump-routes", func(t *testing.T) {
 		sess, err := cli.NewSession()
 		if err != nil {
 			t.Fatal(err)

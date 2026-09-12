@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build linux && amd64 && !race
@@ -33,7 +33,6 @@ func TestInQemu(t *testing.T) {
 	}
 	inCI := cibuild.On()
 	for _, arch := range arches {
-		arch := arch
 		t.Run(arch.Goarch, func(t *testing.T) {
 			t.Parallel()
 			qemuUser := "qemu-" + arch.Qarch

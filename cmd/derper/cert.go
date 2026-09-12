@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package main
@@ -11,6 +11,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -22,8 +23,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"time"
 
+	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/acme/autocert"
 	"tailscale.com/tailcfg"
 )
@@ -33,29 +36,68 @@ var unsafeHostnameCharacters = regexp.MustCompile(`[^a-zA-Z0-9-\.]`)
 type certProvider interface {
 	// TLSConfig creates a new TLS config suitable for net/http.Server servers.
 	//
-	// The returned Config must have a GetCertificate function set and that
-	// function must return a unique *tls.Certificate for each call. The
-	// returned *tls.Certificate will be mutated by the caller to append to the
-	// (*tls.Certificate).Certificate field.
+	// The returned Config must have a GetCertificate function set. The
+	// *tls.Certificate values it returns may be shared and cached, so
+	// callers must not mutate them.
 	TLSConfig() *tls.Config
 	// HTTPHandler handle ACME related request, if any.
 	HTTPHandler(fallback http.Handler) http.Handler
 }
 
-func certProviderByCertMode(mode, dir, hostname string) (certProvider, error) {
+func certProviderByCertMode(mode, dir, hostname string, ipCerts bool, eabKID, eabKey, email string) (certProvider, error) {
 	if dir == "" {
 		return nil, errors.New("missing required --certdir flag")
 	}
+	if ipCerts && mode != "letsencrypt" {
+		return nil, errors.New("--acme-ip-certs requires --certmode=letsencrypt")
+	}
 	switch mode {
-	case "letsencrypt":
+	case "letsencrypt", "gcp":
+		if net.ParseIP(hostname) != nil {
+			if mode == "gcp" {
+				return nil, errors.New("--certmode=gcp requires --hostname to be a DNS name, not an IP address")
+			}
+			if !ipCerts {
+				return nil, errors.New("--hostname is an IP address; use --certmode=manual for a self-signed cert, or set --acme-ip-certs to get LetsEncrypt IP address certs")
+			}
+			// IP-only server: certs are issued on demand per
+			// connection, so there is no hostname cert provider.
+			return newIPCertManager(dir, email, "", nil)
+		}
 		certManager := &autocert.Manager{
 			Prompt:     autocert.AcceptTOS,
 			HostPolicy: autocert.HostWhitelist(hostname),
 			Cache:      autocert.DirCache(dir),
 		}
+		if mode == "gcp" {
+			if eabKID == "" || eabKey == "" {
+				return nil, errors.New("--certmode=gcp requires --acme-eab-kid and --acme-eab-key flags")
+			}
+			if email == "" {
+				return nil, errors.New("--certmode=gcp requires --acme-email flag")
+			}
+			keyBytes, err := decodeEABKey(eabKey)
+			if err != nil {
+				return nil, err
+			}
+			certManager.Client = &acme.Client{
+				DirectoryURL: "https://dv.acme-v02.api.pki.goog/directory",
+			}
+			certManager.ExternalAccountBinding = &acme.ExternalAccountBinding{
+				KID: eabKID,
+				Key: keyBytes,
+			}
+		}
 		if hostname == "derp.tailscale.com" {
 			certManager.HostPolicy = prodAutocertHostPolicy
+		}
+		if email != "" {
+			certManager.Email = email
+		} else if hostname == "derp.tailscale.com" {
 			certManager.Email = "security@tailscale.com"
+		}
+		if ipCerts {
+			return newIPCertManager(dir, email, "", certManager)
 		}
 		return certManager, nil
 	case "manual":
@@ -132,12 +174,11 @@ func (m *manualCertManager) getCertificate(hi *tls.ClientHelloInfo) (*tls.Certif
 		return nil, fmt.Errorf("cert mismatch with hostname: %q", hi.ServerName)
 	}
 
-	// Return a shallow copy of the cert so the caller can append to its
-	// Certificate field.
-	certCopy := new(tls.Certificate)
-	*certCopy = *m.cert
-	certCopy.Certificate = certCopy.Certificate[:len(certCopy.Certificate):len(certCopy.Certificate)]
-	return certCopy, nil
+	// Return a shallow copy of the cert with a capacity-clamped chain
+	// so callers can never mutate the manager's long-lived certificate.
+	certCopy := *m.cert
+	certCopy.Certificate = slices.Clip(certCopy.Certificate)
+	return &certCopy, nil
 }
 
 func (m *manualCertManager) HTTPHandler(fallback http.Handler) http.Handler {
@@ -208,4 +249,18 @@ func createSelfSignedIPCert(crtPath, keyPath, ipStr string) (*tls.Certificate, e
 		return nil, fmt.Errorf("failed to create tls.Certificate: %v", err)
 	}
 	return &tlsCert, nil
+}
+
+// decodeEABKey decodes a base64-encoded EAB key.
+// It accepts both standard base64 (with padding) and base64url (without padding).
+func decodeEABKey(s string) ([]byte, error) {
+	// Try base64url first (no padding), then standard base64 (with padding).
+	// This handles both ACME spec format and gcloud output format.
+	if b, err := base64.RawURLEncoding.DecodeString(s); err == nil {
+		return b, nil
+	}
+	if b, err := base64.StdEncoding.DecodeString(s); err == nil {
+		return b, nil
+	}
+	return nil, errors.New("invalid base64 encoding for EAB key")
 }

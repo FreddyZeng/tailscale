@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Windows-specific stuff that can't go in clientupdate.go because it needs
@@ -30,11 +30,6 @@ const (
 	// tailscale.exe process from running before the msiexec process runs and
 	// tries to overwrite ourselves.
 	winMSIEnv = "TS_UPDATE_WIN_MSI"
-	// winExePathEnv is the environment variable that is set along with
-	// winMSIEnv and carries the full path of the calling tailscale.exe binary.
-	// It is used to re-launch the GUI process (tailscale-ipn.exe) after
-	// install is complete.
-	winExePathEnv = "TS_UPDATE_WIN_EXE_PATH"
 	// winVersionEnv is the environment variable that is set along with
 	// winMSIEnv and carries the version of tailscale that is being installed.
 	// It is used for logging purposes.
@@ -43,12 +38,12 @@ const (
 	updaterPrefix = "tailscale-updater"
 )
 
-func makeSelfCopy() (origPathExe, tmpPathExe string, err error) {
-	selfExe, err := os.Executable()
+func makeCmdTailscaleCopy() (origPathExe, tmpPathExe string, err error) {
+	srcExe, err := findCmdTailscale()
 	if err != nil {
 		return "", "", err
 	}
-	f, err := os.Open(selfExe)
+	f, err := os.Open(srcExe)
 	if err != nil {
 		return "", "", err
 	}
@@ -64,7 +59,25 @@ func makeSelfCopy() (origPathExe, tmpPathExe string, err error) {
 		f2.Close()
 		return "", "", err
 	}
-	return selfExe, f2.Name(), f2.Close()
+	return srcExe, f2.Name(), f2.Close()
+}
+
+// findCmdTailscale returns the path to the binary that should be copied for the update
+// re-execution. The copy is re-executed with "update" as a subcommand, so it must be
+// a binary that handles "update" (ie tailscale.exe, not tailscaled.exe)
+func findCmdTailscale() (string, error) {
+	selfExe, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	if strings.EqualFold(filepath.Base(selfExe), "tailscale.exe") {
+		return selfExe, nil
+	}
+	ts := filepath.Join(filepath.Dir(selfExe), "tailscale.exe")
+	if _, err := os.Stat(ts); err != nil {
+		return "", fmt.Errorf("cannot find tailscale.exe alongside %s: %w", selfExe, err)
+	}
+	return ts, nil
 }
 
 func markTempFileWindows(name string) error {
@@ -76,6 +89,17 @@ const certSubjectTailscale = "Tailscale Inc."
 
 func verifyAuthenticode(path string) error {
 	return authenticode.Verify(path, certSubjectTailscale)
+}
+
+func isTSGUIPresent() bool {
+	us, err := os.Executable()
+	if err != nil {
+		return false
+	}
+
+	tsgui := filepath.Join(filepath.Dir(us), "tsgui.dll")
+	_, err = os.Stat(tsgui)
+	return err == nil
 }
 
 func (up *Updater) updateWindows() error {
@@ -131,7 +155,15 @@ you can run the command prompt as Administrator one of these ways:
 		return err
 	}
 	up.cleanupOldDownloads(filepath.Join(msiDir, "*.msi"))
-	pkgsPath := fmt.Sprintf("%s/tailscale-setup-%s-%s.msi", up.Track, ver, arch)
+
+	qualifiers := []string{ver, arch}
+	// TODO(aaron): Temporary hack so autoupdate still works on winui builds;
+	// remove when we enable winui by default on the unstable track.
+	if isTSGUIPresent() {
+		qualifiers = append(qualifiers, "winui")
+	}
+
+	pkgsPath := fmt.Sprintf("%s/tailscale-setup-%s.msi", up.Track, strings.Join(qualifiers, "-"))
 	msiTarget := filepath.Join(msiDir, path.Base(pkgsPath))
 	if err := up.downloadURLToFile(pkgsPath, msiTarget); err != nil {
 		return err
@@ -145,15 +177,15 @@ you can run the command prompt as Administrator one of these ways:
 
 	up.Logf("making tailscale.exe copy to switch to...")
 	up.cleanupOldDownloads(filepath.Join(os.TempDir(), updaterPrefix+"-*.exe"))
-	selfOrig, selfCopy, err := makeSelfCopy()
+	_, cmdTailscaleCopy, err := makeCmdTailscaleCopy()
 	if err != nil {
 		return err
 	}
-	defer os.Remove(selfCopy)
+	defer os.Remove(cmdTailscaleCopy)
 	up.Logf("running tailscale.exe copy for final install...")
 
-	cmd := exec.Command(selfCopy, "update")
-	cmd.Env = append(os.Environ(), winMSIEnv+"="+msiTarget, winExePathEnv+"="+selfOrig, winVersionEnv+"="+ver)
+	cmd := exec.Command(cmdTailscaleCopy, "update")
+	cmd.Env = append(os.Environ(), winMSIEnv+"="+msiTarget, winVersionEnv+"="+ver)
 	cmd.Stdout = up.Stderr
 	cmd.Stderr = up.Stderr
 	cmd.Stdin = os.Stdin
@@ -189,7 +221,7 @@ func (up *Updater) installMSI(msi string) error {
 			case windows.ERROR_SUCCESS_REBOOT_REQUIRED:
 				// In most cases, updating Tailscale should not require a reboot.
 				// If it does, it might be because we failed to close the GUI
-				// and the installer couldn't replace tailscale-ipn.exe.
+				// and the installer couldn't replace its executable.
 				// The old GUI will continue to run until the next reboot.
 				// Not ideal, but also not a retryable error.
 				up.Logf("[unexpected] reboot required")

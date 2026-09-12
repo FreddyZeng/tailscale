@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package router
@@ -54,13 +54,6 @@ func (r *CallbackRouter) Set(rcfg *Config) error {
 	}
 	r.rcfg = rcfg
 	return r.SetBoth(r.rcfg, r.dcfg)
-}
-
-// UpdateMagicsockPort implements the Router interface. This implementation
-// does nothing and returns nil because this router does not currently need
-// to know what the magicsock UDP port is.
-func (r *CallbackRouter) UpdateMagicsockPort(_ uint16, _ string) error {
-	return nil
 }
 
 // SetDNS implements dns.OSConfigurator.

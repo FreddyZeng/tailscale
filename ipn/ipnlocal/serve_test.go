@@ -1,5 +1,7 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
+
+//go:build !ts_omit_serve
 
 package ipnlocal
 
@@ -7,12 +9,13 @@ import (
 	"bytes"
 	"cmp"
 	"context"
-	"crypto/sha256"
 	"crypto/tls"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"mime"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -20,22 +23,29 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"tailscale.com/control/controlclient"
 	"tailscale.com/health"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/store/mem"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
+	"tailscale.com/tailcfg/peercap"
 	"tailscale.com/tsd"
 	"tailscale.com/tstest"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/logid"
 	"tailscale.com/types/netmap"
+	"tailscale.com/util/eventbus/eventbustest"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/must"
+	"tailscale.com/util/syspolicy/policyclient"
 	"tailscale.com/wgengine"
+	"tailscale.com/wgengine/filter"
 )
 
 func TestExpandProxyArg(t *testing.T) {
@@ -60,6 +70,41 @@ func TestExpandProxyArg(t *testing.T) {
 		got := res{target, insecure}
 		if got != tt.want {
 			t.Errorf("expandProxyArg(%q) = %v, want %v", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestParseRedirectWithRedirectCode(t *testing.T) {
+	tests := []struct {
+		in       string
+		wantCode int
+		wantURL  string
+	}{
+		{"301:https://example.com", 301, "https://example.com"},
+		{"302:https://example.com", 302, "https://example.com"},
+		{"303:/path", 303, "/path"},
+		{"307:https://example.com/path?query=1", 307, "https://example.com/path?query=1"},
+		{"308:https://example.com", 308, "https://example.com"},
+
+		{"https://example.com", 302, "https://example.com"},
+		{"/path", 302, "/path"},
+		{"http://example.com", 302, "http://example.com"},
+		{"git://example.com", 302, "git://example.com"},
+
+		{"200:https://example.com", 302, "200:https://example.com"},
+		{"404:https://example.com", 302, "404:https://example.com"},
+		{"500:https://example.com", 302, "500:https://example.com"},
+		{"30:https://example.com", 302, "30:https://example.com"},
+		{"3:https://example.com", 302, "3:https://example.com"},
+		{"3012:https://example.com", 302, "3012:https://example.com"},
+		{"abc:https://example.com", 302, "abc:https://example.com"},
+		{"301", 302, "301"},
+	}
+	for _, tt := range tests {
+		gotCode, gotURL := parseRedirectWithCode(tt.in)
+		if gotCode != tt.wantCode || gotURL != tt.wantURL {
+			t.Errorf("parseRedirectWithCode(%q) = (%d, %q), want (%d, %q)",
+				tt.in, gotCode, gotURL, tt.wantCode, tt.wantURL)
 		}
 	}
 }
@@ -147,12 +192,41 @@ func TestGetServeHandler(t *testing.T) {
 			path: "/foo/../../../../../../../../etc/passwd",
 			want: "/",
 		},
+		// Malformed request targets that net/http hands the handler verbatim.
+		// These clean to a path.Dir fixed point ("*" or ".") that never reaches
+		// "/", and once spun the getServeHandler loop below forever (a remote
+		// serve/funnel DoS). They must resolve to not-found, not hang.
+		{
+			name: "asterisk", // "GET *"
+			conf: conf1,
+			path: "*",
+			want: "",
+		},
+		{
+			name: "empty", // "CONNECT" authority-form sets URL.Path to ""
+			conf: conf1,
+			path: "",
+			want: "",
+		},
+		{
+			name: "dot",
+			conf: conf1,
+			path: ".",
+			want: "",
+		},
+		{
+			name: "asterisk-subpath",
+			conf: conf1,
+			path: "*/foo",
+			want: "",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			b := &LocalBackend{
 				serveConfig: tt.conf.View(),
 				logf:        t.Logf,
+				health:      health.NewTracker(eventbustest.NewBus(t)),
 			}
 			req := &http.Request{
 				URL: &url.URL{
@@ -165,6 +239,9 @@ func TestGetServeHandler(t *testing.T) {
 				DestPort: port,
 			}))
 
+			// A malformed target like "*" or "" once spun getServeHandler's
+			// path-walk loop forever; a regression would hang here until the
+			// package test timeout fires.
 			h, got, ok := b.getServeHandler(req)
 			if (got != "") != ok {
 				t.Fatalf("got ok=%v, but got mountPoint=%q", ok, got)
@@ -177,16 +254,6 @@ func TestGetServeHandler(t *testing.T) {
 			}
 		})
 	}
-}
-
-func getEtag(t *testing.T, b any) string {
-	t.Helper()
-	bts, err := json.Marshal(b)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sum := sha256.Sum256(bts)
-	return hex.EncodeToString(sum[:])
 }
 
 // TestServeConfigForeground tests the inter-dependency
@@ -239,11 +306,15 @@ func TestServeConfigForeground(t *testing.T) {
 
 	err := b.SetServeConfig(&ipn.ServeConfig{
 		Foreground: map[string]*ipn.ServeConfig{
-			session1: {TCP: map[uint16]*ipn.TCPPortHandler{
-				443: {TCPForward: "http://localhost:3000"}},
+			session1: {
+				TCP: map[uint16]*ipn.TCPPortHandler{
+					443: {TCPForward: "http://localhost:3000"},
+				},
 			},
-			session2: {TCP: map[uint16]*ipn.TCPPortHandler{
-				999: {TCPForward: "http://localhost:4000"}},
+			session2: {
+				TCP: map[uint16]*ipn.TCPPortHandler{
+					999: {TCPForward: "http://localhost:4000"},
+				},
 			},
 		},
 	}, "")
@@ -266,8 +337,10 @@ func TestServeConfigForeground(t *testing.T) {
 			5000: {TCPForward: "http://localhost:5000"},
 		},
 		Foreground: map[string]*ipn.ServeConfig{
-			session2: {TCP: map[uint16]*ipn.TCPPortHandler{
-				999: {TCPForward: "http://localhost:4000"}},
+			session2: {
+				TCP: map[uint16]*ipn.TCPPortHandler{
+					999: {TCPForward: "http://localhost:4000"},
+				},
 			},
 		},
 	}, "")
@@ -324,7 +397,7 @@ func TestServeConfigServices(t *testing.T) {
 		SelfNode: (&tailcfg.Node{
 			Name: "example.ts.net",
 			CapMap: tailcfg.NodeCapMap{
-				tailcfg.NodeAttrServiceHost: []tailcfg.RawMessage{tailcfg.RawMessage(svcIPMapJSON)},
+				nodecap.ServiceHost: []tailcfg.RawMessage{tailcfg.RawMessage(svcIPMapJSON)},
 			},
 		}).View(),
 		UserProfiles: map[tailcfg.UserID]tailcfg.UserProfileView{
@@ -339,7 +412,7 @@ func TestServeConfigServices(t *testing.T) {
 	tests := []struct {
 		name              string
 		conf              *ipn.ServeConfig
-		expectedErr       error
+		errExpected       bool
 		packetDstAddrPort []netip.AddrPort
 		intercepted       bool
 	}{
@@ -363,7 +436,7 @@ func TestServeConfigServices(t *testing.T) {
 					},
 				},
 			},
-			expectedErr: ipn.ErrServiceConfigHasBothTCPAndTun,
+			errExpected: true,
 		},
 		{
 			// one correctly configured service with packet should be intercepted
@@ -470,13 +543,13 @@ func TestServeConfigServices(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			err := b.SetServeConfig(tt.conf, "")
-			if err != nil && tt.expectedErr != nil {
-				if !errors.Is(err, tt.expectedErr) {
-					t.Fatalf("expected error %v,\n got %v", tt.expectedErr, err)
-				}
-				return
+			if err == nil && tt.errExpected {
+				t.Fatal("expected error")
 			}
 			if err != nil {
+				if tt.errExpected {
+					return
+				}
 				t.Fatal(err)
 			}
 			for _, addrPort := range tt.packetDstAddrPort {
@@ -490,14 +563,19 @@ func TestServeConfigServices(t *testing.T) {
 			}
 		})
 	}
-
 }
 
 func TestServeConfigETag(t *testing.T) {
 	b := newTestBackend(t)
 
-	// a nil config with initial etag should succeed
-	err := b.SetServeConfig(nil, getEtag(t, nil))
+	// the etag should be valid even when there is no config
+	_, emptyStateETag, err := b.ServeConfigETag()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// a nil config with the empty-state etag should succeed
+	err = b.SetServeConfig(nil, emptyStateETag)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -508,7 +586,7 @@ func TestServeConfigETag(t *testing.T) {
 		t.Fatal("expected an error but got nil")
 	}
 
-	// a new config with no etag should succeed
+	// a new config with the empty-state etag should succeed
 	conf := &ipn.ServeConfig{
 		Web: map[ipn.HostPort]*ipn.WebServerConfig{
 			"example.ts.net:443": {Handlers: map[string]*ipn.HTTPHandler{
@@ -516,15 +594,14 @@ func TestServeConfigETag(t *testing.T) {
 			}},
 		},
 	}
-	err = b.SetServeConfig(conf, getEtag(t, nil))
+	err = b.SetServeConfig(conf, emptyStateETag)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	confView := b.ServeConfig()
-	etag := getEtag(t, confView)
-	if etag == "" {
-		t.Fatal("expected to get an etag but got an empty string")
+	confView, etag, err := b.ServeConfigETag()
+	if err != nil {
+		t.Fatal(err)
 	}
 	conf = confView.AsStruct()
 	mak.Set(&conf.AllowFunnel, "example.ts.net:443", true)
@@ -548,8 +625,10 @@ func TestServeConfigETag(t *testing.T) {
 	}
 
 	// replacing an existing config with the new etag should succeed
-	newCfg := b.ServeConfig()
-	etag = getEtag(t, newCfg)
+	_, etag, err = b.ServeConfigETag()
+	if err != nil {
+		t.Fatal(err)
+	}
 	err = b.SetServeConfig(nil, etag)
 	if err != nil {
 		t.Fatal(err)
@@ -576,49 +655,49 @@ func TestServeHTTPProxyPath(t *testing.T) {
 		wantRequestPath string
 	}{
 		{
-			name:            "/foo -> /foo, with mount point and path /foo",
+			name:            "foo-to-foo-mount-foo",
 			mountPoint:      "/foo",
 			proxyPath:       "/foo",
 			requestPath:     "/foo",
 			wantRequestPath: "/foo",
 		},
 		{
-			name:            "/foo/ -> /foo/, with mount point and path /foo",
+			name:            "foo-slash-to-foo-slash-mount-foo",
 			mountPoint:      "/foo",
 			proxyPath:       "/foo",
 			requestPath:     "/foo/",
 			wantRequestPath: "/foo/",
 		},
 		{
-			name:            "/foo -> /foo/, with mount point and path /foo/",
+			name:            "foo-to-foo-slash-mount-foo-slash",
 			mountPoint:      "/foo/",
 			proxyPath:       "/foo/",
 			requestPath:     "/foo",
 			wantRequestPath: "/foo/",
 		},
 		{
-			name:            "/-> /, with mount point and path /",
+			name:            "root-to-root-mount-root",
 			mountPoint:      "/",
 			proxyPath:       "/",
 			requestPath:     "/",
 			wantRequestPath: "/",
 		},
 		{
-			name:            "/foo -> /foo, with mount point and path /",
+			name:            "foo-to-foo-mount-root",
 			mountPoint:      "/",
 			proxyPath:       "/",
 			requestPath:     "/foo",
 			wantRequestPath: "/foo",
 		},
 		{
-			name:            "/foo/bar -> /foo/bar, with mount point and path /foo",
+			name:            "foo-bar-to-foo-bar-mount-foo",
 			mountPoint:      "/foo",
 			proxyPath:       "/foo",
 			requestPath:     "/foo/bar",
 			wantRequestPath: "/foo/bar",
 		},
 		{
-			name:            "/foo/bar/baz -> /foo/bar/baz, with mount point and path /foo",
+			name:            "foo-bar-baz-to-foo-bar-baz-mount-foo",
 			mountPoint:      "/foo",
 			proxyPath:       "/foo",
 			requestPath:     "/foo/bar/baz",
@@ -658,6 +737,7 @@ func TestServeHTTPProxyPath(t *testing.T) {
 		})
 	}
 }
+
 func TestServeHTTPProxyHeaders(t *testing.T) {
 	b := newTestBackend(t)
 
@@ -750,6 +830,156 @@ func TestServeHTTPProxyHeaders(t *testing.T) {
 			h := w.Result().Header
 			for _, c := range tt.wantHeaders {
 				if got := h.Get(c.header); got != c.want {
+					t.Errorf("invalid %q header; want=%q, got=%q", c.header, c.want, got)
+				}
+			}
+		})
+	}
+}
+
+func TestServeHTTPProxyGrantHeader(t *testing.T) {
+	b := newTestBackend(t)
+
+	nm := b.NetMap()
+	matches, err := filter.MatchesFromFilterRules([]tailcfg.FilterRule{
+		{
+			SrcIPs: []string{"100.150.151.152"},
+			CapGrant: []tailcfg.CapGrant{{
+				Dsts: []netip.Prefix{
+					netip.MustParsePrefix("100.150.151.151/32"),
+				},
+				CapMap: tailcfg.PeerCapMap{
+					"example.com/cap/interesting": []tailcfg.RawMessage{
+						`{"role": "🐿"}`,
+					},
+				},
+			}},
+		},
+		{
+			SrcIPs: []string{"100.150.151.153"},
+			CapGrant: []tailcfg.CapGrant{{
+				Dsts: []netip.Prefix{
+					netip.MustParsePrefix("100.150.151.151/32"),
+				},
+				CapMap: tailcfg.PeerCapMap{
+					"example.com/cap/boring": []tailcfg.RawMessage{
+						`{"role": "Viewer"}`,
+					},
+					"example.com/cap/irrelevant": []tailcfg.RawMessage{
+						`{"role": "Editor"}`,
+					},
+				},
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nm.PacketFilter = matches
+	b.SetControlClientStatus(nil, controlclient.Status{NetMap: nm})
+
+	// Start test serve endpoint.
+	testServ := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			// Piping all the headers through the response writer
+			// so we can check their values in tests below.
+			for key, val := range r.Header {
+				w.Header().Add(key, strings.Join(val, ","))
+			}
+		},
+	))
+	defer testServ.Close()
+
+	conf := &ipn.ServeConfig{
+		Web: map[ipn.HostPort]*ipn.WebServerConfig{
+			"example.ts.net:443": {Handlers: map[string]*ipn.HTTPHandler{
+				"/": {
+					Proxy:         testServ.URL,
+					AcceptAppCaps: []peercap.Cap{"example.com/cap/interesting", "example.com/cap/boring"},
+				},
+			}},
+		},
+	}
+	if err := b.SetServeConfig(conf, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	type headerCheck struct {
+		header string
+		want   string
+	}
+
+	tests := []struct {
+		name        string
+		srcIP       string
+		wantHeaders []headerCheck
+	}{
+		{
+			name:  "request-from-user-within-tailnet",
+			srcIP: "100.150.151.152",
+			wantHeaders: []headerCheck{
+				{"X-Forwarded-Proto", "https"},
+				{"X-Forwarded-For", "100.150.151.152"},
+				{"Tailscale-User-Login", "someone@example.com"},
+				{"Tailscale-User-Name", "Some One"},
+				{"Tailscale-User-Profile-Pic", "https://example.com/photo.jpg"},
+				{"Tailscale-Headers-Info", "https://tailscale.com/s/serve-headers"},
+				{"Tailscale-App-Capabilities", `{"example.com/cap/interesting":[{"role":"🐿"}]}`},
+			},
+		},
+		{
+			name:  "request-from-tagged-node-within-tailnet",
+			srcIP: "100.150.151.153",
+			wantHeaders: []headerCheck{
+				{"X-Forwarded-Proto", "https"},
+				{"X-Forwarded-For", "100.150.151.153"},
+				{"Tailscale-User-Login", ""},
+				{"Tailscale-User-Name", ""},
+				{"Tailscale-User-Profile-Pic", ""},
+				{"Tailscale-Headers-Info", ""},
+				{"Tailscale-App-Capabilities", `{"example.com/cap/boring":[{"role":"Viewer"}]}`},
+			},
+		},
+		{
+			name:  "request-from-outside-tailnet",
+			srcIP: "100.160.161.162",
+			wantHeaders: []headerCheck{
+				{"X-Forwarded-Proto", "https"},
+				{"X-Forwarded-For", "100.160.161.162"},
+				{"Tailscale-User-Login", ""},
+				{"Tailscale-User-Name", ""},
+				{"Tailscale-User-Profile-Pic", ""},
+				{"Tailscale-Headers-Info", ""},
+				{"Tailscale-App-Capabilities", ""},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := &http.Request{
+				URL: &url.URL{Path: "/"},
+				TLS: &tls.ConnectionState{ServerName: "example.ts.net"},
+			}
+			req = req.WithContext(serveHTTPContextKey.WithValue(req.Context(), &serveHTTPContext{
+				DestPort: 443,
+				SrcAddr:  netip.MustParseAddrPort(tt.srcIP + ":1234"), // random src port for tests
+			}))
+
+			w := httptest.NewRecorder()
+			b.serveWebHandler(w, req)
+
+			// Verify the headers. The contract with users is that identity and grant headers containing non-ASCII
+			// UTF-8 characters will be Q-encoded.
+			h := w.Result().Header
+			dec := new(mime.WordDecoder)
+			for _, c := range tt.wantHeaders {
+				maybeEncoded := h.Get(c.header)
+				got, err := dec.DecodeHeader(maybeEncoded)
+				if err != nil {
+					t.Fatalf("invalid %q header; failed to decode: %v", maybeEncoded, err)
+				}
+				if got != c.want {
 					t.Errorf("invalid %q header; want=%q, got=%q", c.header, c.want, got)
 				}
 			}
@@ -858,7 +1088,6 @@ func Test_reverseProxyConfiguration(t *testing.T) {
 			wantsURL:      mustCreateURL(t, "https://example3.com"),
 		},
 	})
-
 }
 
 func mustCreateURL(t *testing.T, u string) url.URL {
@@ -870,17 +1099,28 @@ func mustCreateURL(t *testing.T, u string) url.URL {
 	return *uParsed
 }
 
-func newTestBackend(t *testing.T) *LocalBackend {
+func newTestBackend(t *testing.T, opts ...any) *LocalBackend {
 	var logf logger.Logf = logger.Discard
-	const debug = true
+	const debug = false
 	if debug {
 		logf = logger.WithPrefix(tstest.WhileTestRunningLogger(t), "... ")
 	}
 
-	sys := tsd.NewSystem()
+	bus := eventbustest.NewBus(t)
+	sys := tsd.NewSystemWithBus(bus)
+
+	for _, o := range opts {
+		switch v := o.(type) {
+		case policyclient.Client:
+			sys.PolicyClient.Set(v)
+		default:
+			panic(fmt.Sprintf("unsupported option type %T", v))
+		}
+	}
+
 	e, err := wgengine.NewUserspaceEngine(logf, wgengine.Config{
 		SetSubsystem:  sys.Set,
-		HealthTracker: sys.HealthTracker(),
+		HealthTracker: sys.HealthTracker.Get(),
 		Metrics:       sys.UserMetricsRegistry(),
 		EventBus:      sys.Bus.Get(),
 	})
@@ -898,13 +1138,16 @@ func newTestBackend(t *testing.T) *LocalBackend {
 	dir := t.TempDir()
 	b.SetVarRoot(dir)
 
-	pm := must.Get(newProfileManager(new(mem.Store), logf, new(health.Tracker)))
+	pm := must.Get(newProfileManager(new(mem.Store), logf, health.NewTracker(bus)))
 	pm.currentProfile = (&ipn.LoginProfile{ID: "id0"}).View()
 	b.pm = pm
 
 	b.currentNode().SetNetMap(&netmap.NetworkMap{
 		SelfNode: (&tailcfg.Node{
 			Name: "example.ts.net",
+			Addresses: []netip.Prefix{
+				netip.MustParsePrefix("100.150.151.151/32"),
+			},
 		}).View(),
 		UserProfiles: map[tailcfg.UserID]tailcfg.UserProfileView{
 			tailcfg.UserID(1): (&tailcfg.UserProfile{
@@ -918,6 +1161,7 @@ func newTestBackend(t *testing.T) *LocalBackend {
 				ID:           152,
 				ComputedName: "some-peer",
 				User:         tailcfg.UserID(1),
+				Key:          makeNodeKeyFromID(152),
 				Addresses: []netip.Prefix{
 					netip.MustParsePrefix("100.150.151.152/32"),
 				},
@@ -927,6 +1171,7 @@ func newTestBackend(t *testing.T) *LocalBackend {
 				ComputedName: "some-tagged-peer",
 				Tags:         []string{"tag:server", "tag:test"},
 				User:         tailcfg.UserID(1),
+				Key:          makeNodeKeyFromID(153),
 				Addresses: []netip.Prefix{
 					netip.MustParsePrefix("100.150.151.153/32"),
 				},
@@ -939,13 +1184,13 @@ func newTestBackend(t *testing.T) *LocalBackend {
 func TestServeFileOrDirectory(t *testing.T) {
 	td := t.TempDir()
 	writeFile := func(suffix, contents string) {
-		if err := os.WriteFile(filepath.Join(td, suffix), []byte(contents), 0600); err != nil {
+		if err := os.WriteFile(filepath.Join(td, suffix), []byte(contents), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
 	writeFile("foo", "this is foo")
 	writeFile("bar", "this is bar")
-	os.MkdirAll(filepath.Join(td, "subdir"), 0700)
+	os.MkdirAll(filepath.Join(td, "subdir"), 0o700)
 	writeFile("subdir/file-a", "this is A")
 	writeFile("subdir/file-b", "this is B")
 	writeFile("subdir/file-c", "this is C")
@@ -982,7 +1227,9 @@ func TestServeFileOrDirectory(t *testing.T) {
 		}
 	}
 
-	b := &LocalBackend{}
+	b := &LocalBackend{
+		health: health.NewTracker(eventbustest.NewBus(t)),
+	}
 
 	tests := []struct {
 		req   string
@@ -1061,5 +1308,715 @@ func TestEncTailscaleHeaderValue(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("encTailscaleHeaderValue(%q) = %q, want %q", tt.in, got, tt.want)
 		}
+	}
+}
+
+func TestServeGRPCProxy(t *testing.T) {
+	const msg = "some-response\n"
+	backend := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Path-Was", r.RequestURI)
+		w.Header().Set("Proto-Was", r.Proto)
+		io.WriteString(w, msg)
+	}))
+	backend.EnableHTTP2 = true
+	backend.Config.Protocols = new(http.Protocols)
+	backend.Config.Protocols.SetHTTP1(true)
+	backend.Config.Protocols.SetUnencryptedHTTP2(true)
+	backend.Start()
+	defer backend.Close()
+
+	backendURL := must.Get(url.Parse(backend.URL))
+
+	lb := newTestBackend(t)
+	rp := &reverseProxy{
+		logf:    t.Logf,
+		url:     backendURL,
+		backend: backend.URL,
+		lb:      lb,
+	}
+
+	req := func(method, urlStr string, opt ...any) *http.Request {
+		req := httptest.NewRequest(method, urlStr, nil)
+		for _, o := range opt {
+			switch v := o.(type) {
+			case int:
+				req.ProtoMajor = v
+			case string:
+				req.Header.Set("Content-Type", v)
+			default:
+				panic(fmt.Sprintf("unsupported option type %T", v))
+			}
+		}
+		return req
+	}
+
+	tests := []struct {
+		name      string
+		req       *http.Request
+		wantPath  string
+		wantProto string
+		wantBody  string
+	}{
+		{
+			name:      "non-gRPC",
+			req:       req("GET", "http://foo/bar"),
+			wantPath:  "/bar",
+			wantProto: "HTTP/1.1",
+		},
+		{
+			name:      "gRPC-but-not-http2",
+			req:       req("GET", "http://foo/bar", "application/grpc"),
+			wantPath:  "/bar",
+			wantProto: "HTTP/1.1",
+		},
+		{
+			name:      "gRPC--http2",
+			req:       req("GET", "http://foo/bar", 2, "application/grpc"),
+			wantPath:  "/bar",
+			wantProto: "HTTP/2.0",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			rp.ServeHTTP(rec, tt.req)
+
+			res := rec.Result()
+			got := must.Get(io.ReadAll(res.Body))
+			if got, want := res.Header.Get("Path-Was"), tt.wantPath; want != got {
+				t.Errorf("Path-Was %q, want %q", got, want)
+			}
+			if got, want := res.Header.Get("Proto-Was"), tt.wantProto; want != got {
+				t.Errorf("Proto-Was %q, want %q", got, want)
+			}
+			if string(got) != msg {
+				t.Errorf("got body %q, want %q", got, msg)
+			}
+		})
+	}
+}
+
+// TestServeProxyHTTP2PreservesContentType is a repro for tailscale/tailscale#19866.
+// A client POSTs over HTTP/2 to a serve listener configured to reverse-proxy to a
+// plaintext HTTP/1.1 backend; the test asserts the backend sees the Content-Type
+// header that the client sent.
+func TestServeProxyHTTP2PreservesContentType(t *testing.T) {
+	var (
+		gotHeader http.Header
+		gotMethod string
+		gotProto  string
+		gotBody   string
+	)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeader = r.Header.Clone()
+		gotMethod = r.Method
+		gotProto = r.Proto
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+	backendURL := must.Get(url.Parse(backend.URL))
+
+	lb := newTestBackend(t)
+	rp := &reverseProxy{
+		logf:    t.Logf,
+		url:     backendURL,
+		backend: backend.URL,
+		lb:      lb,
+	}
+
+	// Mirror serveWebHandler's behavior for a mount of "/" with a non-"/" path:
+	// it wraps the proxy in http.StripPrefix("", rp). That's a no-op for "/mcp"
+	// but worth exercising in case StripPrefix interacts weirdly with HTTP/2.
+	frontHandler := http.StripPrefix("", http.HandlerFunc(rp.ServeHTTP))
+	front := httptest.NewUnstartedServer(frontHandler)
+	front.EnableHTTP2 = true
+	front.StartTLS()
+	defer front.Close()
+
+	const reqBody = `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`
+
+	type variant struct {
+		name           string
+		http1Only      bool
+		contentType    string
+		setAccept      bool
+		setContentLen  bool // if false, body is a Reader with unknown length (chunked)
+		dropContentLen bool
+		emptyBody      bool
+	}
+	variants := []variant{
+		{name: "baseline_http2", contentType: "application/json", setAccept: true, setContentLen: true},
+		{name: "http1_baseline", http1Only: true, contentType: "application/json", setAccept: true, setContentLen: true},
+		{name: "no_accept", contentType: "application/json", setContentLen: true},
+		{name: "charset_param", contentType: "application/json; charset=utf-8", setAccept: true, setContentLen: true},
+		{name: "chunked", contentType: "application/json", setAccept: true, setContentLen: false},
+		{name: "drop_content_length", contentType: "application/json", setAccept: true, dropContentLen: true},
+		{name: "empty_body", contentType: "application/json", setAccept: true, emptyBody: true},
+	}
+
+	for _, v := range variants {
+		t.Run(v.name, func(t *testing.T) {
+			gotHeader = nil
+			gotMethod = ""
+			gotProto = ""
+			gotBody = ""
+
+			var body io.Reader
+			switch {
+			case v.emptyBody:
+				body = http.NoBody
+			case v.setContentLen:
+				body = strings.NewReader(reqBody)
+			default:
+				// io.Reader that isn't a *bytes.Reader / *strings.Reader / *bytes.Buffer
+				// so net/http does not auto-set Content-Length.
+				body = struct{ io.Reader }{strings.NewReader(reqBody)}
+			}
+
+			url := front.URL + "/mcp"
+			req, err := http.NewRequest("POST", url, body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Content-Type", v.contentType)
+			if v.setAccept {
+				req.Header.Set("Accept", "application/json, text/event-stream")
+			}
+			if v.dropContentLen {
+				req.ContentLength = -1
+			}
+
+			client := front.Client()
+			if v.http1Only {
+				// Force the client onto HTTP/1.1 by removing h2 from ALPN.
+				tr := client.Transport.(*http.Transport).Clone()
+				if tr.TLSClientConfig != nil {
+					tr.TLSClientConfig = tr.TLSClientConfig.Clone()
+					tr.TLSClientConfig.NextProtos = []string{"http/1.1"}
+				}
+				tr.ForceAttemptHTTP2 = false
+				client = &http.Client{Transport: tr}
+			}
+
+			res, err := client.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer res.Body.Close()
+			io.Copy(io.Discard, res.Body)
+
+			wantProtoMajor := 2
+			if v.http1Only {
+				wantProtoMajor = 1
+			}
+			if res.ProtoMajor != wantProtoMajor {
+				t.Fatalf("front-end proto = %s, want HTTP/%d.x", res.Proto, wantProtoMajor)
+			}
+			if res.StatusCode != http.StatusOK {
+				t.Fatalf("backend returned status %d, want 200", res.StatusCode)
+			}
+			if gotMethod != "POST" {
+				t.Errorf("backend method = %q, want POST", gotMethod)
+			}
+			t.Logf("backend saw proto=%q content-length=%q transfer-encoding=%v body=%q",
+				gotProto, gotHeader.Get("Content-Length"), gotHeader.Values("Transfer-Encoding"), gotBody)
+			if got, want := gotHeader.Get("Content-Type"), v.contentType; got != want {
+				t.Errorf("Content-Type at backend = %q, want %q (full headers: %v)", got, want, gotHeader)
+			}
+		})
+	}
+}
+
+// TestServeWebHandlerHTTP2PreservesContentType drives the full
+// b.serveWebHandler entry point (the actual production code path) via a real
+// HTTP/2 TLS frontend, with serveHTTPContext.Funnel set to mimic a funnel
+// request. Repro probe for tailscale/tailscale#19866.
+func TestServeWebHandlerHTTP2PreservesContentType(t *testing.T) {
+	var gotHeader http.Header
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeader = r.Header.Clone()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	b := newTestBackend(t)
+
+	front := httptest.NewUnstartedServer(http.HandlerFunc(b.serveWebHandler))
+	front.EnableHTTP2 = true
+	realFrontAddr := front.Listener.Addr().String()
+	_, portStr, _ := net.SplitHostPort(realFrontAddr)
+	p, _ := strconv.ParseUint(portStr, 10, 16)
+	frontPort := uint16(p)
+	front.Config.BaseContext = func(_ net.Listener) context.Context {
+		return serveHTTPContextKey.WithValue(context.Background(), &serveHTTPContext{
+			Funnel:   &funnelFlow{Host: "example.ts.net"},
+			SrcAddr:  netip.MustParseAddrPort("1.2.3.4:1234"),
+			DestPort: frontPort,
+		})
+	}
+	front.StartTLS()
+	defer front.Close()
+
+	conf := &ipn.ServeConfig{
+		Web: map[ipn.HostPort]*ipn.WebServerConfig{
+			ipn.HostPort(net.JoinHostPort("example.ts.net", portStr)): {Handlers: map[string]*ipn.HTTPHandler{
+				"/": {Proxy: backend.URL},
+			}},
+		},
+	}
+	if err := b.SetServeConfig(conf, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Custom client: dial example.ts.net:PORT to the real httptest address,
+	// skip cert verification, and send SNI "example.ts.net" so the serveConfig
+	// host lookup works.
+	tr := front.Client().Transport.(*http.Transport).Clone()
+	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", realFrontAddr)
+	}
+	tr.TLSClientConfig = &tls.Config{
+		InsecureSkipVerify: true,
+		ServerName:         "example.ts.net",
+		NextProtos:         []string{"h2", "http/1.1"},
+	}
+	tr.ForceAttemptHTTP2 = true
+	client := &http.Client{Transport: tr}
+
+	const reqBody = `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`
+	url := "https://example.ts.net:" + portStr + "/mcp"
+	req, err := http.NewRequest("POST", url, strings.NewReader(reqBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+
+	res, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	body, _ := io.ReadAll(res.Body)
+
+	if res.ProtoMajor != 2 {
+		t.Fatalf("front-end proto = %s, want HTTP/2", res.Proto)
+	}
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("status %d, want 200; body=%q", res.StatusCode, body)
+	}
+	t.Logf("backend headers (full): %v", gotHeader)
+	if got, want := gotHeader.Get("Content-Type"), "application/json"; got != want {
+		t.Errorf("Content-Type at backend = %q, want %q", got, want)
+	}
+	if got := gotHeader.Get("Tailscale-Funnel-Request"); got != "?1" {
+		t.Errorf("Tailscale-Funnel-Request = %q, want %q (sanity check)", got, "?1")
+	}
+}
+
+func TestServeHTTPRedirect(t *testing.T) {
+	b := newTestBackend(t)
+
+	tests := []struct {
+		host     string
+		path     string
+		redirect string
+		reqURI   string
+		wantCode int
+		wantLoc  string
+	}{
+		{
+			host:     "hardcoded-root",
+			path:     "/",
+			redirect: "https://example.com/",
+			reqURI:   "/old",
+			wantCode: http.StatusFound, // 302 is the default
+			wantLoc:  "https://example.com/",
+		},
+		{
+			host:     "template-host-and-uri",
+			path:     "/",
+			redirect: "https://${HOST}${REQUEST_URI}",
+			reqURI:   "/path?foo=bar",
+			wantCode: http.StatusFound, // 302 is the default
+			wantLoc:  "https://template-host-and-uri/path?foo=bar",
+		},
+		{
+			host:     "custom-301",
+			path:     "/",
+			redirect: "301:https://example.com/",
+			reqURI:   "/old",
+			wantCode: http.StatusMovedPermanently, // 301
+			wantLoc:  "https://example.com/",
+		},
+		{
+			host:     "custom-307",
+			path:     "/",
+			redirect: "307:https://example.com/new",
+			reqURI:   "/old",
+			wantCode: http.StatusTemporaryRedirect, // 307
+			wantLoc:  "https://example.com/new",
+		},
+		{
+			host:     "custom-308",
+			path:     "/",
+			redirect: "308:https://example.com/permanent",
+			reqURI:   "/old",
+			wantCode: http.StatusPermanentRedirect, // 308
+			wantLoc:  "https://example.com/permanent",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.host, func(t *testing.T) {
+			conf := &ipn.ServeConfig{
+				Web: map[ipn.HostPort]*ipn.WebServerConfig{
+					ipn.HostPort(tt.host + ":80"): {
+						Handlers: map[string]*ipn.HTTPHandler{
+							tt.path: {Redirect: tt.redirect},
+						},
+					},
+				},
+			}
+			if err := b.SetServeConfig(conf, ""); err != nil {
+				t.Fatal(err)
+			}
+
+			req := &http.Request{
+				Host:       tt.host,
+				URL:        &url.URL{Path: tt.path},
+				RequestURI: tt.reqURI,
+				TLS:        &tls.ConnectionState{ServerName: tt.host},
+			}
+			req = req.WithContext(serveHTTPContextKey.WithValue(req.Context(), &serveHTTPContext{
+				DestPort: 80,
+				SrcAddr:  netip.MustParseAddrPort("1.2.3.4:1234"),
+			}))
+
+			w := httptest.NewRecorder()
+			b.serveWebHandler(w, req)
+
+			if w.Code != tt.wantCode {
+				t.Errorf("got status %d, want %d", w.Code, tt.wantCode)
+			}
+			if got := w.Header().Get("Location"); got != tt.wantLoc {
+				t.Errorf("got Location %q, want %q", got, tt.wantLoc)
+			}
+		})
+	}
+}
+
+func TestValidateServeConfigUpdate(t *testing.T) {
+	tests := []struct {
+		name, description  string
+		existing, incoming *ipn.ServeConfig
+		wantError          bool
+	}{
+		{
+			name:        "empty-existing-config",
+			description: "should be able to update with empty existing config",
+			existing:    &ipn.ServeConfig{},
+			incoming: &ipn.ServeConfig{
+				TCP: map[uint16]*ipn.TCPPortHandler{
+					8080: {},
+				},
+			},
+			wantError: false,
+		},
+		{
+			name:        "no-existing-config",
+			description: "should be able to update with no existing config",
+			existing:    nil,
+			incoming: &ipn.ServeConfig{
+				TCP: map[uint16]*ipn.TCPPortHandler{
+					8080: {},
+				},
+			},
+			wantError: false,
+		},
+		{
+			name:        "empty-incoming-config",
+			description: "wiping config should work",
+			existing: &ipn.ServeConfig{
+				TCP: map[uint16]*ipn.TCPPortHandler{
+					80: {},
+				},
+			},
+			incoming:  &ipn.ServeConfig{},
+			wantError: false,
+		},
+		{
+			name:        "no-incoming-config",
+			description: "missing incoming config should not result in an error",
+			existing: &ipn.ServeConfig{
+				TCP: map[uint16]*ipn.TCPPortHandler{
+					80: {},
+				},
+			},
+			incoming:  nil,
+			wantError: false,
+		},
+		{
+			name:        "non-overlapping-update",
+			description: "non-overlapping update should work",
+			existing: &ipn.ServeConfig{
+				TCP: map[uint16]*ipn.TCPPortHandler{
+					80: {},
+				},
+			},
+			incoming: &ipn.ServeConfig{
+				TCP: map[uint16]*ipn.TCPPortHandler{
+					8080: {},
+				},
+			},
+			wantError: false,
+		},
+		{
+			name:        "overwriting-background-port",
+			description: "should be able to overwrite a background port",
+			existing: &ipn.ServeConfig{
+				TCP: map[uint16]*ipn.TCPPortHandler{
+					80: {
+						TCPForward: "localhost:8080",
+					},
+				},
+			},
+			incoming: &ipn.ServeConfig{
+				TCP: map[uint16]*ipn.TCPPortHandler{
+					80: {
+						TCPForward: "localhost:9999",
+					},
+				},
+			},
+			wantError: false,
+		},
+		{
+			name:        "broken-existing-config",
+			description: "broken existing config should not prevent new config updates",
+			existing: &ipn.ServeConfig{
+				TCP: map[uint16]*ipn.TCPPortHandler{
+					// Broken because HTTPS and TCPForward are mutually exclusive.
+					9000: {
+						HTTPS:      true,
+						TCPForward: "127.0.0.1:9000",
+					},
+					// Broken because foreground and background handlers cannot coexist.
+					443: {},
+				},
+				Foreground: map[string]*ipn.ServeConfig{
+					"12345": {
+						TCP: map[uint16]*ipn.TCPPortHandler{
+							// Broken because foreground and background handlers cannot coexist.
+							443: {},
+						},
+					},
+				},
+				// Broken because Services cannot specify TUN mode and a TCP handler.
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:foo": {
+						TCP: map[uint16]*ipn.TCPPortHandler{
+							6060: {},
+						},
+						Tun: true,
+					},
+				},
+			},
+			incoming: &ipn.ServeConfig{
+				TCP: map[uint16]*ipn.TCPPortHandler{
+					80: {},
+				},
+			},
+			wantError: false,
+		},
+		{
+			name:        "services-same-port-as-background",
+			description: "services should be able to use the same port as background listeners",
+			existing: &ipn.ServeConfig{
+				TCP: map[uint16]*ipn.TCPPortHandler{
+					80: {},
+				},
+			},
+			incoming: &ipn.ServeConfig{
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:foo": {
+						TCP: map[uint16]*ipn.TCPPortHandler{
+							80: {},
+						},
+					},
+				},
+			},
+			wantError: false,
+		},
+		{
+			name:        "services-tun-mode",
+			description: "TUN mode should be mutually exclusive with TCP or web handlers for new Services",
+			existing:    &ipn.ServeConfig{},
+			incoming: &ipn.ServeConfig{
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:foo": {
+						TCP: map[uint16]*ipn.TCPPortHandler{
+							6060: {},
+						},
+						Tun: true,
+					},
+				},
+			},
+			wantError: true,
+		},
+		{
+			name:        "new-foreground-listener",
+			description: "new foreground listeners must be on open ports",
+			existing: &ipn.ServeConfig{
+				TCP: map[uint16]*ipn.TCPPortHandler{
+					80: {},
+				},
+			},
+			incoming: &ipn.ServeConfig{
+				Foreground: map[string]*ipn.ServeConfig{
+					"12345": {
+						TCP: map[uint16]*ipn.TCPPortHandler{
+							80: {},
+						},
+					},
+				},
+			},
+			wantError: true,
+		},
+		{
+			name:        "new-background-listener",
+			description: "new background listers cannot overwrite foreground listeners",
+			existing: &ipn.ServeConfig{
+				Foreground: map[string]*ipn.ServeConfig{
+					"12345": {
+						TCP: map[uint16]*ipn.TCPPortHandler{
+							80: {},
+						},
+					},
+				},
+			},
+			incoming: &ipn.ServeConfig{
+				TCP: map[uint16]*ipn.TCPPortHandler{
+					80: {},
+				},
+			},
+			wantError: true,
+		},
+		{
+			name:        "serve-type-overwrite",
+			description: "incoming configuration cannot change the serve type in use by a port",
+			existing: &ipn.ServeConfig{
+				TCP: map[uint16]*ipn.TCPPortHandler{
+					80: {
+						HTTP: true,
+					},
+				},
+			},
+			incoming: &ipn.ServeConfig{
+				TCP: map[uint16]*ipn.TCPPortHandler{
+					80: {
+						TCPForward: "localhost:8080",
+					},
+				},
+			},
+			wantError: true,
+		},
+		{
+			name:        "serve-type-overwrite-services",
+			description: "incoming Services configuration cannot change the serve type in use by a port",
+			existing: &ipn.ServeConfig{
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:foo": {
+						TCP: map[uint16]*ipn.TCPPortHandler{
+							80: {
+								HTTP: true,
+							},
+						},
+					},
+				},
+			},
+			incoming: &ipn.ServeConfig{
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:foo": {
+						TCP: map[uint16]*ipn.TCPPortHandler{
+							80: {
+								TCPForward: "localhost:8080",
+							},
+						},
+					},
+				},
+			},
+			wantError: true,
+		},
+		{
+			name:        "tun-mode-with-handlers",
+			description: "Services cannot enable TUN mode if L4 or L7 handlers already exist",
+			existing: &ipn.ServeConfig{
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:foo": {
+						TCP: map[uint16]*ipn.TCPPortHandler{
+							443: {
+								HTTPS: true,
+							},
+						},
+						Web: map[ipn.HostPort]*ipn.WebServerConfig{
+							"127.0.0.1:443": {
+								Handlers: map[string]*ipn.HTTPHandler{},
+							},
+						},
+					},
+				},
+			},
+			incoming: &ipn.ServeConfig{
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:foo": {
+						Tun: true,
+					},
+				},
+			},
+			wantError: true,
+		},
+		{
+			name:        "handlers-with-tun-mode",
+			description: "Services cannot add L4 or L7 handlers if TUN mode is already enabled",
+			existing: &ipn.ServeConfig{
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:foo": {
+						Tun: true,
+					},
+				},
+			},
+			incoming: &ipn.ServeConfig{
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:foo": {
+						TCP: map[uint16]*ipn.TCPPortHandler{
+							443: {
+								HTTPS: true,
+							},
+						},
+						Web: map[ipn.HostPort]*ipn.WebServerConfig{
+							"127.0.0.1:443": {
+								Handlers: map[string]*ipn.HTTPHandler{},
+							},
+						},
+					},
+				},
+			},
+			wantError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateServeConfigUpdate(tt.existing.View(), tt.incoming.View())
+			if err != nil && !tt.wantError {
+				t.Error("unexpected error:", err)
+			}
+			if err == nil && tt.wantError {
+				t.Error("expected error, got nil;", tt.description)
+			}
+		})
 	}
 }

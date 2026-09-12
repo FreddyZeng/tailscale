@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package xdp
@@ -14,7 +14,6 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/prometheus/client_golang/prometheus"
-	"tailscale.com/util/multierr"
 )
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -type config -type counters_key -type counter_key_af -type counter_key_packets_bytes_action -type counter_key_prog_end bpf xdp.c -- -I headers
@@ -63,8 +62,7 @@ func NewSTUNServer(config *STUNServerConfig, opts ...STUNServerOption) (*STUNSer
 	objs := new(bpfObjects)
 	err = loadBpfObjects(objs, nil)
 	if err != nil {
-		var ve *ebpf.VerifierError
-		if config.FullVerifierErr && errors.As(err, &ve) {
+		if ve, ok := errors.AsType[*ebpf.VerifierError](err); config.FullVerifierErr && ok {
 			err = fmt.Errorf("verifier error: %+v", ve)
 		}
 		return nil, fmt.Errorf("error loading XDP program: %w", err)
@@ -110,7 +108,7 @@ func (s *STUNServer) Close() error {
 		errs = append(errs, s.link.Close())
 	}
 	errs = append(errs, s.objs.Close())
-	return multierr.New(errs...)
+	return errors.Join(errs...)
 }
 
 type stunServerMetrics struct {

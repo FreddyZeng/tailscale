@@ -1,10 +1,10 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // This file is just the types. The bulk of the code is in poller.go.
 
-// The portlist package contains code that checks what ports are open and
-// listening on the current machine.
+// Package portlist contains code that checks what ports are open and listening
+// on the current machine.
 package portlist
 
 import (

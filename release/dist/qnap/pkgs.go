@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package qnap contains dist Targets for building QNAP Tailscale packages.
@@ -27,11 +27,12 @@ type target struct {
 }
 
 type signer struct {
-	gcloudCredentialsBase64 string
-	gcloudProject           string
-	gcloudKeyring           string
-	keyName                 string
-	certificateBase64       string
+	gcloudCredentialsBase64         string
+	gcloudProject                   string
+	gcloudKeyring                   string
+	keyName                         string
+	certificateBase64               string
+	certificateIntermediariesBase64 string
 }
 
 func (t *target) String() string {
@@ -90,6 +91,7 @@ func (t *target) buildQPKG(b *dist.Build, qnapBuilds *qnapBuilds, inner *innerPk
 			"-e", fmt.Sprintf("GCLOUD_KEYRING=%s", t.signer.gcloudKeyring),
 			"-e", fmt.Sprintf("QNAP_SIGNING_KEY_NAME=%s", t.signer.keyName),
 			"-e", fmt.Sprintf("QNAP_SIGNING_CERT_BASE64=%s", t.signer.certificateBase64),
+			"-e", fmt.Sprintf("QNAP_SIGNING_CERT_INTERMEDIARIES_BASE64=%s", t.signer.certificateIntermediariesBase64),
 			"-e", fmt.Sprintf("QNAP_SIGNING_SCRIPT=%s", "/sign-qpkg.sh"),
 			"-v", fmt.Sprintf("%s:/sign-qpkg.sh", filepath.Join(qnapBuilds.tmpDir, "files/scripts/sign-qpkg.sh")),
 		)
@@ -116,7 +118,16 @@ func (t *target) buildQPKG(b *dist.Build, qnapBuilds *qnapBuilds, inner *innerPk
 		return nil, fmt.Errorf("docker run %v: %s", err, out)
 	}
 
-	return []string{filePath, filePath + ".md5"}, nil
+	ret := []string{filePath, filePath + ".md5"}
+	// If the build was signed, a .codesigning file is produced containing
+	// the last 32 characters of the base64-encoded CMS signature. This is
+	// used by pkgserve to populate <signature> entries in the QNAP
+	// repository XML.
+	codesigning := filePath + ".codesigning"
+	if _, err := os.Stat(codesigning); err == nil {
+		ret = append(ret, codesigning)
+	}
+	return ret, nil
 }
 
 type qnapBuildsMemoizeKey struct{}

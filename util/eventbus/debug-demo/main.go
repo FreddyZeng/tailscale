@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // debug-demo is a program that serves a bus's debug interface over
@@ -14,12 +14,16 @@ import (
 	"net/netip"
 	"time"
 
+	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/tsweb"
 	"tailscale.com/types/key"
 	"tailscale.com/util/eventbus"
 )
 
 func main() {
+	if !buildfeatures.HasDebugEventBus {
+		log.Fatalf("debug-demo requires the \"debugeventbus\" feature enabled")
+	}
 	b := eventbus.New()
 	c := b.Client("RouteMonitor")
 	go testPub[RouteAdded](c, 5*time.Second)

@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build windows
@@ -18,13 +18,15 @@ import (
 
 // Known addresses.
 var (
-	linkLocalRange           = netip.MustParsePrefix("ff80::/10")
+	linkLocalRange           = netip.MustParsePrefix("fe80::/10")
 	linkLocalDHCPMulticast   = netip.MustParseAddr("ff02::1:2")
 	siteLocalDHCPMulticast   = netip.MustParseAddr("ff05::1:3")
 	linkLocalRouterMulticast = netip.MustParseAddr("ff02::2")
 
 	linkLocalMulticastIPv4Range = netip.MustParsePrefix("224.0.0.0/24")
 	linkLocalMulticastIPv6Range = netip.MustParsePrefix("ff02::/16")
+
+	limitedBroadcast = netip.MustParsePrefix("255.255.255.255/32")
 )
 
 type direction int
@@ -66,8 +68,8 @@ func (p protocol) getLayers(d direction) []wf.LayerID {
 	return layers
 }
 
-func ruleName(action wf.Action, l wf.LayerID, name string) string {
-	switch l {
+func ruleName(action wf.Action, layerID wf.LayerID, name string) string {
+	switch layerID {
 	case wf.LayerALEAuthConnectV4:
 		return fmt.Sprintf("%s outbound %s (IPv4)", action, name)
 	case wf.LayerALEAuthConnectV6:
@@ -233,24 +235,39 @@ func (f *Firewall) UpdatePermittedRoutes(newRoutes []netip.Prefix) error {
 			return err
 		}
 
-		name = "link-local multicast - " + r.String()
-		conditions = matchLinkLocalMulticast(r, false)
-		multicastRules, err := f.addRules(name, weightKnownTraffic, conditions, wf.ActionPermit, p, directionOutbound)
+		multicastRules, err := f.addLinkLocalMulticastRules(p, r)
 		if err != nil {
 			return err
 		}
 		rules = append(rules, multicastRules...)
 
-		conditions = matchLinkLocalMulticast(r, true)
-		multicastRules, err = f.addRules(name, weightKnownTraffic, conditions, wf.ActionPermit, p, directionInbound)
+		broadcastRules, err := f.addLimitedBroadcastRules(p, r)
 		if err != nil {
 			return err
 		}
-		rules = append(rules, multicastRules...)
+		rules = append(rules, broadcastRules...)
 
 		f.permittedRoutes[r] = rules
 	}
 	return nil
+}
+
+// addLinkLocalMulticastRules adds rules to allow inbound and outbound
+// link-local multicast traffic to or from the specified network.
+// It returns the added rules, or an error.
+func (f *Firewall) addLinkLocalMulticastRules(p protocol, r netip.Prefix) ([]*wf.Rule, error) {
+	name := "link-local multicast - " + r.String()
+	conditions := matchLinkLocalMulticast(r, false)
+	outboundRules, err := f.addRules(name, weightKnownTraffic, conditions, wf.ActionPermit, p, directionOutbound)
+	if err != nil {
+		return nil, err
+	}
+	conditions = matchLinkLocalMulticast(r, true)
+	inboundRules, err := f.addRules(name, weightKnownTraffic, conditions, wf.ActionPermit, p, directionInbound)
+	if err != nil {
+		return nil, err
+	}
+	return append(outboundRules, inboundRules...), nil
 }
 
 // matchLinkLocalMulticast returns a list of conditions that match
@@ -268,6 +285,59 @@ func matchLinkLocalMulticast(pfx netip.Prefix, inbound bool) []*wf.Match {
 		localAddr, remoteAddr = linkLocalMulticastRange, pfx
 	} else {
 		localAddr, remoteAddr = pfx, linkLocalMulticastRange
+	}
+	return []*wf.Match{
+		{
+			Field: wf.FieldIPProtocol,
+			Op:    wf.MatchTypeEqual,
+			Value: wf.IPProtoUDP,
+		},
+		{
+			Field: wf.FieldIPLocalAddress,
+			Op:    wf.MatchTypeEqual,
+			Value: localAddr,
+		},
+		{
+			Field: wf.FieldIPRemoteAddress,
+			Op:    wf.MatchTypeEqual,
+			Value: remoteAddr,
+		},
+	}
+}
+
+// addLimitedBroadcastRules adds rules to allow inbound and outbound
+// limited broadcast traffic to or from the specified network,
+// if the network is IPv4. It returns the added rules, or an error.
+func (f *Firewall) addLimitedBroadcastRules(p protocol, r netip.Prefix) ([]*wf.Rule, error) {
+	if !r.Addr().Is4() {
+		return nil, nil
+	}
+	name := "broadcast - " + r.String()
+	conditions := matchLimitedBroadcast(r, false)
+	outboundRules, err := f.addRules(name, weightKnownTraffic, conditions, wf.ActionPermit, p, directionOutbound)
+	if err != nil {
+		return nil, err
+	}
+	conditions = matchLimitedBroadcast(r, true)
+	inboundRules, err := f.addRules(name, weightKnownTraffic, conditions, wf.ActionPermit, p, directionInbound)
+	if err != nil {
+		return nil, err
+	}
+	return append(outboundRules, inboundRules...), nil
+}
+
+// matchLimitedBroadcast returns a list of conditions that match
+// outbound or inbound limited broadcast traffic to or from the
+// specified network. It panics if the pfx is not IPv4.
+func matchLimitedBroadcast(pfx netip.Prefix, inbound bool) []*wf.Match {
+	if !pfx.Addr().Is4() {
+		panic("limited broadcast is only applicable to IPv4")
+	}
+	var localAddr, remoteAddr netip.Prefix
+	if inbound {
+		localAddr, remoteAddr = limitedBroadcast, pfx
+	} else {
+		localAddr, remoteAddr = pfx, limitedBroadcast
 	}
 	return []*wf.Match{
 		{
@@ -307,8 +377,8 @@ func (f *Firewall) newRule(name string, w weight, layer wf.LayerID, conditions [
 
 func (f *Firewall) addRules(name string, w weight, conditions []*wf.Match, action wf.Action, p protocol, d direction) ([]*wf.Rule, error) {
 	var rules []*wf.Rule
-	for _, l := range p.getLayers(d) {
-		r, err := f.newRule(name, w, l, conditions, action)
+	for _, layer := range p.getLayers(d) {
+		r, err := f.newRule(name, w, layer, conditions, action)
 		if err != nil {
 			return nil, err
 		}

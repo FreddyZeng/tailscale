@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package ipnlocal
@@ -32,6 +32,7 @@ import (
 	"tailscale.com/types/lazy"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/persist"
+	"tailscale.com/util/eventbus/eventbustest"
 	"tailscale.com/util/must"
 )
 
@@ -847,7 +848,7 @@ func TestBackgroundProfileResolver(t *testing.T) {
 
 			// Create a new profile manager and add the profiles to it.
 			// We expose the profile manager to the extensions via the read-only [ipnext.ProfileStore] interface.
-			pm := must.Get(newProfileManager(new(mem.Store), t.Logf, new(health.Tracker)))
+			pm := must.Get(newProfileManager(new(mem.Store), t.Logf, health.NewTracker(eventbustest.NewBus(t))))
 			for i, p := range tt.profiles {
 				// Generate a unique ID and key for each profile,
 				// unless the profile already has them set
@@ -1009,9 +1010,8 @@ func TestNilExtensionHostMethodCall(t *testing.T) {
 	t.Parallel()
 
 	var h *ExtensionHost
-	typ := reflect.TypeOf(h)
-	for i := range typ.NumMethod() {
-		m := typ.Method(i)
+	typ := reflect.TypeFor[*ExtensionHost]()
+	for m := range typ.Methods() {
 		if strings.HasSuffix(m.Name, "ForTest") {
 			// Skip methods that are only for testing.
 			continue
@@ -1230,7 +1230,7 @@ func (e *testExtension) InitCalled() bool {
 func (e *testExtension) Shutdown() (err error) {
 	e.t.Helper()
 	e.mu.Lock()
-	e.mu.Unlock()
+	defer e.mu.Unlock()
 	if e.ShutdownHook != nil {
 		err = e.ShutdownHook(e)
 	}
@@ -1375,6 +1375,7 @@ func (b *testBackend) Sys() *tsd.System {
 func (b *testBackend) SendNotify(ipn.Notify)           { panic("not implemented") }
 func (b *testBackend) NodeBackend() ipnext.NodeBackend { panic("not implemented") }
 func (b *testBackend) TailscaleVarRoot() string        { panic("not implemented") }
+func (b *testBackend) authReconfig()                   { panic("not implemented") }
 
 func (b *testBackend) SwitchToBestProfile(reason string) {
 	b.mu.Lock()

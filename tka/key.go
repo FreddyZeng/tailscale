@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package tka
@@ -7,8 +7,8 @@ import (
 	"crypto/ed25519"
 	"errors"
 	"fmt"
+	"maps"
 
-	"github.com/hdevalence/ed25519consensus"
 	"tailscale.com/types/tkatype"
 )
 
@@ -32,7 +32,7 @@ func (k KeyKind) String() string {
 	}
 }
 
-// Key describes the public components of a key known to network-lock.
+// Key describes the public components of a key known to tailnet-lock.
 type Key struct {
 	Kind KeyKind `cbor:"1,keyasint"`
 
@@ -65,9 +65,7 @@ func (k Key) Clone() Key {
 
 	if k.Meta != nil {
 		out.Meta = make(map[string]string, len(k.Meta))
-		for k, v := range k.Meta {
-			out.Meta[k] = v
-		}
+		maps.Copy(out.Meta, k.Meta)
 	}
 
 	return out
@@ -106,8 +104,6 @@ func (k Key) Ed25519() (ed25519.PublicKey, error) {
 	}
 }
 
-const maxMetaBytes = 512
-
 func (k Key) StaticValidate() error {
 	if k.Votes > 4096 {
 		return fmt.Errorf("excessive key weight: %d > 4096", k.Votes)
@@ -135,25 +131,4 @@ func (k Key) StaticValidate() error {
 		return fmt.Errorf("unrecognized key kind: %v", k.Kind)
 	}
 	return nil
-}
-
-// Verify returns a nil error if the signature is valid over the
-// provided AUM BLAKE2s digest, using the given key.
-func signatureVerify(s *tkatype.Signature, aumDigest tkatype.AUMSigHash, key Key) error {
-	// NOTE(tom): Even if we can compute the public from the KeyID,
-	//            its possible for the KeyID to be attacker-controlled
-	//            so we should use the public contained in the state machine.
-	switch key.Kind {
-	case Key25519:
-		if len(key.Public) != ed25519.PublicKeySize {
-			return fmt.Errorf("ed25519 key has wrong length: %d", len(key.Public))
-		}
-		if ed25519consensus.Verify(ed25519.PublicKey(key.Public), aumDigest[:], s.Signature) {
-			return nil
-		}
-		return errors.New("invalid signature")
-
-	default:
-		return fmt.Errorf("unhandled key type: %v", key.Kind)
-	}
 }

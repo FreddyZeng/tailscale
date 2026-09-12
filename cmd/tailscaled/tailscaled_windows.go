@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build go1.19
@@ -45,17 +45,17 @@ import (
 	"tailscale.com/drive/driveimpl"
 	"tailscale.com/envknob"
 	_ "tailscale.com/ipn/auditlog"
-	_ "tailscale.com/ipn/desktop"
 	"tailscale.com/logpolicy"
-	"tailscale.com/logtail/backoff"
 	"tailscale.com/net/dns"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/tstun"
 	"tailscale.com/tsd"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/logid"
+	"tailscale.com/util/backoff"
 	"tailscale.com/util/osdiag"
-	"tailscale.com/util/syspolicy"
+	"tailscale.com/util/syspolicy/pkey"
+	"tailscale.com/util/syspolicy/policyclient"
 	"tailscale.com/util/winutil"
 	"tailscale.com/util/winutil/gp"
 	"tailscale.com/version"
@@ -148,6 +148,8 @@ var syslogf logger.Logf = logger.Discard
 //
 // At this point we're still the parent process that
 // Windows started.
+//
+// pol may be nil.
 func runWindowsService(pol *logpolicy.Policy) error {
 	go func() {
 		logger.Logf(log.Printf).JSON(1, "SupportInfo", osdiag.SupportInfo(osdiag.LogSupportInfoReasonStartup))
@@ -155,7 +157,7 @@ func runWindowsService(pol *logpolicy.Policy) error {
 
 	if syslog, err := eventlog.Open(serviceName); err == nil {
 		syslogf = func(format string, args ...any) {
-			if logSCMInteractions, _ := syspolicy.GetBoolean(syspolicy.LogSCMInteractions, false); logSCMInteractions {
+			if logSCMInteractions, _ := policyclient.Get().GetBoolean(pkey.LogSCMInteractions, false); logSCMInteractions {
 				syslog.Info(0, fmt.Sprintf(format, args...))
 			}
 		}
@@ -168,7 +170,7 @@ func runWindowsService(pol *logpolicy.Policy) error {
 }
 
 type ipnService struct {
-	Policy *logpolicy.Policy
+	Policy *logpolicy.Policy // or nil if logging not in use
 }
 
 // Called by Windows to execute the windows service.
@@ -185,7 +187,11 @@ func (service *ipnService) Execute(args []string, r <-chan svc.ChangeRequest, ch
 	doneCh := make(chan struct{})
 	go func() {
 		defer close(doneCh)
-		args := []string{"/subproc", service.Policy.PublicID.String()}
+		publicID := "none"
+		if service.Policy != nil {
+			publicID = service.Policy.PublicID.String()
+		}
+		args := []string{"/subproc", publicID}
 		// Make a logger without a date prefix, as filelogger
 		// and logtail both already add their own. All we really want
 		// from the log package is the automatic newline.
@@ -389,8 +395,7 @@ func handleSessionChange(chgRequest svc.ChangeRequest) {
 	if chgRequest.Cmd != svc.SessionChange || chgRequest.EventType != windows.WTS_SESSION_UNLOCK {
 		return
 	}
-
-	if flushDNSOnSessionUnlock, _ := syspolicy.GetBoolean(syspolicy.FlushDNSOnSessionUnlock, false); flushDNSOnSessionUnlock {
+	if flushDNSOnSessionUnlock, _ := policyclient.Get().GetBoolean(pkey.FlushDNSOnSessionUnlock, false); flushDNSOnSessionUnlock {
 		log.Printf("Received WTS_SESSION_UNLOCK event, initiating DNS flush.")
 		go func() {
 			err := dns.Flush()

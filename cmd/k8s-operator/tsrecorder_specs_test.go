@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !plan9
@@ -12,17 +12,18 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
-	"tailscale.com/types/ptr"
 )
 
 func TestRecorderSpecs(t *testing.T) {
-	t.Run("ensure spec fields are passed through correctly", func(t *testing.T) {
+	t.Run("spec-fields-passthrough", func(t *testing.T) {
 		tsr := &tsapi.Recorder{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: "test",
 			},
 			Spec: tsapi.RecorderSpec{
+				Replicas: new(int32(3)),
 				StatefulSet: tsapi.RecorderStatefulSet{
 					Labels: map[string]string{
 						"ss-label-key": "ss-label-value",
@@ -49,7 +50,7 @@ func TestRecorderSpecs(t *testing.T) {
 							},
 						},
 						SecurityContext: &corev1.PodSecurityContext{
-							RunAsUser: ptr.To[int64](1000),
+							RunAsUser: new(int64(1000)),
 						},
 						ImagePullSecrets: []corev1.LocalObjectReference{{
 							Name: "img-pull",
@@ -60,7 +61,7 @@ func TestRecorderSpecs(t *testing.T) {
 						Tolerations: []corev1.Toleration{{
 							Key:               "key",
 							Value:             "value",
-							TolerationSeconds: ptr.To[int64](60),
+							TolerationSeconds: new(int64(60)),
 						}},
 						Container: tsapi.RecorderContainer{
 							Env: []tsapi.Env{{
@@ -90,7 +91,7 @@ func TestRecorderSpecs(t *testing.T) {
 			},
 		}
 
-		ss := tsrStatefulSet(tsr, tsNamespace)
+		ss := tsrStatefulSet(tsr, tsNamespace, tsLoginServer)
 
 		// StatefulSet-level.
 		if diff := cmp.Diff(ss.Annotations, tsr.Spec.StatefulSet.Annotations); diff != "" {
@@ -101,10 +102,10 @@ func TestRecorderSpecs(t *testing.T) {
 		}
 
 		// Pod-level.
-		if diff := cmp.Diff(ss.Labels, labels("recorder", "test", tsr.Spec.StatefulSet.Labels)); diff != "" {
+		if diff := cmp.Diff(ss.Labels, tsrLabels("recorder", "test", tsr.Spec.StatefulSet.Labels)); diff != "" {
 			t.Errorf("(-got +want):\n%s", diff)
 		}
-		if diff := cmp.Diff(ss.Spec.Template.Labels, labels("recorder", "test", tsr.Spec.StatefulSet.Pod.Labels)); diff != "" {
+		if diff := cmp.Diff(ss.Spec.Template.Labels, tsrLabels("recorder", "test", tsr.Spec.StatefulSet.Pod.Labels)); diff != "" {
 			t.Errorf("(-got +want):\n%s", diff)
 		}
 		if diff := cmp.Diff(ss.Spec.Template.Spec.Affinity, tsr.Spec.StatefulSet.Pod.Affinity); diff != "" {
@@ -124,7 +125,7 @@ func TestRecorderSpecs(t *testing.T) {
 		}
 
 		// Container-level.
-		if diff := cmp.Diff(ss.Spec.Template.Spec.Containers[0].Env, env(tsr)); diff != "" {
+		if diff := cmp.Diff(ss.Spec.Template.Spec.Containers[0].Env, tsrEnv(tsr, tsLoginServer)); diff != "" {
 			t.Errorf("(-got +want):\n%s", diff)
 		}
 		if diff := cmp.Diff(ss.Spec.Template.Spec.Containers[0].Image, tsr.Spec.StatefulSet.Pod.Container.Image); diff != "" {
@@ -138,6 +139,18 @@ func TestRecorderSpecs(t *testing.T) {
 		}
 		if diff := cmp.Diff(ss.Spec.Template.Spec.Containers[0].Resources, tsr.Spec.StatefulSet.Pod.Container.Resources); diff != "" {
 			t.Errorf("(-got +want):\n%s", diff)
+		}
+
+		if *ss.Spec.Replicas != *tsr.Spec.Replicas {
+			t.Errorf("expected %d replicas, got %d", *tsr.Spec.Replicas, *ss.Spec.Replicas)
+		}
+
+		if len(ss.Spec.Template.Spec.Volumes) != int(*tsr.Spec.Replicas)+1 {
+			t.Errorf("expected %d volumes, got %d", *tsr.Spec.Replicas+1, len(ss.Spec.Template.Spec.Volumes))
+		}
+
+		if len(ss.Spec.Template.Spec.Containers[0].VolumeMounts) != int(*tsr.Spec.Replicas)+1 {
+			t.Errorf("expected %d volume mounts, got %d", *tsr.Spec.Replicas+1, len(ss.Spec.Template.Spec.Containers[0].VolumeMounts))
 		}
 	})
 }

@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package egressservices contains shared types for exposing tailnet services to
@@ -69,12 +69,12 @@ var _ json.Unmarshaler = &PortMaps{}
 func (p *PortMaps) UnmarshalJSON(data []byte) error {
 	*p = make(map[PortMap]struct{})
 
-	var l []PortMap
-	if err := json.Unmarshal(data, &l); err != nil {
+	var v []PortMap
+	if err := json.Unmarshal(data, &v); err != nil {
 		return err
 	}
 
-	for _, pm := range l {
+	for _, pm := range v {
 		(*p)[pm] = struct{}{}
 	}
 
@@ -82,18 +82,19 @@ func (p *PortMaps) UnmarshalJSON(data []byte) error {
 }
 
 func (p PortMaps) MarshalJSON() ([]byte, error) {
-	l := make([]PortMap, 0, len(p))
+	v := make([]PortMap, 0, len(p))
 	for pm := range p {
-		l = append(l, pm)
+		v = append(v, pm)
 	}
 
-	return json.Marshal(l)
+	return json.Marshal(v)
 }
 
 // Status represents the currently configured firewall rules for all egress
 // services for a proxy identified by the PodIP.
 type Status struct {
 	PodIPv4 string `json:"podIPv4"`
+	PodIPv6 string `json:"podIPv6,omitempty"`
 	// All egress service status keyed by service name.
 	Services map[string]*ServiceStatus `json:"services"`
 }

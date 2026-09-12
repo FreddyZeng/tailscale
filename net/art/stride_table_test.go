@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package art
@@ -19,7 +19,7 @@ import (
 func TestInversePrefix(t *testing.T) {
 	t.Parallel()
 	for i := range 256 {
-		for len := 0; len < 9; len++ {
+		for len := range 9 {
 			addr := i & (0xFF << (8 - len))
 			idx := prefixIndex(uint8(addr), len)
 			addr2, len2 := inversePrefixIndex(idx)
@@ -377,8 +377,8 @@ func pfxMask(pfxLen int) uint8 {
 func allPrefixes() []slowEntry[int] {
 	ret := make([]slowEntry[int], 0, lastHostIndex)
 	for i := 1; i < lastHostIndex+1; i++ {
-		a, l := inversePrefixIndex(i)
-		ret = append(ret, slowEntry[int]{a, l, i})
+		a, ln := inversePrefixIndex(i)
+		ret = append(ret, slowEntry[int]{a, ln, i})
 	}
 	return ret
 }

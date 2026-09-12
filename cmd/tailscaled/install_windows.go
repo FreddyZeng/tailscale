@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build go1.19
@@ -16,13 +16,23 @@ import (
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/mgr"
 	"tailscale.com/cmd/tailscaled/tailscaledhooks"
-	"tailscale.com/logtail/backoff"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/backoff"
 )
 
 func init() {
 	installSystemDaemon = installSystemDaemonWindows
 	uninstallSystemDaemon = uninstallSystemDaemonWindows
+}
+
+// serviceDependencies lists all system services that tailscaled depends on.
+// This list must be kept in sync with the TailscaledDependencies preprocessor
+// variable in the installer.
+var serviceDependencies = []string{
+	"Dnscache",
+	"iphlpsvc",
+	"netprofm",
+	"WinHttpAutoProxySvc",
 }
 
 func installSystemDaemonWindows(args []string) (err error) {
@@ -48,6 +58,7 @@ func installSystemDaemonWindows(args []string) (err error) {
 		ServiceType:  windows.SERVICE_WIN32_OWN_PROCESS,
 		StartType:    mgr.StartAutomatic,
 		ErrorControl: mgr.ErrorNormal,
+		Dependencies: serviceDependencies,
 		DisplayName:  serviceName,
 		Description:  "Connects this computer to others on the Tailscale network.",
 	}

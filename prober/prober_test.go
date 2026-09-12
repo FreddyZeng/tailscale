@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package prober
@@ -11,6 +11,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -203,13 +205,24 @@ func TestProberConcurrency(t *testing.T) {
 	p.Run("foo", time.Second, nil, pfunc)
 	waitActiveProbes(t, p, clk, 1)
 
-	for range 50 {
-		clk.Advance(time.Second)
-	}
-
+	// The fake ticker drops ticks when the probe loop goroutine isn't
+	// already blocked on its channel (buffer of one, non-blocking send),
+	// so advancing the clock in a tight loop doesn't guarantee that the
+	// loop observes enough ticks to start three concurrent probe runs.
+	// Instead, advance the clock inside the polling loop so ticks keep
+	// firing until all three probe goroutines have started.
 	if err := tstest.WaitFor(convergenceTimeout, func() error {
+		clk.Advance(time.Second)
 		if got, want := ran.Load(), int64(3); got != want {
 			return fmt.Errorf("expected %d probes to run concurrently, got %d", want, got)
+		}
+		wantMetrics := `
+		# HELP prober_in_flight Number of probes currently running
+        # TYPE prober_in_flight gauge
+        prober_in_flight{class="",name="foo"} 3
+		`
+		if err := testutil.GatherAndCompare(p.metrics, strings.NewReader(wantMetrics), "prober_in_flight"); err != nil {
+			return fmt.Errorf("unexpected metrics: %w", err)
 		}
 		return nil
 	}); err != nil {
@@ -306,9 +319,12 @@ probe_end_secs{class="",label="value",name="testprobe"} %d
 # HELP probe_result Latest probe result (1 = success, 0 = failure)
 # TYPE probe_result gauge
 probe_result{class="",label="value",name="testprobe"} 0
+# HELP probe_in_flight Number of probes currently running
+# TYPE probe_in_flight gauge
+probe_in_flight{class="",label="value",name="testprobe"} 0
 `, probeInterval.Seconds(), epoch.Unix(), epoch.Add(aFewMillis).Unix())
 		return testutil.GatherAndCompare(p.metrics, strings.NewReader(want),
-			"probe_interval_secs", "probe_start_secs", "probe_end_secs", "probe_result")
+			"probe_interval_secs", "probe_start_secs", "probe_end_secs", "probe_result", "probe_in_flight")
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -336,9 +352,13 @@ probe_latency_millis{class="",label="value",name="testprobe"} %d
 # HELP probe_result Latest probe result (1 = success, 0 = failure)
 # TYPE probe_result gauge
 probe_result{class="",label="value",name="testprobe"} 1
+# HELP probe_in_flight Number of probes currently running
+# TYPE probe_in_flight gauge
+probe_in_flight{class="",label="value",name="testprobe"} 0
 `, probeInterval.Seconds(), start.Unix(), end.Unix(), aFewMillis.Milliseconds())
 		return testutil.GatherAndCompare(p.metrics, strings.NewReader(want),
-			"probe_interval_secs", "probe_start_secs", "probe_end_secs", "probe_latency_millis", "probe_result")
+			"probe_interval_secs", "probe_start_secs", "probe_end_secs",
+			"probe_latency_millis", "probe_result", "probe_in_flight")
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -545,7 +565,7 @@ func TestProberRunHandler(t *testing.T) {
 		probeFunc             func(context.Context) error
 		wantResponseCode      int
 		wantJSONResponse      RunHandlerResponse
-		wantPlaintextResponse string
+		wantPlaintextResponse *regexp.Regexp
 	}{
 		{
 			name:             "success",
@@ -560,7 +580,7 @@ func TestProberRunHandler(t *testing.T) {
 				},
 				PreviousSuccessRatio: 1,
 			},
-			wantPlaintextResponse: "Probe succeeded",
+			wantPlaintextResponse: regexp.MustCompile("(?s)Probe succeeded .*Last 2 probes.*success rate 100%"),
 		},
 		{
 			name:             "failure",
@@ -575,7 +595,7 @@ func TestProberRunHandler(t *testing.T) {
 					RecentResults: []bool{false, false},
 				},
 			},
-			wantPlaintextResponse: "Probe failed",
+			wantPlaintextResponse: regexp.MustCompile("(?s)Probe failed: .*Last 2 probes.*success rate 0%"),
 		},
 	}
 
@@ -606,6 +626,7 @@ func TestProberRunHandler(t *testing.T) {
 				if err != nil {
 					t.Fatalf("failed to make request: %v", err)
 				}
+				defer resp.Body.Close()
 
 				if resp.StatusCode != tt.wantResponseCode {
 					t.Errorf("unexpected response code: got %d, want %d", resp.StatusCode, tt.wantResponseCode)
@@ -629,14 +650,203 @@ func TestProberRunHandler(t *testing.T) {
 					}
 				} else {
 					body, _ := io.ReadAll(resp.Body)
-					if !strings.Contains(string(body), tt.wantPlaintextResponse) {
-						t.Errorf("unexpected response body: got %q, want to contain %q", body, tt.wantPlaintextResponse)
+					if !tt.wantPlaintextResponse.MatchString(string(body)) {
+						t.Errorf("unexpected response body: got %q, want to match %q", body, tt.wantPlaintextResponse)
 					}
 				}
 			})
 		}
 	}
 
+}
+
+func TestRunAllHandler(t *testing.T) {
+	clk := newFakeTime()
+
+	tests := []struct {
+		name                  string
+		probeFunc             []func(context.Context) error
+		wantResponseCode      int
+		wantJSONResponse      RunHandlerAllResponse
+		wantPlaintextResponse string
+	}{
+		{
+			name:             "successProbe",
+			probeFunc:        []func(context.Context) error{func(context.Context) error { return nil }, func(context.Context) error { return nil }},
+			wantResponseCode: http.StatusOK,
+			wantJSONResponse: RunHandlerAllResponse{
+				Results: map[string]RunHandlerResponse{
+					"successProbe-0": {
+						ProbeInfo: ProbeInfo{
+							Name:          "successProbe-0",
+							Interval:      probeInterval,
+							Status:        ProbeStatusSucceeded,
+							RecentResults: []bool{true, true},
+						},
+						PreviousSuccessRatio: 1,
+					},
+					"successProbe-1": {
+						ProbeInfo: ProbeInfo{
+							Name:          "successProbe-1",
+							Interval:      probeInterval,
+							Status:        ProbeStatusSucceeded,
+							RecentResults: []bool{true, true},
+						},
+						PreviousSuccessRatio: 1,
+					},
+				},
+			},
+			wantPlaintextResponse: "Probe successProbe-0: succeeded\n\tLast run: 0s\n\tPrevious success rate: 100.0%\n\tPrevious median latency: 0s\nProbe successProbe-1: succeeded\n\tLast run: 0s\n\tPrevious success rate: 100.0%\n\tPrevious median latency: 0s\n\n",
+		},
+		{
+			name:             "successAndFailureProbes",
+			probeFunc:        []func(context.Context) error{func(context.Context) error { return nil }, func(context.Context) error { return fmt.Errorf("error2") }},
+			wantResponseCode: http.StatusFailedDependency,
+			wantJSONResponse: RunHandlerAllResponse{
+				Results: map[string]RunHandlerResponse{
+					"successAndFailureProbes-0": {
+						ProbeInfo: ProbeInfo{
+							Name:          "successAndFailureProbes-0",
+							Interval:      probeInterval,
+							Status:        ProbeStatusSucceeded,
+							RecentResults: []bool{true, true},
+						},
+						PreviousSuccessRatio: 1,
+					},
+					"successAndFailureProbes-1": {
+						ProbeInfo: ProbeInfo{
+							Name:          "successAndFailureProbes-1",
+							Interval:      probeInterval,
+							Status:        ProbeStatusFailed,
+							Error:         "error2",
+							RecentResults: []bool{false, false},
+						},
+					},
+				},
+			},
+			wantPlaintextResponse: "Probe successAndFailureProbes-0: succeeded\n\tLast run: 0s\n\tPrevious success rate: 100.0%\n\tPrevious median latency: 0s\nProbe successAndFailureProbes-1: failed\n\tLast run: 0s\n\tPrevious success rate: 0.0%\n\tPrevious median latency: 0s\n\n\tLast error: error2\n\n",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newForTest(clk.Now, clk.NewTicker).WithOnce(true)
+			for i, pfunc := range tc.probeFunc {
+				probe := p.Run(fmt.Sprintf("%s-%d", tc.name, i), probeInterval, nil, FuncProbe(pfunc))
+				defer probe.Close()
+				<-probe.stopped // wait for the first run.
+			}
+
+			mux := http.NewServeMux()
+			server := httptest.NewServer(mux)
+			defer server.Close()
+
+			mux.Handle("/prober/runall/", tsweb.StdHandler(tsweb.ReturnHandlerFunc(p.RunAllHandler), tsweb.HandlerOptions{}))
+
+			req, err := http.NewRequest("GET", server.URL+"/prober/runall", nil)
+			if err != nil {
+				t.Fatalf("failed to create request: %v", err)
+			}
+
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("failed to make request: %v", err)
+			}
+
+			if resp.StatusCode != tc.wantResponseCode {
+				t.Errorf("unexpected response code: got %d, want %d", resp.StatusCode, tc.wantResponseCode)
+			}
+
+			if resp.Header.Get("Content-Type") != "application/json" {
+				t.Errorf("unexpected content type: got %q, want application/json", resp.Header.Get("Content-Type"))
+			}
+			var gotJSON RunHandlerAllResponse
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("failed to read response body: %v", err)
+			}
+
+			if err := json.Unmarshal(body, &gotJSON); err != nil {
+				t.Fatalf("failed to unmarshal JSON response: %v; body: %s", err, body)
+			}
+			if diff := cmp.Diff(tc.wantJSONResponse, gotJSON, cmpopts.IgnoreFields(ProbeInfo{}, "Start", "End", "Labels", "RecentLatencies")); diff != "" {
+				t.Errorf("unexpected JSON response (-want +got):\n%s", diff)
+			}
+
+		})
+	}
+
+}
+
+func TestExcludeInRunAll(t *testing.T) {
+	clk := newFakeTime()
+	p := newForTest(clk.Now, clk.NewTicker).WithOnce(true)
+
+	wantJSONResponse := RunHandlerAllResponse{
+		Results: map[string]RunHandlerResponse{
+			"includedProbe": {
+				ProbeInfo: ProbeInfo{
+					Name:          "includedProbe",
+					Interval:      probeInterval,
+					Status:        ProbeStatusSucceeded,
+					RecentResults: []bool{true, true},
+				},
+				PreviousSuccessRatio: 1,
+			},
+		},
+	}
+
+	includedProbe := p.Run("includedProbe", probeInterval, nil, FuncProbe(func(context.Context) error { return nil }))
+	excludedProbe := p.Run("excludedProbe", probeInterval, nil, FuncProbe(func(context.Context) error { return nil }))
+	excludedOtherProbe := p.Run("excludedOtherProbe", probeInterval, nil, FuncProbe(func(context.Context) error { return nil }))
+
+	// Wait for all probes to complete their initial run
+	<-includedProbe.stopped
+	<-excludedProbe.stopped
+	<-excludedOtherProbe.stopped
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	mux.Handle("/prober/runall", tsweb.StdHandler(tsweb.ReturnHandlerFunc(p.RunAllHandler), tsweb.HandlerOptions{}))
+
+	req, err := http.NewRequest("GET", server.URL+"/prober/runall", nil)
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+
+	// Exclude probes with "excluded" in their name
+	req.URL.RawQuery = url.Values{
+		"exclude": []string{"excludedProbe", "excludedOtherProbe"},
+	}.Encode()
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("failed to make request: %v", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("unexpected response code: got %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	var gotJSON RunHandlerAllResponse
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("failed to read response body: %v", err)
+	}
+
+	if err := json.Unmarshal(body, &gotJSON); err != nil {
+		t.Fatalf("failed to unmarshal JSON response: %v; body: %s", err, body)
+	}
+
+	if resp.Header.Get("Content-Type") != "application/json" {
+		t.Errorf("unexpected content type: got %q, want application/json", resp.Header.Get("Content-Type"))
+	}
+
+	if diff := cmp.Diff(wantJSONResponse, gotJSON, cmpopts.IgnoreFields(ProbeInfo{}, "Start", "End", "Labels", "RecentLatencies")); diff != "" {
+		t.Errorf("unexpected JSON response (-want +got):\n%s", diff)
+	}
 }
 
 type fakeTicker struct {

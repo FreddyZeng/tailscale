@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package web
@@ -26,8 +26,10 @@ import (
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/memnet"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/peercap"
 	"tailscale.com/types/views"
 	"tailscale.com/util/httpm"
+	"tailscale.com/util/syspolicy/policyclient"
 )
 
 func TestQnapAuthnURL(t *testing.T) {
@@ -40,37 +42,37 @@ func TestQnapAuthnURL(t *testing.T) {
 		want string
 	}{
 		{
-			name: "localhost http",
+			name: "localhost-http",
 			in:   "http://localhost:8088/",
 			want: "http://localhost:8088/cgi-bin/authLogin.cgi?qtoken=token",
 		},
 		{
-			name: "localhost https",
+			name: "localhost-https",
 			in:   "https://localhost:5000/",
 			want: "https://localhost:5000/cgi-bin/authLogin.cgi?qtoken=token",
 		},
 		{
-			name: "IP http",
+			name: "IP-http",
 			in:   "http://10.1.20.4:80/",
 			want: "http://10.1.20.4:80/cgi-bin/authLogin.cgi?qtoken=token",
 		},
 		{
-			name: "IP6 https",
+			name: "IP6-https",
 			in:   "https://[ff7d:0:1:2::1]/",
 			want: "https://[ff7d:0:1:2::1]/cgi-bin/authLogin.cgi?qtoken=token",
 		},
 		{
-			name: "hostname https",
+			name: "hostname-https",
 			in:   "https://qnap.example.com/",
 			want: "https://qnap.example.com/cgi-bin/authLogin.cgi?qtoken=token",
 		},
 		{
-			name: "invalid URL",
+			name: "invalid-URL",
 			in:   "This is not a URL, it is a really really really really really really really really really really really really long string to exercise the URL truncation code in the error path.",
 			want: "http://localhost/cgi-bin/authLogin.cgi?qtoken=token",
 		},
 		{
-			name: "err != nil",
+			name: "err-not-nil",
 			in:   "http://192.168.0.%31/",
 			want: "http://localhost/cgi-bin/authLogin.cgi?qtoken=token",
 		},
@@ -104,7 +106,7 @@ func TestServeAPI(t *testing.T) {
 			remoteIPWithAllCapabilities: {
 				Node:        &tailcfg.Node{StableID: "node1"},
 				UserProfile: remoteUser,
-				CapMap:      tailcfg.PeerCapMap{tailcfg.PeerCapabilityWebUI: []tailcfg.RawMessage{"{\"canEdit\":[\"*\"]}"}},
+				CapMap:      tailcfg.PeerCapMap{peercap.WebUI: []tailcfg.RawMessage{"{\"canEdit\":[\"*\"]}"}},
 			},
 			remoteIPWithNoCapabilities: {
 				Node:        &tailcfg.Node{StableID: "node2"},
@@ -190,7 +192,7 @@ func TestServeAPI(t *testing.T) {
 		reqBody:   "{\"setExitNode\":true}",
 		tests: []requestTest{{
 			remoteIP:     remoteIPWithNoCapabilities,
-			wantResponse: "not allowed",
+			wantResponse: "SetExitNode not allowed",
 			wantStatus:   http.StatusUnauthorized,
 		}, {
 			remoteIP:   remoteIPWithAllCapabilities,
@@ -203,7 +205,7 @@ func TestServeAPI(t *testing.T) {
 		reqContentType: "application/json",
 		tests: []requestTest{{
 			remoteIP:     remoteIPWithNoCapabilities,
-			wantResponse: "not allowed",
+			wantResponse: "RunSSHSet not allowed",
 			wantStatus:   http.StatusUnauthorized,
 		}, {
 			remoteIP:   remoteIPWithAllCapabilities,
@@ -576,16 +578,28 @@ func TestServeAuth(t *testing.T) {
 		timeNow:     func() time.Time { return timeNow },
 		newAuthURL:  mockNewAuthURL,
 		waitAuthURL: mockWaitAuthURL,
+		polc:        policyclient.NoPolicyClient{},
 	}
 
 	successCookie := "ts-cookie-success"
 	s.browserSessions.Store(successCookie, &browserSession{
-		ID:      successCookie,
-		SrcNode: remoteNode.Node.ID,
-		SrcUser: user.ID,
-		Created: oneHourAgo,
-		AuthID:  testAuthPathSuccess,
-		AuthURL: *testControlURL + testAuthPathSuccess,
+		ID:          successCookie,
+		SrcNode:     remoteNode.Node.ID,
+		SrcUser:     user.ID,
+		Created:     oneHourAgo,
+		AuthID:      testAuthPathSuccess,
+		AuthURL:     *testControlURL + testAuthPathSuccess,
+		PendingAuth: true,
+	})
+	successCookie2 := "ts-cookie-success-2"
+	s.browserSessions.Store(successCookie2, &browserSession{
+		ID:          successCookie2,
+		SrcNode:     remoteNode.Node.ID,
+		SrcUser:     user.ID,
+		Created:     oneHourAgo,
+		AuthID:      testAuthPathSuccess,
+		AuthURL:     *testControlURL + testAuthPathSuccess,
+		PendingAuth: true,
 	})
 	failureCookie := "ts-cookie-failure"
 	s.browserSessions.Store(failureCookie, &browserSession{
@@ -640,22 +654,7 @@ func TestServeAuth(t *testing.T) {
 				AuthID:        testAuthPath,
 				AuthURL:       *testControlURL + testAuthPath,
 				Authenticated: false,
-			},
-		},
-		{
-			name:       "query-existing-incomplete-session",
-			path:       "/api/auth",
-			cookie:     successCookie,
-			wantStatus: http.StatusOK,
-			wantResp:   &authResponse{ViewerIdentity: vi, ServerMode: ManageServerMode},
-			wantSession: &browserSession{
-				ID:            successCookie,
-				SrcNode:       remoteNode.Node.ID,
-				SrcUser:       user.ID,
-				Created:       oneHourAgo,
-				AuthID:        testAuthPathSuccess,
-				AuthURL:       *testControlURL + testAuthPathSuccess,
-				Authenticated: false,
+				PendingAuth:   true,
 			},
 		},
 		{
@@ -672,16 +671,33 @@ func TestServeAuth(t *testing.T) {
 				AuthID:        testAuthPathSuccess,
 				AuthURL:       *testControlURL + testAuthPathSuccess,
 				Authenticated: false,
+				PendingAuth:   true,
 			},
 		},
 		{
-			name:       "transition-to-successful-session",
+			name:       "transition-to-successful-session-via-api-auth-session-wait",
 			path:       "/api/auth/session/wait",
 			cookie:     successCookie,
 			wantStatus: http.StatusOK,
 			wantResp:   nil,
 			wantSession: &browserSession{
 				ID:            successCookie,
+				SrcNode:       remoteNode.Node.ID,
+				SrcUser:       user.ID,
+				Created:       oneHourAgo,
+				AuthID:        testAuthPathSuccess,
+				AuthURL:       *testControlURL + testAuthPathSuccess,
+				Authenticated: true,
+			},
+		},
+		{
+			name:       "transition-to-successful-session-via-api-auth",
+			path:       "/api/auth",
+			cookie:     successCookie2,
+			wantStatus: http.StatusOK,
+			wantResp:   &authResponse{Authorized: true, ViewerIdentity: vi, ServerMode: ManageServerMode},
+			wantSession: &browserSession{
+				ID:            successCookie2,
 				SrcNode:       remoteNode.Node.ID,
 				SrcUser:       user.ID,
 				Created:       oneHourAgo,
@@ -729,6 +745,7 @@ func TestServeAuth(t *testing.T) {
 				AuthID:        testAuthPath,
 				AuthURL:       *testControlURL + testAuthPath,
 				Authenticated: false,
+				PendingAuth:   true,
 			},
 		},
 		{
@@ -746,6 +763,7 @@ func TestServeAuth(t *testing.T) {
 				AuthID:        testAuthPath,
 				AuthURL:       *testControlURL + testAuthPath,
 				Authenticated: false,
+				PendingAuth:   true,
 			},
 		},
 		{
@@ -1231,7 +1249,7 @@ func TestPeerCapabilities(t *testing.T) {
 				UserProfile: &tailcfg.UserProfile{ID: tailcfg.UserID(2)},
 				Node:        &tailcfg.Node{ID: tailcfg.NodeID(1)},
 				CapMap: tailcfg.PeerCapMap{
-					tailcfg.PeerCapabilityWebUI: []tailcfg.RawMessage{
+					peercap.WebUI: []tailcfg.RawMessage{
 						"{\"canEdit\":[\"ssh\",\"subnets\"]}",
 					},
 				},
@@ -1245,7 +1263,7 @@ func TestPeerCapabilities(t *testing.T) {
 				UserProfile: &tailcfg.UserProfile{ID: tailcfg.UserID(1)},
 				Node:        &tailcfg.Node{ID: tailcfg.NodeID(1)},
 				CapMap: tailcfg.PeerCapMap{
-					tailcfg.PeerCapabilityWebUI: []tailcfg.RawMessage{
+					peercap.WebUI: []tailcfg.RawMessage{
 						"{\"canEdit\":[\"ssh\",\"subnets\"]}",
 					},
 				},
@@ -1258,7 +1276,7 @@ func TestPeerCapabilities(t *testing.T) {
 			whois: &apitype.WhoIsResponse{
 				Node: &tailcfg.Node{ID: tailcfg.NodeID(1)},
 				CapMap: tailcfg.PeerCapMap{
-					tailcfg.PeerCapabilityDebugPeer: []tailcfg.RawMessage{},
+					peercap.DebugPeer: []tailcfg.RawMessage{},
 				},
 			},
 			wantCaps: peerCapabilities{},
@@ -1269,7 +1287,7 @@ func TestPeerCapabilities(t *testing.T) {
 			whois: &apitype.WhoIsResponse{
 				Node: &tailcfg.Node{ID: tailcfg.NodeID(1)},
 				CapMap: tailcfg.PeerCapMap{
-					tailcfg.PeerCapabilityWebUI: []tailcfg.RawMessage{
+					peercap.WebUI: []tailcfg.RawMessage{
 						"{\"canEdit\":[\"ssh\",\"subnets\"]}",
 					},
 				},
@@ -1285,7 +1303,7 @@ func TestPeerCapabilities(t *testing.T) {
 			whois: &apitype.WhoIsResponse{
 				Node: &tailcfg.Node{ID: tailcfg.NodeID(1)},
 				CapMap: tailcfg.PeerCapMap{
-					tailcfg.PeerCapabilityWebUI: []tailcfg.RawMessage{
+					peercap.WebUI: []tailcfg.RawMessage{
 						"{\"canEdit\":[\"ssh\",\"subnets\"]}",
 						"{\"canEdit\":[\"subnets\",\"exitnodes\",\"*\"]}",
 					},
@@ -1304,7 +1322,7 @@ func TestPeerCapabilities(t *testing.T) {
 			whois: &apitype.WhoIsResponse{
 				Node: &tailcfg.Node{ID: tailcfg.NodeID(1)},
 				CapMap: tailcfg.PeerCapMap{
-					tailcfg.PeerCapabilityWebUI: []tailcfg.RawMessage{
+					peercap.WebUI: []tailcfg.RawMessage{
 						"{\"canEdit\":[\"SSH\",\"sUBnets\"]}",
 					},
 				},
@@ -1320,7 +1338,7 @@ func TestPeerCapabilities(t *testing.T) {
 			whois: &apitype.WhoIsResponse{
 				Node: &tailcfg.Node{ID: tailcfg.NodeID(1)},
 				CapMap: tailcfg.PeerCapMap{
-					tailcfg.PeerCapabilityWebUI: []tailcfg.RawMessage{
+					peercap.WebUI: []tailcfg.RawMessage{
 						"{\"canEdit\":[\"unknown-feature\"]}",
 					},
 				},
@@ -1333,7 +1351,7 @@ func TestPeerCapabilities(t *testing.T) {
 			whois: &apitype.WhoIsResponse{
 				Node: &tailcfg.Node{ID: tailcfg.NodeID(1)},
 				CapMap: tailcfg.PeerCapMap{
-					tailcfg.PeerCapabilityWebUI: []tailcfg.RawMessage{
+					peercap.WebUI: []tailcfg.RawMessage{
 						"{\"canDoSomething\":[\"*\"]}",
 					},
 				},
@@ -1346,7 +1364,7 @@ func TestPeerCapabilities(t *testing.T) {
 			whois: &apitype.WhoIsResponse{
 				Node: &tailcfg.Node{ID: tailcfg.NodeID(1), Tags: tags.AsSlice()},
 				CapMap: tailcfg.PeerCapMap{
-					tailcfg.PeerCapabilityWebUI: []tailcfg.RawMessage{
+					peercap.WebUI: []tailcfg.RawMessage{
 						"{\"canEdit\":[\"ssh\",\"subnets\"]}",
 					},
 				},
@@ -1460,7 +1478,9 @@ func mockLocalAPI(t *testing.T, whoIs map[string]*apitype.WhoIsResponse, self fu
 				http.Error(w, "invalid JSON body", http.StatusBadRequest)
 				return
 			}
-			metricCapture(metricNames[0].Name)
+			if metricCapture != nil && len(metricNames) > 0 {
+				metricCapture(metricNames[0].Name)
+			}
 			writeJSON(w, struct{}{})
 			return
 		case "/localapi/v0/logout":
@@ -1499,47 +1519,47 @@ func TestCSRFProtect(t *testing.T) {
 		wantError      bool
 	}{
 		{
-			name:   "GET requests with no header are allowed",
+			name:   "GET-no-header-allowed", // GET requests with no header are allowed
 			method: "GET",
 		},
 		{
-			name:         "POST requests with same-origin are allowed",
+			name:         "POST-same-origin-allowed",
 			method:       "POST",
 			secFetchSite: "same-origin",
 		},
 		{
-			name:         "POST requests with cross-site are not allowed",
+			name:         "POST-cross-site-rejected",
 			method:       "POST",
 			secFetchSite: "cross-site",
 			wantError:    true,
 		},
 		{
-			name:         "POST requests with unknown sec-fetch-site values are not allowed",
+			name:         "POST-unknown-sec-fetch-site-rejected",
 			method:       "POST",
 			secFetchSite: "new-unknown-value",
 			wantError:    true,
 		},
 		{
-			name:         "POST requests with none are not allowed",
+			name:         "POST-sec-fetch-none-rejected",
 			method:       "POST",
 			secFetchSite: "none",
 			wantError:    true,
 		},
 		{
-			name:   "POST requests with no sec-fetch-site header but matching host and origin are allowed",
+			name:   "POST-no-sec-fetch-site-matching-host-origin", // no sec-fetch-site header but matching host and origin are allowed
 			method: "POST",
 			host:   "example.com",
 			origin: "https://example.com",
 		},
 		{
-			name:      "POST requests with no sec-fetch-site and non-matching host and origin are not allowed",
+			name:      "POST-no-sec-fetch-site-mismatched-host-origin-rejected",
 			method:    "POST",
 			host:      "example.com",
 			origin:    "https://example.net",
 			wantError: true,
 		},
 		{
-			name:           "POST requests with no sec-fetch-site and and origin that matches the override are allowed",
+			name:           "POST-no-sec-fetch-site-origin-override-allowed",
 			method:         "POST",
 			originOverride: "example.net",
 			host:           "internal.example.foo", // Host can be changed by reverse proxies
@@ -1581,6 +1601,152 @@ func TestCSRFProtect(t *testing.T) {
 			}
 			if res.StatusCode != http.StatusOK {
 				t.Errorf("expected status ok, got %v", res.StatusCode)
+			}
+		})
+	}
+}
+
+func TestServePostRoutes(t *testing.T) {
+	existingExitNodeID := tailcfg.StableNodeID("existing-exit-node")
+	existingRoute := netip.MustParsePrefix("192.168.1.0/24")
+
+	existingPrefs := &ipn.Prefs{
+		ExitNodeID:      existingExitNodeID,
+		AdvertiseRoutes: []netip.Prefix{existingRoute},
+	}
+
+	tests := []struct {
+		name           string
+		data           postRoutesRequest
+		peerCaps       peerCapabilities
+		wantErr        bool
+		wantEditPrefs  bool // whether EditPrefs (PATCH /prefs) should be called
+		wantExitNodeID tailcfg.StableNodeID
+		wantRoutes     []netip.Prefix
+	}{
+		{
+			name:          "empty-request",
+			data:          postRoutesRequest{},
+			peerCaps:      peerCapabilities{capFeatureExitNodes: true, capFeatureSubnets: true},
+			wantErr:       true,
+			wantEditPrefs: false,
+		},
+		{
+			name: "SetExitNode-only",
+			data: postRoutesRequest{
+				SetExitNode: true,
+				UseExitNode: "new-exit-node",
+			},
+			peerCaps:       peerCapabilities{capFeatureExitNodes: true, capFeatureSubnets: true},
+			wantEditPrefs:  true,
+			wantExitNodeID: "new-exit-node",
+			wantRoutes:     []netip.Prefix{existingRoute},
+		},
+		{
+			name: "SetExitNode-not-allowed",
+			data: postRoutesRequest{
+				SetExitNode: true,
+				UseExitNode: "new-exit-node",
+			},
+			peerCaps: peerCapabilities{capFeatureSubnets: true},
+			wantErr:  true,
+		},
+		{
+			name: "SetRoutes-only",
+			data: postRoutesRequest{
+				SetRoutes:       true,
+				AdvertiseRoutes: []string{"10.0.0.0/8"},
+			},
+			peerCaps:       peerCapabilities{capFeatureExitNodes: true, capFeatureSubnets: true},
+			wantEditPrefs:  true,
+			wantExitNodeID: existingExitNodeID,
+			wantRoutes:     []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")},
+		},
+		{
+			name: "SetRoutes-not-allowed",
+			data: postRoutesRequest{
+				SetRoutes:       true,
+				AdvertiseRoutes: []string{"10.0.0.0/8"},
+			},
+			peerCaps: peerCapabilities{capFeatureExitNodes: true},
+			wantErr:  true,
+		},
+		{
+			name: "SetExitNode-and-SetRoutes",
+			data: postRoutesRequest{
+				SetExitNode:     true,
+				SetRoutes:       true,
+				UseExitNode:     "new-exit-node",
+				AdvertiseRoutes: []string{"10.0.0.0/8"},
+			},
+			peerCaps:       peerCapabilities{capFeatureExitNodes: true, capFeatureSubnets: true},
+			wantEditPrefs:  true,
+			wantExitNodeID: "new-exit-node",
+			wantRoutes:     []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gotPrefs *ipn.MaskedPrefs
+
+			lal := memnet.Listen("local-tailscaled.sock:80")
+			defer lal.Close()
+
+			localapi := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/localapi/v0/prefs" {
+					t.Errorf("unexpected localapi call to %q", r.URL.Path)
+					http.Error(w, "unexpected localapi call", http.StatusInternalServerError)
+					return
+				}
+				switch r.Method {
+				case httpm.GET:
+					writeJSON(w, existingPrefs)
+				case httpm.PATCH:
+					var mp ipn.MaskedPrefs
+					if err := json.NewDecoder(r.Body).Decode(&mp); err != nil {
+						http.Error(w, err.Error(), http.StatusBadRequest)
+						return
+					}
+					gotPrefs = &mp
+					writeJSON(w, gotPrefs.Prefs)
+				default:
+					t.Errorf("unexpected method %q on /prefs", r.Method)
+					http.Error(w, "unexpected method", http.StatusMethodNotAllowed)
+				}
+			})}
+			defer localapi.Close()
+			go localapi.Serve(lal)
+
+			s := &Server{
+				mode: ManageServerMode,
+				lc:   &local.Client{Dial: lal.Dial},
+			}
+
+			ctx := contextKeyPeer.WithValue(t.Context(), tt.peerCaps)
+			err := s.servePostRoutes(ctx, tt.data)
+
+			if tt.wantErr {
+				if err == nil {
+					t.Error("wanted error, got nil")
+				}
+				if gotPrefs != nil {
+					t.Error("EditPrefs should not have been called on error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if gotPrefs == nil {
+				t.Fatal("expected EditPrefs to be called")
+			}
+			if diff := cmp.Diff(tt.wantExitNodeID, gotPrefs.ExitNodeID); diff != "" {
+				t.Errorf("ExitNodeID mismatch (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff(tt.wantRoutes, gotPrefs.AdvertiseRoutes, cmp.Comparer(func(a, b netip.Prefix) bool { return a.Compare(b) == 0 })); diff != "" {
+				t.Errorf("AdvertiseRoutes mismatch (-want +got):\n%s", diff)
 			}
 		})
 	}

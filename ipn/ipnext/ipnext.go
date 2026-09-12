@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package ipnext defines types and interfaces used for extending the core LocalBackend
@@ -6,6 +6,7 @@
 package ipnext
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"iter"
@@ -17,10 +18,15 @@ import (
 	"tailscale.com/ipn/ipnauth"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/peercap"
 	"tailscale.com/tsd"
 	"tailscale.com/tstime"
+	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/mapx"
+	"tailscale.com/types/netmap"
+	"tailscale.com/types/views"
+	"tailscale.com/wgengine/filter"
 )
 
 // Extension augments LocalBackend with additional functionality.
@@ -201,6 +207,16 @@ type Host interface {
 	// NodeBackend returns the [NodeBackend] for the currently active node
 	// (which is approximately the same as the current profile).
 	NodeBackend() NodeBackend
+
+	// AuthReconfigAsync asynchronously pushes a new configuration into wgengine,
+	// if engine updates are not currently blocked, based on the cached netmap and
+	// user prefs. The reconfiguration is applied to [ipnlocal.LocalBackend]'s currently
+	// active node at the time of execution.
+	//
+	// AuthReconfigAsync should not be called at a high rate (i.e., more often
+	// than prefs and netmap changes), except in experimental or proof-of-concept
+	// contexts, since reconfiguration is known to be slow.
+	AuthReconfigAsync()
 }
 
 // SafeBackend is a subset of the [ipnlocal.LocalBackend] type's methods that
@@ -210,6 +226,33 @@ type SafeBackend interface {
 	Sys() *tsd.System
 	Clock() tstime.Clock
 	TailscaleVarRoot() string
+}
+
+// NotifyWatcher is a subset of [tailscale.com/ipn/ipnlocal.LocalBackend]
+// for extensions that subscribe to the IPN notification bus from within tailscaled.
+//
+// Unlike [SafeBackend], its methods acquire LocalBackend’s internal mutex
+// and must not be called from extension hooks,
+// instead call them from a goroutine started by [Extension.Init].
+type NotifyWatcher interface {
+	// WatchNotifications subscribes to the ipn.Notify message bus notification
+	// messages.
+	//
+	// WatchNotifications blocks until ctx is done.
+	//
+	// The provided onWatchAdded, if non-nil, will be called once the watcher
+	// is installed.
+	//
+	// The provided fn will be called for each notification. It will only be
+	// called with non-nil pointers. The caller must not modify roNotify. If
+	// fn returns false, the watch also stops.
+	//
+	// Failure to consume many notifications in a row will result in one final
+	// notification with ErrMessage set, followed by the watch closing, unless mask
+	// includes ipn.NotifyInProcessNoDisconnect. Watchers using
+	// NotifyInProcessNoDisconnect must not call back into LocalBackend from fn or
+	// wait on work that might call back into LocalBackend.
+	WatchNotifications(ctx context.Context, mask ipn.NotifyWatchOpt, onWatchAdded func(), fn func(roNotify *ipn.Notify) (keepGoing bool))
 }
 
 // ExtensionServices provides access to the [Host]'s extension management services,
@@ -323,7 +366,8 @@ type ProfileStateChangeCallback func(_ ipn.LoginProfileView, _ ipn.PrefsView, sa
 // [ProfileStateChangeCallback]s are called first.
 //
 // It returns a function to be called when the cc is being shut down,
-// or nil if no cleanup is needed.
+// or nil if no cleanup is needed. That cleanup function should not call
+// back into LocalBackend, which may be locked during shutdown.
 type NewControlClientCallback func(controlclient.Client, ipn.LoginProfileView) (cleanup func())
 
 // Hooks is a collection of hooks that extensions can add to (non-concurrently)
@@ -361,6 +405,12 @@ type Hooks struct {
 	// is created. It is called with the LocalBackend locked.
 	NewControlClient feature.Hooks[NewControlClientCallback]
 
+	// OnNetMapToggle is called (with LocalBackend.mu held) when the network map
+	// is toggled from nil to non-nil, or non-nil to nil. This usually happens
+	// when the client connects to the control plane and receives the initial MapResponse,
+	// or when the client disconnects and the network map is cleared.
+	OnNetMapToggle feature.Hooks[func(*netmap.NetworkMap)]
+
 	// OnSelfChange is called (with LocalBackend.mu held) when the self node
 	// changes, including changing to nothing (an invalid view).
 	OnSelfChange feature.Hooks[func(tailcfg.NodeView)]
@@ -372,21 +422,112 @@ type Hooks struct {
 	// SetPeerStatus is called to mutate PeerStatus.
 	// Callers must only use NodeBackend to read data.
 	SetPeerStatus feature.Hooks[func(*ipnstate.PeerStatus, tailcfg.NodeView, NodeBackend)]
+
+	// ShouldUploadServices reports whether this node should include services
+	// in Hostinfo from the portlist extension.
+	ShouldUploadServices feature.Hook[func() bool]
+
+	// Filter contains hooks for the packet filter.
+	// See [filter.Filter] for details on how these hooks are invoked.
+	Filter FilterHooks
+
+	// ExtraWireGuardAllowedIPs is called with a sequence of peers whose
+	// extra AllowedIPs the caller wants (re)computed, and returns
+	// prefixes to append to those peers' AllowedIPs, keyed by node ID.
+	//
+	// The sequence is not necessarily all peers: callers may pass any
+	// subset (such as only the peers changed by a netmap delta), and
+	// the returned map's meaning is scoped to the peers presented. A
+	// peer absent from the returned map has no extra AllowedIPs. As of
+	// 2026-07-15 the only caller passes all current peers on each
+	// reconfig, but extensions must not rely on that.
+	//
+	// An extension with nothing to add should return nil without
+	// iterating peers; that keeps steady-state netmap deltas free of
+	// per-peer work when the extension is idle. The peers sequence is
+	// only valid during the call.
+	//
+	// The extra AllowedIPs are given to WireGuard, but not the OS
+	// routing table.
+	//
+	// The returned prefixes should not contain duplicates, either
+	// internally, or with netmap peer prefixes. They should only
+	// contain host routes, and not contain default or subnet routes.
+	// Subsequent calls that return an unchanged set of prefixes for a
+	// given peer should return the prefixes in the same order for that
+	// peer, to prevent configuration churn.
+	//
+	// The returned map and slices should not be mutated by the
+	// extension after they are returned.
+	//
+	// The hook is called with LocalBackend's mutex locked.
+	//
+	// TODO(#17858): This hook may not be needed and can possibly be replaced by
+	// new hooks that fit into the new architecture that make use of new
+	// WireGuard APIs.
+	ExtraWireGuardAllowedIPs feature.Hook[func(peers iter.Seq2[tailcfg.NodeID, key.NodePublic]) map[tailcfg.NodeID][]netip.Prefix]
+
+	// ExtraRouterConfigRoutes returns a view of prefixes to append to [router.Config.Routes].
+	//
+	// Routes goes through the WireGuard engine which makes efforts to avoid
+	// unnecessary reconfiguration by checking that things have actually changed.
+	// So implementors should make sure that the order of the prefixes is stable
+	// and that we don't have duplicate entries.
+	//
+	// The returned slice should not be mutated by the extension after it is returned.
+	//
+	// The hook is called with LocalBackend's mutex locked.
+	ExtraRouterConfigRoutes feature.Hook[func() views.Slice[netip.Prefix]]
+}
+
+// FilterHooks contains hooks that extensions can use to customize the packet
+// filter. Field names match the corresponding fields in filter.Filter.
+type FilterHooks struct {
+	// IngressAllowHooks are hooks that allow extensions to accept inbound
+	// packets beyond the standard filter rules. Packets that are not dropped
+	// by the direction-agnostic pre-check, but would be not accepted by the
+	// main filter rules, including the check for destinations in the node's
+	// local IP set, will be accepted if they match one of these hooks.
+	// As of 2026-02-24, the ingress filter does not implement explicit drop
+	// rules, but if it does, an explicitly dropped packet will be dropped,
+	// and these hooks will not be evaluated.
+	//
+	// Processing of hooks stop after the first one that returns true.
+	// The returned why string of the first match is used in logging.
+	// Returning false does not drop the packet.
+	// See also [filter.Filter.IngressAllowHooks].
+	IngressAllowHooks feature.Hooks[filter.PacketMatch]
+
+	// LinkLocalAllowHooks are hooks that provide exceptions to the default
+	// policy of dropping link-local unicast packets. They run inside the
+	// direction-agnostic pre-checks for both ingress and egress.
+	//
+	// A hook can allow a link-local packet to pass the link-local check,
+	// but the packet is still subject to all other filter rules, and could be
+	// dropped elsewhere. Matching link-local packets are not logged.
+	// See also [filter.Filter.LinkLocalAllowHooks].
+	LinkLocalAllowHooks feature.Hooks[filter.PacketMatch]
 }
 
 // NodeBackend is an interface to query the current node and its peers.
 //
 // It is not a snapshot in time but is locked to a particular node.
 type NodeBackend interface {
+	// Self returns the current node.
+	Self() tailcfg.NodeView
+
 	// AppendMatchingPeers appends all peers that match the predicate
 	// to the base slice and returns it.
 	AppendMatchingPeers(base []tailcfg.NodeView, pred func(tailcfg.NodeView) bool) []tailcfg.NodeView
+
+	// Peers returns all the current peers.
+	Peers() []tailcfg.NodeView
 
 	// PeerCaps returns the capabilities that src has to this node.
 	PeerCaps(src netip.Addr) tailcfg.PeerCapMap
 
 	// PeerHasCap reports whether the peer has the specified peer capability.
-	PeerHasCap(peer tailcfg.NodeView, cap tailcfg.PeerCapability) bool
+	PeerHasCap(peer tailcfg.NodeView, cap peercap.Cap) bool
 
 	// PeerAPIBase returns the "http://ip:port" URL base to reach peer's
 	// PeerAPI, or the empty string if the peer is invalid or doesn't support
@@ -398,4 +539,13 @@ type NodeBackend interface {
 	// It effectively just reports whether PeerAPIBase(node) is non-empty, but
 	// potentially more efficiently.
 	PeerHasPeerAPI(tailcfg.NodeView) bool
+
+	// CollectServices reports whether the control plane is telling this
+	// node that the portlist service collection is desirable, should it
+	// choose to report them.
+	CollectServices() bool
+
+	// DERPMap returns the current DERP map from the current netmap,
+	// or nil if there is no netmap.
+	DERPMap() *tailcfg.DERPMap
 }

@@ -1,10 +1,11 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package ipn
 
 import (
 	"bytes"
+	"iter"
 	"sync"
 	"testing"
 
@@ -29,6 +30,19 @@ func (s *memStore) WriteState(k StateKey, v []byte) error {
 	mak.Set(&s.m, k, bytes.Clone(v))
 	s.writes++
 	return nil
+}
+
+func (s *memStore) All() iter.Seq2[StateKey, []byte] {
+	return func(yield func(StateKey, []byte) bool) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		for k, v := range s.m {
+			if !yield(k, v) {
+				break
+			}
+		}
+	}
 }
 
 func TestWriteState(t *testing.T) {

@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package logpolicy
@@ -81,6 +81,50 @@ func TestOptions(t *testing.T) {
 				t.Errorf("got %q, want %q", config.BaseURL, tt.wantBaseURL)
 			}
 			policy.Close()
+		})
+	}
+}
+
+// TestInvalidLogTarget is a test for #17792
+func TestInvalidLogTarget(t *testing.T) {
+	defer resetLogTarget()
+
+	tests := []struct {
+		name      string
+		logTarget string
+	}{
+		{
+			name:      "invalid_url_no_scheme",
+			logTarget: "not a url at all",
+		},
+		{
+			name:      "malformed_url",
+			logTarget: "ht!tp://invalid",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resetLogTarget()
+			os.Setenv("TS_LOG_TARGET", tt.logTarget)
+
+			opts := Options{
+				Collection: "test.log.tailscale.io",
+				Logf:       t.Logf,
+			}
+
+			// This should not panic even with invalid log target
+			config, policy := opts.init(false)
+			if policy == nil {
+				t.Fatal("expected non-nil policy")
+			}
+			defer policy.Close()
+
+			// When log target is invalid, it should fall back to the invalid value
+			// but not crash. BaseURL should remain empty
+			if config.BaseURL != "" {
+				t.Errorf("got BaseURL=%q, want empty", config.BaseURL)
+			}
 		})
 	}
 }

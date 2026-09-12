@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // The natc command is a work-in-progress implementation of a NAT based
@@ -8,6 +8,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"expvar"
 	"flag"
@@ -18,10 +19,13 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/gaissmai/bart"
+	"github.com/hashicorp/raft"
 	"github.com/inetaf/tcpproxy"
 	"github.com/peterbourgon/ff/v3"
 	"go4.org/netipx"
@@ -49,14 +53,20 @@ func main() {
 	// Parse flags
 	fs := flag.NewFlagSet("natc", flag.ExitOnError)
 	var (
-		debugPort       = fs.Int("debug-port", 8893, "Listening port for debug/metrics endpoint")
-		hostname        = fs.String("hostname", "", "Hostname to register the service under")
-		siteID          = fs.Uint("site-id", 1, "an integer site ID to use for the ULA prefix which allows for multiple proxies to act in a HA configuration")
-		v4PfxStr        = fs.String("v4-pfx", "100.64.1.0/24", "comma-separated list of IPv4 prefixes to advertise")
-		verboseTSNet    = fs.Bool("verbose-tsnet", false, "enable verbose logging in tsnet")
-		printULA        = fs.Bool("print-ula", false, "print the ULA prefix and exit")
-		ignoreDstPfxStr = fs.String("ignore-destinations", "", "comma-separated list of prefixes to ignore")
-		wgPort          = fs.Uint("wg-port", 0, "udp port for wireguard and peer to peer traffic")
+		debugPort         = fs.Int("debug-port", 8893, "Listening port for debug/metrics endpoint")
+		hostname          = fs.String("hostname", "", "Hostname to register the service under")
+		siteID            = fs.Uint("site-id", 1, "an integer site ID to use for the ULA prefix which allows for multiple proxies to act in a HA configuration")
+		v4PfxStr          = fs.String("v4-pfx", "100.64.1.0/24", "comma-separated list of IPv4 prefixes to advertise")
+		dnsServers        = fs.String("dns-servers", "", "comma separated list of upstream DNS to use, including host and port (use system if empty)")
+		verboseTSNet      = fs.Bool("verbose-tsnet", false, "enable verbose logging in tsnet")
+		printULA          = fs.Bool("print-ula", false, "print the ULA prefix and exit")
+		ignoreDstPfxStr   = fs.String("ignore-destinations", "", "comma-separated list of prefixes to ignore")
+		wgPort            = fs.Uint("wg-port", 0, "udp port for wireguard and peer to peer traffic")
+		clusterTag        = fs.String("cluster-tag", "", "optionally run in a consensus cluster with other nodes with this tag")
+		server            = fs.String("login-server", ipn.DefaultControlURL, "the base URL of control server")
+		stateDir          = fs.String("state-dir", "", "path to directory in which to store app state")
+		clusterFollowOnly = fs.Bool("follow-only", false, "Try to find a leader with the cluster tag or exit.")
+		clusterAdminPort  = fs.Int("cluster-admin-port", 8081, "Port on localhost for the cluster admin HTTP API")
 	)
 	ff.Parse(fs, os.Args[1:], ff.WithEnvVarPrefix("TS_NATC"))
 
@@ -73,14 +83,14 @@ func main() {
 		log.Fatalf("site-id must be in the range [0, 65535]")
 	}
 
-	var ignoreDstTable *bart.Table[bool]
-	for _, s := range strings.Split(*ignoreDstPfxStr, ",") {
+	var ignoreDstTable *bart.Lite
+	for s := range strings.SplitSeq(*ignoreDstPfxStr, ",") {
 		s := strings.TrimSpace(s)
 		if s == "" {
 			continue
 		}
 		if ignoreDstTable == nil {
-			ignoreDstTable = &bart.Table[bool]{}
+			ignoreDstTable = &bart.Lite{}
 		}
 		pfx, err := netip.ParsePrefix(s)
 		if err != nil {
@@ -89,11 +99,13 @@ func main() {
 		if pfx.Masked() != pfx {
 			log.Fatalf("prefix %v is not normalized (bits are set outside the mask)", pfx)
 		}
-		ignoreDstTable.Insert(pfx, true)
+		ignoreDstTable.Insert(pfx)
 	}
 	ts := &tsnet.Server{
 		Hostname: *hostname,
+		Dir:      *stateDir,
 	}
+	ts.ControlURL = *server
 	if *wgPort != 0 {
 		if *wgPort >= 1<<16 {
 			log.Fatalf("wg-port must be in the range [0, 65535]")
@@ -138,7 +150,7 @@ func main() {
 	}
 
 	var prefixes []netip.Prefix
-	for _, s := range strings.Split(*v4PfxStr, ",") {
+	for s := range strings.SplitSeq(*v4PfxStr, ",") {
 		p := netip.MustParsePrefix(strings.TrimSpace(s))
 		if p.Masked() != p {
 			log.Fatalf("v4 prefix %v is not a masked prefix", p)
@@ -148,17 +160,76 @@ func main() {
 	routes, dnsAddr, addrPool := calculateAddresses(prefixes)
 
 	v6ULA := ula(uint16(*siteID))
+
+	var ipp ippool.IPPool
+	if *clusterTag != "" {
+		cipp := ippool.NewConsensusIPPool(addrPool)
+		clusterStateDir, err := getClusterStatePath(*stateDir)
+		if err != nil {
+			log.Fatalf("Creating cluster state dir failed: %v", err)
+		}
+		err = cipp.StartConsensus(ctx, ts, ippool.ClusterOpts{
+			Tag:        *clusterTag,
+			StateDir:   clusterStateDir,
+			FollowOnly: *clusterFollowOnly,
+		})
+		if err != nil {
+			log.Fatalf("StartConsensus: %v", err)
+		}
+		defer func() {
+			err := cipp.StopConsensus(ctx)
+			if err != nil {
+				log.Printf("Error stopping consensus: %v", err)
+			}
+		}()
+		ipp = cipp
+
+		go func() {
+			// This listens on localhost only, so that only those with access to the host machine
+			// can remove servers from the cluster config.
+			log.Print(http.ListenAndServe(fmt.Sprintf("127.0.0.1:%d", *clusterAdminPort), httpClusterAdmin(cipp)))
+		}()
+	} else {
+		ipp = &ippool.SingleMachineIPPool{IPSet: addrPool}
+	}
+
 	c := &connector{
 		ts:         ts,
 		whois:      lc,
 		v6ULA:      v6ULA,
 		ignoreDsts: ignoreDstTable,
-		ipPool:     &ippool.IPPool{IPSet: addrPool},
+		ipPool:     ipp,
 		routes:     routes,
 		dnsAddr:    dnsAddr,
-		resolver:   net.DefaultResolver,
+		resolver:   getResolver(*dnsServers),
 	}
 	c.run(ctx, lc)
+}
+
+// getResolver parses serverFlag and returns either the default resolver, or a
+// resolver that uses the provided comma-separated DNS server AddrPort's, or
+// panics.
+func getResolver(serverFlag string) lookupNetIPer {
+	if serverFlag == "" {
+		return net.DefaultResolver
+	}
+	var addrs []string
+	for s := range strings.SplitSeq(serverFlag, ",") {
+		s = strings.TrimSpace(s)
+		addr, err := netip.ParseAddrPort(s)
+		if err != nil {
+			log.Fatalf("dns server provided: %q does not parse: %v", s, err)
+		}
+		addrs = append(addrs, addr.String())
+	}
+	return &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network string, address string) (net.Conn, error) {
+			var dialer net.Dialer
+			// TODO(raggi): perhaps something other than random?
+			return dialer.DialContext(ctx, network, addrs[rand.N(len(addrs))])
+		},
+	}
 }
 
 func calculateAddresses(prefixes []netip.Prefix) (*netipx.IPSet, netip.Addr, *netipx.IPSet) {
@@ -206,10 +277,10 @@ type connector struct {
 	// and if any of the ip addresses in response to the lookup match any 'ignore destinations' prefix we will
 	// return a dns response that contains the ip addresses we discovered with the lookup (ie not the
 	// natc behavior, which would return a dummy ip address pointing at natc).
-	ignoreDsts *bart.Table[bool]
+	ignoreDsts *bart.Lite
 
 	// ipPool contains the per-peer IPv4 address assignments.
-	ipPool *ippool.IPPool
+	ipPool ippool.IPPool
 
 	// resolver is used to lookup IP addresses for DNS queries.
 	resolver lookupNetIPer
@@ -302,8 +373,7 @@ func (c *connector) handleDNS(pc net.PacketConn, buf []byte, remoteAddr *net.UDP
 		addrQCount++
 		if _, ok := resolves[q.Name.String()]; !ok {
 			addrs, err := c.resolver.LookupNetIP(ctx, "ip", q.Name.String())
-			var dnsErr *net.DNSError
-			if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
+			if dnsErr, ok := errors.AsType[*net.DNSError](err); ok && dnsErr.IsNotFound {
 				continue
 			}
 			if err != nil {
@@ -453,7 +523,7 @@ func (c *connector) handleTCPFlow(src, dst netip.AddrPort) (handler func(net.Con
 	if dstAddr.Is6() {
 		dstAddr = v4ForV6(dstAddr)
 	}
-	domain, ok := c.ipPool.DomainForIP(who.Node.ID, dstAddr)
+	domain, ok := c.ipPool.DomainForIP(who.Node.ID, dstAddr, time.Now())
 	if !ok {
 		return nil, false
 	}
@@ -468,12 +538,7 @@ func (c *connector) ignoreDestination(dstAddrs []netip.Addr) bool {
 	if c.ignoreDsts == nil {
 		return false
 	}
-	for _, a := range dstAddrs {
-		if _, ok := c.ignoreDsts.Lookup(a); ok {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(dstAddrs, c.ignoreDsts.Contains)
 }
 
 func proxyTCPConn(c net.Conn, dest string, ctor *connector) {
@@ -546,4 +611,58 @@ func proxyTCPConn(c net.Conn, dest string, ctor *connector) {
 	})
 
 	p.Start()
+}
+
+func getClusterStatePath(stateDirFlag string) (string, error) {
+	var dirPath string
+	if stateDirFlag != "" {
+		dirPath = stateDirFlag
+	} else {
+		confDir, err := os.UserConfigDir()
+		if err != nil {
+			return "", err
+		}
+		dirPath = filepath.Join(confDir, "nat-connector-state")
+	}
+	dirPath = filepath.Join(dirPath, "cluster")
+
+	if err := os.MkdirAll(dirPath, 0700); err != nil {
+		return "", err
+	}
+	if fi, err := os.Stat(dirPath); err != nil {
+		return "", err
+	} else if !fi.IsDir() {
+		return "", fmt.Errorf("%v is not a directory", dirPath)
+	}
+
+	return dirPath, nil
+}
+
+func httpClusterAdmin(ipp *ippool.ConsensusIPPool) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+		c, err := ipp.GetClusterConfiguration()
+		if err != nil {
+			log.Printf("cluster admin http: error getClusterConfig: %v", err)
+			http.Error(w, "", http.StatusInternalServerError)
+			return
+		}
+		if err := json.NewEncoder(w).Encode(c); err != nil {
+			log.Printf("cluster admin http: error encoding raft configuration: %v", err)
+		}
+	})
+	mux.HandleFunc("DELETE /{id}", func(w http.ResponseWriter, r *http.Request) {
+		idString := r.PathValue("id")
+		id := raft.ServerID(idString)
+		idx, err := ipp.DeleteClusterServer(id)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if err := json.NewEncoder(w).Encode(idx); err != nil {
+			log.Printf("cluster admin http: error encoding delete index: %v", err)
+			return
+		}
+	})
+	return mux
 }

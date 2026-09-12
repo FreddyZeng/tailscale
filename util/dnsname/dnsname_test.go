@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package dnsname
@@ -59,6 +59,38 @@ func TestFQDN(t *testing.T) {
 	}
 }
 
+func TestFQDNTooLong(t *testing.T) {
+	// RFC 1035 says a dns name has a max size of 255 octets, and is represented as labels of len+ASCII chars so
+	//   example.com
+	// is represented as
+	//   7example3com0
+	// which is to say that if we have a trailing dot then the dots cancel out all the len bytes except the first and
+	// we can accept 254 chars.
+
+	// This name is max length
+	name := "aaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaa.example.com."
+	if len(name) != 254 {
+		t.Fatalf("name should be 254 chars including trailing . (len is %d)", len(name))
+	}
+	got, err := ToFQDN(name)
+	if err != nil {
+		t.Fatalf("want: no error, got: %v", err)
+	}
+	if string(got) != name {
+		t.Fatalf("want: %s, got: %s", name, got)
+	}
+
+	// This name is too long
+	name = "x" + name
+	got, err = ToFQDN(name)
+	if got != "" {
+		t.Fatalf("want: \"\", got: %s", got)
+	}
+	if err == nil || !strings.HasSuffix(err.Error(), "is too long to be a DNS name") {
+		t.Fatalf("want: error to end with \"is too long to be a DNS name\", got: %v", err)
+	}
+}
+
 func TestFQDNContains(t *testing.T) {
 	tests := []struct {
 		a, b string
@@ -86,6 +118,34 @@ func TestFQDNContains(t *testing.T) {
 
 			if got := a.Contains(b); got != test.want {
 				t.Errorf("ToFQDN(%q).Contains(%q) got %v, want %v", a, b, got, test.want)
+			}
+		})
+	}
+}
+
+func TestFQDNParent(t *testing.T) {
+	tests := []struct {
+		in   string
+		want FQDN
+	}{
+		{"", ""},
+		{".", ""},
+		{"com.", ""},
+		{"foo.com.", "com."},
+		{"www.foo.com.", "foo.com."},
+		{"a.b.c.d.", "b.c.d."},
+		{"sub.node.tailnet.ts.net.", "node.tailnet.ts.net."},
+	}
+
+	for _, test := range tests {
+		t.Run(test.in, func(t *testing.T) {
+			in, err := ToFQDN(test.in)
+			if err != nil {
+				t.Fatalf("ToFQDN(%q): %v", test.in, err)
+			}
+			got := in.Parent()
+			if got != test.want {
+				t.Errorf("ToFQDN(%q).Parent() = %q, want %q", test.in, got, test.want)
 			}
 		})
 	}
@@ -182,6 +242,56 @@ func TestTrimSuffix(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("TrimSuffix(%q, %q) = %q; want %q", tt.name, tt.suffix, got, tt.want)
 		}
+	}
+}
+
+func TestValidLabel(t *testing.T) {
+	tests := []struct {
+		label   string
+		wantErr string
+	}{
+		{"", "empty DNS label"},
+		{"example", ""},
+		{" example", `must start with a letter or number`},
+		{"example ", `must end with a letter or number`},
+		{strings.Repeat("a", 63), ""},
+		{strings.Repeat("a", 64), `is too long, max length is 63 bytes`},
+		{"what🤦xx", "contains invalid character"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.label, func(t *testing.T) {
+			err := ValidLabel(test.label)
+			if (err == nil) != (test.wantErr == "") || (err != nil && !strings.Contains(err.Error(), test.wantErr)) {
+				t.Fatalf("ValidLabel(%s)=%v; expected %v", test.label, err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidLabelLike(t *testing.T) {
+	tests := []struct {
+		labelLike string
+		maxLength int
+		wantErr   string
+	}{
+		{"", 63, "empty DNS label"},
+		{"example", 63, ""},
+		{" example", 63, `must start with a letter or number`},
+		{"example ", 63, `must end with a letter or number`},
+		{strings.Repeat("a", 63), 63, ""},
+		{strings.Repeat("a", 64), 63, `is too long, max length is 63 bytes`},
+		{strings.Repeat("a", 65), 64, `is too long, max length is 64 bytes`},
+		{"what🤦xx", 63, "contains invalid character"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.labelLike, func(t *testing.T) {
+			err := ValidLabelLike(test.labelLike, test.maxLength)
+			if (err == nil) != (test.wantErr == "") || (err != nil && !strings.Contains(err.Error(), test.wantErr)) {
+				t.Fatalf("ValidLabelLike(%s)=%v; expected %v", test.labelLike, err, test.wantErr)
+			}
+		})
 	}
 }
 

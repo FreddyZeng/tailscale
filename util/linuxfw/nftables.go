@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // TODO(#8502): add support for more architectures
@@ -101,6 +101,10 @@ func DebugNetfilter(logf logger.Logf) error {
 	}
 
 	return nil
+}
+
+func init() {
+	hookDetectNetfilter.Set(detectNetfilter)
 }
 
 // detectNetfilter returns the number of nftables rules present in the system.

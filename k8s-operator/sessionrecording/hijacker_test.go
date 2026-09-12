@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !plan9
@@ -91,11 +91,11 @@ func Test_Hijacker(t *testing.T) {
 				who:      &apitype.WhoIsResponse{Node: &tailcfg.Node{}, UserProfile: &tailcfg.UserProfile{}},
 				log:      zl.Sugar(),
 				ts:       &tsnet.Server{},
-				req:      &http.Request{URL: &url.URL{}},
+				req:      &http.Request{URL: &url.URL{RawQuery: "tty=true"}},
 				proto:    tt.proto,
 			}
 			ctx := context.Background()
-			_, err := h.setUpRecording(ctx, tc)
+			_, err := h.setUpRecording(tc)
 			if (err != nil) != tt.wantsSetupErr {
 				t.Errorf("spdyHijacker.setupRecording() error = %v, wantErr %v", err, tt.wantsSetupErr)
 				return

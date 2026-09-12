@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package derphttp implements DERP-over-HTTP.
@@ -32,6 +32,8 @@ import (
 	"tailscale.com/derp"
 	"tailscale.com/derp/derpconst"
 	"tailscale.com/envknob"
+	"tailscale.com/feature"
+	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/health"
 	"tailscale.com/net/dnscache"
 	"tailscale.com/net/netmon"
@@ -39,7 +41,6 @@ import (
 	"tailscale.com/net/netx"
 	"tailscale.com/net/sockstats"
 	"tailscale.com/net/tlsdial"
-	"tailscale.com/net/tshttpproxy"
 	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstime"
@@ -59,6 +60,7 @@ type Client struct {
 	DNSCache      *dnscache.Resolver // optional; nil means no caching
 	MeshKey       key.DERPMesh       // optional; for trusted clients
 	IsProber      bool               // optional; for probers to optional declare themselves as such
+	AppName       string             // optional; opaque app name to advertise to the server for stats
 
 	// WatchConnectionChanges is whether the client wishes to subscribe to
 	// notifications about clients connecting & disconnecting.
@@ -178,7 +180,7 @@ func NewClient(privateKey key.NodePrivate, serverURL string, logf logger.Logf, n
 
 // isStarted reports whether this client has been used yet.
 //
-// If if reports false, it may still have its exported fields configured.
+// If it reports false, it may still have its exported fields configured.
 func (c *Client) isStarted() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -279,10 +281,16 @@ func (c *Client) urlString(node *tailcfg.DERPNode) string {
 		return c.url.String()
 	}
 	proto := "https"
+	defaultPort := 443
 	if debugUseDERPHTTP() {
 		proto = "http"
+		defaultPort = 80
 	}
-	return fmt.Sprintf("%s://%s/derp", proto, node.HostName)
+	host := node.HostName
+	if node.DERPPort != 0 && node.DERPPort != defaultPort {
+		host = net.JoinHostPort(host, fmt.Sprint(node.DERPPort))
+	}
+	return fmt.Sprintf("%s://%s/derp", proto, host)
 }
 
 // AddressFamilySelector decides whether IPv6 is preferred for
@@ -406,6 +414,7 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
 			derp.MeshKey(c.MeshKey),
 			derp.CanAckPings(c.canAckPings),
 			derp.IsProber(c.IsProber),
+			derp.AppName(c.AppName),
 		)
 		if err != nil {
 			return nil, 0, err
@@ -522,7 +531,7 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
 		// just to get routed into the server's HTTP Handler so it
 		// can Hijack the request, but we signal with a special header
 		// that we don't want to deal with its HTTP response.
-		req.Header.Set(fastStartHeader, "1") // suppresses the server's HTTP response
+		req.Header.Set(derp.FastStartHeader, "1") // suppresses the server's HTTP response
 		if err := req.Write(brw); err != nil {
 			return nil, 0, err
 		}
@@ -551,6 +560,7 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
 		derp.ServerPublicKey(serverPub),
 		derp.CanAckPings(c.canAckPings),
 		derp.IsProber(c.IsProber),
+		derp.AppName(c.AppName),
 	)
 	if err != nil {
 		return nil, 0, err
@@ -647,7 +657,10 @@ func (c *Client) dialRegion(ctx context.Context, reg *tailcfg.DERPRegion) (net.C
 }
 
 func (c *Client) tlsClient(nc net.Conn, node *tailcfg.DERPNode) *tls.Conn {
-	tlsConf := tlsdial.Config(c.tlsServerName(node), c.HealthTracker, c.TLSConfig)
+	tlsConf := tlsdial.Config(c.HealthTracker, c.TLSConfig)
+	// node is allowed to be nil here, tlsServerName falls back to using the URL
+	// if node is nil.
+	tlsConf.ServerName = c.tlsServerName(node)
 	if node != nil {
 		if node.InsecureForTests {
 			tlsConf.InsecureSkipVerify = true
@@ -731,8 +744,12 @@ func (c *Client) dialNode(ctx context.Context, n *tailcfg.DERPNode) (net.Conn, e
 			Path:   "/", // unused
 		},
 	}
-	if proxyURL, err := tshttpproxy.ProxyFromEnvironment(proxyReq); err == nil && proxyURL != nil {
-		return c.dialNodeUsingProxy(ctx, n, proxyURL)
+	if buildfeatures.HasUseProxy {
+		if proxyFromEnv, ok := feature.HookProxyFromEnvironment.GetOk(); ok {
+			if proxyURL, err := proxyFromEnv(proxyReq); err == nil && proxyURL != nil {
+				return c.dialNodeUsingProxy(ctx, n, proxyURL)
+			}
+		}
 	}
 
 	type res struct {
@@ -859,13 +876,25 @@ func (c *Client) dialNodeUsingProxy(ctx context.Context, n *tailcfg.DERPNode, pr
 		}
 	}()
 
-	target := net.JoinHostPort(n.HostName, "443")
+	// Keep port selection in sync with dialNode.
+	port := "443"
+	if !c.useHTTPS() {
+		port = "3340"
+	}
+	if n.DERPPort != 0 {
+		port = fmt.Sprint(n.DERPPort)
+	}
+	target := net.JoinHostPort(n.HostName, port)
 
 	var authHeader string
-	if v, err := tshttpproxy.GetAuthHeader(pu); err != nil {
-		c.logf("derphttp: error getting proxy auth header for %v: %v", proxyURL, err)
-	} else if v != "" {
-		authHeader = fmt.Sprintf("Proxy-Authorization: %s\r\n", v)
+	if buildfeatures.HasUseProxy {
+		if getAuthHeader, ok := feature.HookProxyGetAuthHeader.GetOk(); ok {
+			if v, err := getAuthHeader(pu); err != nil {
+				c.logf("derphttp: error getting proxy auth header for %v: %v", proxyURL, err)
+			} else if v != "" {
+				authHeader = fmt.Sprintf("Proxy-Authorization: %s\r\n", v)
+			}
+		}
 	}
 
 	if _, err := fmt.Fprintf(proxyConn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n%s\r\n", target, target, authHeader); err != nil {

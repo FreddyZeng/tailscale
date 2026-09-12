@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package eventbus
@@ -6,13 +6,21 @@ package eventbus
 import (
 	"cmp"
 	"fmt"
+	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
-	"sync"
+	"strings"
 	"sync/atomic"
+	"time"
 
-	"tailscale.com/tsweb"
+	"tailscale.com/syncs"
+	"tailscale.com/types/logger"
 )
+
+// slowSubscriberTimeout is a timeout after which a subscriber that does not
+// accept a pending event will be flagged as being slow.
+const slowSubscriberTimeout = 5 * time.Second
 
 // A Debugger offers access to a bus's privileged introspection and
 // debugging facilities.
@@ -137,11 +145,9 @@ func (d *Debugger) SubscribeTypes(client *Client) []reflect.Type {
 	return client.subscribeTypes()
 }
 
-func (d *Debugger) RegisterHTTP(td *tsweb.DebugHandler) { registerHTTPDebugger(d, td) }
-
 // A hook collects hook functions that can be run as a group.
 type hook[T any] struct {
-	sync.Mutex
+	syncs.Mutex
 	fns []hookFn[T]
 }
 
@@ -185,4 +191,52 @@ func (h *hook[T]) run(v T) {
 type hookFn[T any] struct {
 	ID uint64
 	Fn func(T)
+}
+
+// DebugEvent is a representation of an event used for debug clients.
+type DebugEvent struct {
+	Count int
+	Type  string
+	From  string
+	To    []string
+	Event any
+}
+
+// DebugTopics provides the JSON encoding as a wrapper for a collection of [DebugTopic].
+type DebugTopics struct {
+	Topics []DebugTopic
+}
+
+// DebugTopic provides the JSON encoding of publishers and subscribers for a
+// given topic.
+type DebugTopic struct {
+	Name        string
+	Publisher   string
+	Subscribers []string
+}
+
+// logfForCaller returns a [logger.Logf] that prefixes its output with the
+// package, filename, and line number of the caller's caller.
+// If logf == nil, it returns [logger.Discard].
+// If the caller location could not be determined, it returns logf unmodified.
+func logfForCaller(logf logger.Logf) logger.Logf {
+	if logf == nil {
+		return logger.Discard
+	}
+	pc, fpath, line, _ := runtime.Caller(2) // +1 for my caller, +1 for theirs
+	if f := runtime.FuncForPC(pc); f != nil {
+		return logger.WithPrefix(logf, fmt.Sprintf("%s %s:%d: ", funcPackageName(f.Name()), filepath.Base(fpath), line))
+	}
+	return logf
+}
+
+func funcPackageName(funcName string) string {
+	ls := max(strings.LastIndex(funcName, "/"), 0)
+	for {
+		i := strings.LastIndex(funcName, ".")
+		if i <= ls {
+			return funcName
+		}
+		funcName = funcName[:i]
+	}
 }

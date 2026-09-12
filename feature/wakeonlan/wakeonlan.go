@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package wakeonlan registers the Wake-on-LAN feature.
@@ -20,6 +20,7 @@ import (
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/peercap"
 	"tailscale.com/util/clientmetric"
 )
 
@@ -90,7 +91,7 @@ func canWakeOnLAN(h ipnlocal.PeerAPIHandler) bool {
 	if h.Peer().UnsignedPeerAPIOnly() {
 		return false
 	}
-	return h.IsSelfUntagged() || h.PeerCaps().HasCapability(tailcfg.PeerCapabilityWakeOnLAN)
+	return h.IsSelfUntagged() || h.PeerCaps().HasCapability(peercap.WakeOnLAN)
 }
 
 var metricWakeOnLANCalls = clientmetric.NewCounter("peerapi_wol")

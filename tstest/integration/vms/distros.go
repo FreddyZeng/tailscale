@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package vms
@@ -35,11 +35,10 @@ func (d *Distro) InstallPre() string {
 		return ` - [ dnf, install, "-y", iptables ]`
 
 	case "apt":
-		return ` - [ apt-get, update ]
- - [ apt-get, "-y", install, curl, "apt-transport-https", gnupg2 ]`
+		return ` - [ apt-get, "-y", install, curl, "apt-transport-https", gnupg2 ]`
 
 	case "apk":
-		return ` - [ apk, "-U", add, curl, "ca-certificates", iptables, ip6tables ]
+		return ` - [ apk, add, curl, "ca-certificates", iptables, ip6tables ]
  - [ modprobe, tun ]`
 	}
 

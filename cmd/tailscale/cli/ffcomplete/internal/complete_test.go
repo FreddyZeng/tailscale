@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package internal_test
@@ -196,7 +196,6 @@ func TestComplete(t *testing.T) {
 
 	// Run the tests.
 	for _, test := range tests {
-		test := test
 		name := strings.Join(test.args, "␣")
 		if test.showFlags {
 			name += "+flags"

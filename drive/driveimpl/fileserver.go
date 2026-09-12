@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package driveimpl
@@ -20,7 +20,7 @@ import (
 // It's typically used in a separate process from the actual Taildrive server to
 // serve up files as an unprivileged user.
 type FileServer struct {
-	l             net.Listener
+	ln            net.Listener
 	secretToken   string
 	shareHandlers map[string]http.Handler
 	sharesMu      sync.RWMutex
@@ -41,10 +41,10 @@ type FileServer struct {
 // called.
 func NewFileServer() (*FileServer, error) {
 	// path := filepath.Join(os.TempDir(), fmt.Sprintf("%v.socket", uuid.New().String()))
-	// l, err := safesocket.Listen(path)
+	// ln, err := safesocket.Listen(path)
 	// if err != nil {
 	// TODO(oxtoacart): actually get safesocket working in more environments (MacOS Sandboxed, Windows, ???)
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, fmt.Errorf("listen: %w", err)
 	}
@@ -55,7 +55,7 @@ func NewFileServer() (*FileServer, error) {
 	}
 
 	return &FileServer{
-		l:             l,
+		ln:            ln,
 		secretToken:   secretToken,
 		shareHandlers: make(map[string]http.Handler),
 	}, nil
@@ -74,12 +74,12 @@ func generateSecretToken() (string, error) {
 // Addr returns the address at which this FileServer is listening. This
 // includes the secret token in front of the address, delimited by a pipe |.
 func (s *FileServer) Addr() string {
-	return fmt.Sprintf("%s|%s", s.secretToken, s.l.Addr().String())
+	return fmt.Sprintf("%s|%s", s.secretToken, s.ln.Addr().String())
 }
 
 // Serve() starts serving files and blocks until it encounters a fatal error.
 func (s *FileServer) Serve() error {
-	return http.Serve(s.l, s)
+	return http.Serve(s.ln, s)
 }
 
 // LockShares locks the map of shares in preparation for manipulating it.
@@ -102,7 +102,7 @@ func (s *FileServer) ClearSharesLocked() {
 // has been called first.
 func (s *FileServer) AddShareLocked(share, path string) {
 	s.shareHandlers[share] = &webdav.Handler{
-		FileSystem: &birthTimingFS{webdav.Dir(path)},
+		FileSystem: &birthTimingFS{&normalizingFS{webdav.Dir(path)}},
 		LockSystem: webdav.NewMemLS(),
 	}
 }
@@ -162,5 +162,5 @@ func (s *FileServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *FileServer) Close() error {
-	return s.l.Close()
+	return s.ln.Close()
 }

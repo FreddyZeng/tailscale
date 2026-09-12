@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !plan9
@@ -11,8 +11,10 @@ import (
 	"log"
 	"os"
 	"path"
+	"path/filepath"
 
 	"github.com/tailscale/hujson"
+	"tailscale.com/cmd/tsconnect/wasmbuild"
 	"tailscale.com/util/precompress"
 	"tailscale.com/version"
 )
@@ -43,9 +45,16 @@ func runBuildPkg() {
 		log.Fatalf("Could not pre-recompress wasm: %v", err)
 	}
 
+	if err := writeBuildInfo(); err != nil {
+		log.Fatalf("Could not write %s: %v", wasmbuild.BuildInfoFile, err)
+	}
+
 	log.Printf("Generating types...\n")
 	if err := runYarn("pkg-types"); err != nil {
 		log.Fatalf("Type generation failed: %v", err)
+	}
+	if err := copyTypeDeclarations(); err != nil {
+		log.Fatalf("Cannot copy generated types: %v", err)
 	}
 
 	if err := updateVersion(); err != nil {
@@ -90,10 +99,40 @@ func updateVersion() error {
 	return os.WriteFile(path.Join(*pkgDir, "package.json"), packageJSONBytes, 0644)
 }
 
+// writeBuildInfo writes pkg/build-info.json so tests can detect a stale
+// pkg/main.wasm. lastRawWasmSHA256 is set by buildWasm (in common.go)
+// just before wasm-opt overwrites the file.
+func writeBuildInfo() error {
+	if lastRawWasmSHA256 == "" {
+		return fmt.Errorf("lastRawWasmSHA256 unset; buildWasm did not run in non-dev mode")
+	}
+	bi := wasmbuild.BuildInfo{RawWasmSHA256: lastRawWasmSHA256}
+	data, err := json.MarshalIndent(bi, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path.Join(*pkgDir, wasmbuild.BuildInfoFile), append(data, '\n'), 0644)
+}
+
 func copyReadme() error {
 	readmeBytes, err := os.ReadFile("README.pkg.md")
 	if err != nil {
 		return fmt.Errorf("Could not read README.pkg.md: %w", err)
 	}
 	return os.WriteFile(path.Join(*pkgDir, "README.md"), readmeBytes, 0644)
+}
+
+// copyTypeDeclarations copies pkg.d.ts into pkgDir
+// if pkgDir differs from the local default ./pkg.
+func copyTypeDeclarations() error {
+	const src = "pkg/pkg.d.ts"
+	dst := path.Join(*pkgDir, "pkg.d.ts")
+	if filepath.Clean(src) == filepath.Clean(dst) {
+		return nil
+	}
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dst, data, 0644)
 }

@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package tka
@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"fmt"
+	"maps"
 	"strconv"
 	"strings"
 	"testing"
@@ -198,14 +199,12 @@ func (c *testChain) recordParent(t *testing.T, child, parent string) {
 // This method populates c.AUMs and c.AUMHashes.
 func (c *testChain) buildChain() {
 	pending := make(map[string]*testchainNode, len(c.Nodes))
-	for k, v := range c.Nodes {
-		pending[k] = v
-	}
+	maps.Copy(pending, c.Nodes)
 
 	// AUMs with a parent need to know their hash, so we
-	// only compute AUMs who's parents have been computed
+	// only compute AUMs whose parents have been computed
 	// each iteration. Since at least the genesis AUM
-	// had no parent, theres always a path to completion
+	// had no parent, there's always a path to completion
 	// in O(n+1) where n is the number of AUMs.
 	c.AUMs = make(map[string]AUM, len(c.Nodes))
 	c.AUMHashes = make(map[string]AUMHash, len(c.Nodes))
@@ -285,25 +284,25 @@ func (c *testChain) makeAUM(v *testchainNode) AUM {
 
 // Chonk returns a tailchonk containing all AUMs.
 func (c *testChain) Chonk() Chonk {
-	var out Mem
+	out := ChonkMem()
 	for _, update := range c.AUMs {
 		if err := out.CommitVerifiedAUMs([]AUM{update}); err != nil {
 			panic(err)
 		}
 	}
-	return &out
+	return out
 }
 
 // ChonkWith returns a tailchonk containing the named AUMs.
 func (c *testChain) ChonkWith(names ...string) Chonk {
-	var out Mem
+	out := ChonkMem()
 	for _, name := range names {
 		update := c.AUMs[name]
 		if err := out.CommitVerifiedAUMs([]AUM{update}); err != nil {
 			panic(err)
 		}
 	}
-	return &out
+	return out
 }
 
 type testchainOpt struct {
@@ -319,6 +318,20 @@ func optTemplate(name string, template AUM) testchainOpt {
 		Name:     name,
 		Template: &template,
 	}
+}
+
+func genesisTemplate(key Key) testchainOpt {
+	state := CreateStateForTest(key)
+	return optTemplate("genesis", AUM{MessageKind: AUMCheckpoint, State: &state})
+}
+
+func checkpointTemplate() testchainOpt {
+	fakeState := &State{
+		Keys:              []Key{{Kind: Key25519, Votes: 1}},
+		DisablementValues: [][]byte{bytes.Repeat([]byte{1}, 32)},
+	}
+
+	return optTemplate("checkpoint", AUM{MessageKind: AUMCheckpoint, State: fakeState})
 }
 
 func optKey(name string, key Key, priv ed25519.PrivateKey) testchainOpt {

@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package netmap
@@ -14,7 +14,6 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/opt"
-	"tailscale.com/types/ptr"
 )
 
 // tests mapResponseContainsNonPatchFields
@@ -35,7 +34,7 @@ func TestMapResponseContainsNonPatchFields(t *testing.T) {
 			return reflect.ValueOf(int64(1)).Convert(t)
 		case reflect.Slice:
 			return reflect.MakeSlice(t, 1, 1)
-		case reflect.Ptr:
+		case reflect.Pointer:
 			return reflect.New(t.Elem())
 		case reflect.Map:
 			return reflect.MakeMap(t)
@@ -44,8 +43,7 @@ func TestMapResponseContainsNonPatchFields(t *testing.T) {
 	}
 
 	rt := reflect.TypeFor[tailcfg.MapResponse]()
-	for i := range rt.NumField() {
-		f := rt.Field(i)
+	for f := range rt.Fields() {
 
 		var want bool
 		switch f.Name {
@@ -54,7 +52,16 @@ func TestMapResponseContainsNonPatchFields(t *testing.T) {
 			// They should be ignored.
 			want = false
 		case "PeersChangedPatch", "PeerSeenChange", "OnlineChange":
-			// The actual three delta fields we care about handling.
+			// The three legacy delta fields handled via NodeMutation patches.
+			want = false
+		case "PeersChanged", "PeersRemoved":
+			// Now carried as NodeMutationUpsert / NodeMutationRemove entries.
+			want = false
+		case "PacketFilter", "PacketFilters":
+			// Now delivered separately via PacketFilterUpdater.
+			want = false
+		case "UserProfiles":
+			// Now delivered separately via UserProfileUpdater.
 			want = false
 		default:
 			// Everything else should be conseratively handled as a
@@ -117,7 +124,7 @@ func TestMutationsFromMapResponse(t *testing.T) {
 			name: "patch-online",
 			mr: fromChanges(&tailcfg.PeerChange{
 				NodeID: 1,
-				Online: ptr.To(true),
+				Online: new(true),
 			}),
 			want: muts(NodeMutationOnline{1, true}),
 		},
@@ -125,7 +132,7 @@ func TestMutationsFromMapResponse(t *testing.T) {
 			name: "patch-online-false",
 			mr: fromChanges(&tailcfg.PeerChange{
 				NodeID: 1,
-				Online: ptr.To(false),
+				Online: new(false),
 			}),
 			want: muts(NodeMutationOnline{1, false}),
 		},
@@ -133,7 +140,7 @@ func TestMutationsFromMapResponse(t *testing.T) {
 			name: "patch-lastseen",
 			mr: fromChanges(&tailcfg.PeerChange{
 				NodeID:   1,
-				LastSeen: ptr.To(time.Unix(12345, 0)),
+				LastSeen: new(time.Unix(12345, 0)),
 			}),
 			want: muts(NodeMutationLastSeen{1, time.Unix(12345, 0)}),
 		},
@@ -177,6 +184,36 @@ func TestMutationsFromMapResponse(t *testing.T) {
 			},
 			want: nil,
 		},
+		{
+			name: "peer-removed",
+			mr: &tailcfg.MapResponse{
+				PeersRemoved: []tailcfg.NodeID{5},
+			},
+			want: muts(NodeMutationRemove{5}),
+		},
+		{
+			name: "peer-added",
+			mr: &tailcfg.MapResponse{
+				PeersChanged: []*tailcfg.Node{{ID: 7}},
+			},
+			want: muts(NodeMutationUpsert{Node: (&tailcfg.Node{ID: 7}).View()}),
+		},
+		{
+			name: "add-and-remove-mixed-with-patch",
+			mr: &tailcfg.MapResponse{
+				PeersRemoved: []tailcfg.NodeID{3},
+				PeersChanged: []*tailcfg.Node{{ID: 7}},
+				PeersChangedPatch: []*tailcfg.PeerChange{{
+					NodeID:     5,
+					DERPRegion: 2,
+				}},
+			},
+			want: muts(
+				NodeMutationRemove{3},
+				NodeMutationDERPHome{5, 2},
+				NodeMutationUpsert{Node: (&tailcfg.Node{ID: 7}).View()},
+			),
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -190,11 +227,13 @@ func TestMutationsFromMapResponse(t *testing.T) {
 			if diff := cmp.Diff(tt.want, got,
 				cmp.Comparer(func(a, b netip.Addr) bool { return a == b }),
 				cmp.Comparer(func(a, b netip.AddrPort) bool { return a == b }),
+				cmp.Comparer(func(a, b tailcfg.NodeView) bool { return a.ID() == b.ID() }),
 				cmp.AllowUnexported(
 					NodeMutationEndpoints{},
 					NodeMutationDERPHome{},
 					NodeMutationOnline{},
 					NodeMutationLastSeen{},
+					NodeMutationRemove{},
 				)); diff != "" {
 				t.Errorf("wrong result (-want +got):\n%s", diff)
 			}

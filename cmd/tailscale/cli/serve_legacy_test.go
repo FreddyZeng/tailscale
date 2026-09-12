@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package cli
@@ -18,10 +18,11 @@ import (
 	"testing"
 
 	"github.com/peterbourgon/ff/v3/ffcli"
-	"tailscale.com/client/tailscale"
+	"tailscale.com/client/local"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/tstest"
 	"tailscale.com/types/logger"
 )
@@ -327,6 +328,18 @@ func TestServeConfigMutations(t *testing.T) {
 		},
 	})
 	add(step{reset: true})
+	add(step{ // support IPv6 localhost proxy
+		command: cmd("https / http://[::1]:3000"),
+		want: &ipn.ServeConfig{
+			TCP: map[uint16]*ipn.TCPPortHandler{443: {HTTPS: true}},
+			Web: map[ipn.HostPort]*ipn.WebServerConfig{
+				"foo.test.ts.net:443": {Handlers: map[string]*ipn.HTTPHandler{
+					"/": {Proxy: "http://[::1]:3000"},
+				}},
+			},
+		},
+	})
+	add(step{reset: true})
 	add(step{ // support path in proxy
 		command: cmd("https / http://127.0.0.1:3000/foo/bar"),
 		want: &ipn.ServeConfig{
@@ -363,6 +376,17 @@ func TestServeConfigMutations(t *testing.T) {
 			TCP: map[uint16]*ipn.TCPPortHandler{
 				443: {
 					TCPForward:   "127.0.0.1:5432",
+					TerminateTLS: "foo.test.ts.net",
+				},
+			},
+		},
+	})
+	add(step{
+		command: cmd("tls-terminated-tcp:443 tcp://[::1]:8443"),
+		want: &ipn.ServeConfig{
+			TCP: map[uint16]*ipn.TCPPortHandler{
+				443: {
+					TCPForward:   "[::1]:8443",
 					TerminateTLS: "foo.test.ts.net",
 				},
 			},
@@ -777,7 +801,7 @@ func TestVerifyFunnelEnabled(t *testing.T) {
 		// queryFeatureResponse is the mock response desired from the
 		// call made to lc.QueryFeature by verifyFunnelEnabled.
 		queryFeatureResponse mockQueryFeatureResponse
-		caps                 []tailcfg.NodeCapability // optionally set at fakeStatus.Capabilities
+		caps                 []nodecap.Cap // optionally set at fakeStatus.Capabilities
 		wantErr              string
 		wantPanic            string
 	}{
@@ -794,13 +818,13 @@ func TestVerifyFunnelEnabled(t *testing.T) {
 		{
 			name:                 "fallback-flow-missing-acl-rule",
 			queryFeatureResponse: mockQueryFeatureResponse{resp: nil, err: errors.New("not-allowed")},
-			caps:                 []tailcfg.NodeCapability{tailcfg.CapabilityHTTPS},
+			caps:                 []nodecap.Cap{nodecap.HTTPS},
 			wantErr:              `Funnel not available; "funnel" node attribute not set. See https://tailscale.com/s/no-funnel.`,
 		},
 		{
 			name:                 "fallback-flow-enabled",
 			queryFeatureResponse: mockQueryFeatureResponse{resp: nil, err: errors.New("not-allowed")},
-			caps:                 []tailcfg.NodeCapability{tailcfg.CapabilityHTTPS, tailcfg.NodeAttrFunnel, "https://tailscale.com/cap/funnel-ports?ports=80,443,8080-8090"},
+			caps:                 []nodecap.Cap{nodecap.HTTPS, nodecap.Funnel, "https://tailscale.com/cap/funnel-ports?ports=80,443,8080-8090"},
 			wantErr:              "", // no error, success
 		},
 		{
@@ -859,6 +883,9 @@ type fakeLocalServeClient struct {
 	config               *ipn.ServeConfig
 	setCount             int                       // counts calls to SetServeConfig
 	queryFeatureResponse *mockQueryFeatureResponse // mock response to QueryFeature calls
+	prefs                *ipn.Prefs                // fake preferences, used to test GetPrefs and SetPrefs
+	SOMarkInUse          bool                      // fake SO mark in use status
+	statusWithoutPeers   *ipnstate.Status          // nil for fakeStatus
 }
 
 // fakeStatus is a fake ipnstate.Status value for tests.
@@ -871,14 +898,18 @@ var fakeStatus = &ipnstate.Status{
 	Self: &ipnstate.PeerStatus{
 		DNSName: "foo.test.ts.net",
 		CapMap: tailcfg.NodeCapMap{
-			tailcfg.NodeAttrFunnel:                            nil,
-			tailcfg.CapabilityFunnelPorts + "?ports=443,8443": nil,
+			nodecap.Funnel:                          nil,
+			nodecap.FunnelPorts + "?ports=443,8443": nil,
 		},
 	},
+	CurrentTailnet: &ipnstate.TailnetStatus{MagicDNSSuffix: "test.ts.net"},
 }
 
 func (lc *fakeLocalServeClient) StatusWithoutPeers(ctx context.Context) (*ipnstate.Status, error) {
-	return fakeStatus, nil
+	if lc.statusWithoutPeers == nil {
+		return fakeStatus, nil
+	}
+	return lc.statusWithoutPeers, nil
 }
 
 func (lc *fakeLocalServeClient) GetServeConfig(ctx context.Context) (*ipn.ServeConfig, error) {
@@ -889,6 +920,21 @@ func (lc *fakeLocalServeClient) SetServeConfig(ctx context.Context, config *ipn.
 	lc.setCount += 1
 	lc.config = config.Clone()
 	return nil
+}
+
+func (lc *fakeLocalServeClient) GetPrefs(ctx context.Context) (*ipn.Prefs, error) {
+	if lc.prefs == nil {
+		lc.prefs = ipn.NewPrefs()
+	}
+	return lc.prefs, nil
+}
+
+func (lc *fakeLocalServeClient) EditPrefs(ctx context.Context, prefs *ipn.MaskedPrefs) (*ipn.Prefs, error) {
+	if lc.prefs == nil {
+		lc.prefs = ipn.NewPrefs()
+	}
+	lc.prefs.ApplyEdits(prefs)
+	return lc.prefs, nil
 }
 
 type mockQueryFeatureResponse struct {
@@ -908,12 +954,16 @@ func (lc *fakeLocalServeClient) QueryFeature(ctx context.Context, feature string
 	return &tailcfg.QueryFeatureResponse{Complete: true}, nil // fallback to already enabled
 }
 
-func (lc *fakeLocalServeClient) WatchIPNBus(ctx context.Context, mask ipn.NotifyWatchOpt) (*tailscale.IPNBusWatcher, error) {
+func (lc *fakeLocalServeClient) WatchIPNBus(ctx context.Context, mask ipn.NotifyWatchOpt) (*local.IPNBusWatcher, error) {
 	return nil, nil // unused in tests
 }
 
 func (lc *fakeLocalServeClient) IncrementCounter(ctx context.Context, name string, delta int) error {
 	return nil // unused in tests
+}
+
+func (lc *fakeLocalServeClient) CheckSOMarkInUse(ctx context.Context) (bool, error) {
+	return lc.SOMarkInUse, nil
 }
 
 // exactError returns an error checker that wants exactly the provided want error.

@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build linux
@@ -6,6 +6,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -15,16 +16,22 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"time"
 
 	"tailscale.com/ipn/conffile"
 	"tailscale.com/kube/kubeclient"
+	"tailscale.com/util/def"
 )
 
 // settings is all the configuration for containerboot.
 type settings struct {
-	AuthKey  string
-	Hostname string
-	Routes   *string
+	AuthKey      string
+	ClientID     string
+	ClientSecret string
+	IDToken      string
+	Audience     string
+	Hostname     string
+	Routes       *string
 	// ProxyTargetIP is the destination IP to which all incoming
 	// Tailscale traffic should be proxied. If empty, no proxying
 	// is done. This is typically a locally reachable IP.
@@ -80,44 +87,59 @@ type settings struct {
 	// logic),  'ro' (for Pods that shold never attempt to issue/renew
 	// certs) and 'rw' for Pods that should manage the TLS certs shared
 	// amongst the replicas.
-	CertShareMode string
+	CertShareMode  string
+	BootCtxTimeout time.Duration
 }
 
 func configFromEnv() (*settings, error) {
 	cfg := &settings{
-		AuthKey:                               defaultEnvs([]string{"TS_AUTHKEY", "TS_AUTH_KEY"}, ""),
-		Hostname:                              defaultEnv("TS_HOSTNAME", ""),
-		Routes:                                defaultEnvStringPointer("TS_ROUTES"),
-		ServeConfigPath:                       defaultEnv("TS_SERVE_CONFIG", ""),
-		ProxyTargetIP:                         defaultEnv("TS_DEST_IP", ""),
-		ProxyTargetDNSName:                    defaultEnv("TS_EXPERIMENTAL_DEST_DNS_NAME", ""),
-		TailnetTargetIP:                       defaultEnv("TS_TAILNET_TARGET_IP", ""),
-		TailnetTargetFQDN:                     defaultEnv("TS_TAILNET_TARGET_FQDN", ""),
-		DaemonExtraArgs:                       defaultEnv("TS_TAILSCALED_EXTRA_ARGS", ""),
-		ExtraArgs:                             defaultEnv("TS_EXTRA_ARGS", ""),
-		InKubernetes:                          os.Getenv("KUBERNETES_SERVICE_HOST") != "",
-		UserspaceMode:                         defaultBool("TS_USERSPACE", true),
-		StateDir:                              defaultEnv("TS_STATE_DIR", ""),
-		AcceptDNS:                             defaultEnvBoolPointer("TS_ACCEPT_DNS"),
-		KubeSecret:                            defaultEnv("TS_KUBE_SECRET", "tailscale"),
-		SOCKSProxyAddr:                        defaultEnv("TS_SOCKS5_SERVER", ""),
-		HTTPProxyAddr:                         defaultEnv("TS_OUTBOUND_HTTP_PROXY_LISTEN", ""),
-		Socket:                                defaultEnv("TS_SOCKET", "/tmp/tailscaled.sock"),
-		AuthOnce:                              defaultBool("TS_AUTH_ONCE", false),
-		Root:                                  defaultEnv("TS_TEST_ONLY_ROOT", "/"),
+		AuthKey:            cmp.Or(os.Getenv("TS_AUTHKEY"), os.Getenv("TS_AUTH_KEY")),
+		ClientID:           os.Getenv("TS_CLIENT_ID"),
+		ClientSecret:       os.Getenv("TS_CLIENT_SECRET"),
+		IDToken:            os.Getenv("TS_ID_TOKEN"),
+		Audience:           os.Getenv("TS_AUDIENCE"),
+		Hostname:           os.Getenv("TS_HOSTNAME"),
+		Routes:             defaultEnvStringPointer("TS_ROUTES"),
+		ServeConfigPath:    os.Getenv("TS_SERVE_CONFIG"),
+		ProxyTargetIP:      os.Getenv("TS_DEST_IP"),
+		ProxyTargetDNSName: os.Getenv("TS_EXPERIMENTAL_DEST_DNS_NAME"),
+		TailnetTargetIP:    os.Getenv("TS_TAILNET_TARGET_IP"),
+		TailnetTargetFQDN:  os.Getenv("TS_TAILNET_TARGET_FQDN"),
+		DaemonExtraArgs:    os.Getenv("TS_TAILSCALED_EXTRA_ARGS"),
+		ExtraArgs:          os.Getenv("TS_EXTRA_ARGS"),
+		InKubernetes:       os.Getenv("KUBERNETES_SERVICE_HOST") != "",
+		UserspaceMode:      def.Bool(os.Getenv("TS_USERSPACE"), true),
+		StateDir:           os.Getenv("TS_STATE_DIR"),
+		AcceptDNS:          defaultEnvBoolPointer("TS_ACCEPT_DNS"),
+		KubeSecret: func() string {
+			if os.Getenv("KUBERNETES_SERVICE_HOST") == "" {
+				return os.Getenv("TS_KUBE_SECRET")
+			}
+			// An explicitly empty TS_KUBE_SECRET disables Secret storage, so
+			// unset and empty must stay distinguishable: def.LookupEnv keeps
+			// an explicit "" rather than falling back to the default.
+			return def.LookupEnv("TS_KUBE_SECRET", "tailscale")
+		}(),
+		SOCKSProxyAddr:                        os.Getenv("TS_SOCKS5_SERVER"),
+		HTTPProxyAddr:                         os.Getenv("TS_OUTBOUND_HTTP_PROXY_LISTEN"),
+		Socket:                                cmp.Or(os.Getenv("TS_SOCKET"), "/tmp/tailscaled.sock"),
+		AuthOnce:                              def.Bool(os.Getenv("TS_AUTH_ONCE"), false),
+		Root:                                  cmp.Or(os.Getenv("TS_TEST_ONLY_ROOT"), "/"),
 		TailscaledConfigFilePath:              tailscaledConfigFilePath(),
-		AllowProxyingClusterTrafficViaIngress: defaultBool("EXPERIMENTAL_ALLOW_PROXYING_CLUSTER_TRAFFIC_VIA_INGRESS", false),
-		PodIP:                                 defaultEnv("POD_IP", ""),
-		EnableForwardingOptimizations:         defaultBool("TS_EXPERIMENTAL_ENABLE_FORWARDING_OPTIMIZATIONS", false),
-		HealthCheckAddrPort:                   defaultEnv("TS_HEALTHCHECK_ADDR_PORT", ""),
-		LocalAddrPort:                         defaultEnv("TS_LOCAL_ADDR_PORT", "[::]:9002"),
-		MetricsEnabled:                        defaultBool("TS_ENABLE_METRICS", false),
-		HealthCheckEnabled:                    defaultBool("TS_ENABLE_HEALTH_CHECK", false),
-		DebugAddrPort:                         defaultEnv("TS_DEBUG_ADDR_PORT", ""),
-		EgressProxiesCfgPath:                  defaultEnv("TS_EGRESS_PROXIES_CONFIG_PATH", ""),
-		IngressProxiesCfgPath:                 defaultEnv("TS_INGRESS_PROXIES_CONFIG_PATH", ""),
-		PodUID:                                defaultEnv("POD_UID", ""),
+		AllowProxyingClusterTrafficViaIngress: def.Bool(os.Getenv("EXPERIMENTAL_ALLOW_PROXYING_CLUSTER_TRAFFIC_VIA_INGRESS"), false),
+		PodIP:                                 os.Getenv("POD_IP"),
+		EnableForwardingOptimizations:         def.Bool(os.Getenv("TS_EXPERIMENTAL_ENABLE_FORWARDING_OPTIMIZATIONS"), false),
+		HealthCheckAddrPort:                   os.Getenv("TS_HEALTHCHECK_ADDR_PORT"),
+		LocalAddrPort:                         cmp.Or(os.Getenv("TS_LOCAL_ADDR_PORT"), "[::]:9002"),
+		MetricsEnabled:                        def.Bool(os.Getenv("TS_ENABLE_METRICS"), false),
+		HealthCheckEnabled:                    def.Bool(os.Getenv("TS_ENABLE_HEALTH_CHECK"), false),
+		DebugAddrPort:                         os.Getenv("TS_DEBUG_ADDR_PORT"),
+		EgressProxiesCfgPath:                  os.Getenv("TS_EGRESS_PROXIES_CONFIG_PATH"),
+		IngressProxiesCfgPath:                 os.Getenv("TS_INGRESS_PROXIES_CONFIG_PATH"),
+		PodUID:                                os.Getenv("POD_UID"),
+		BootCtxTimeout:                        def.Duration(os.Getenv("TS_BOOT_TIMEOUT"), 60*time.Second),
 	}
+
 	podIPs, ok := os.LookupEnv("POD_IPS")
 	if ok {
 		ips := strings.Split(podIPs, ",")
@@ -136,9 +158,10 @@ func configFromEnv() (*settings, error) {
 			cfg.PodIPv6 = parsed.String()
 		}
 	}
+
 	// If cert share is enabled, set the replica as read or write. Only 0th
 	// replica should be able to write.
-	isInCertShareMode := defaultBool("TS_EXPERIMENTAL_CERT_SHARE", false)
+	isInCertShareMode := def.Bool(os.Getenv("TS_EXPERIMENTAL_CERT_SHARE"), false)
 	if isInCertShareMode {
 		cfg.CertShareMode = "ro"
 		podName := os.Getenv("POD_NAME")
@@ -147,10 +170,77 @@ func configFromEnv() (*settings, error) {
 		}
 	}
 
+	// See https://github.com/tailscale/tailscale/issues/16108 for context- we
+	// do this to preserve the previous behaviour where --accept-dns could be
+	// set either via TS_ACCEPT_DNS or TS_EXTRA_ARGS.
+	acceptDNS := cfg.AcceptDNS != nil && *cfg.AcceptDNS
+	tsExtraArgs, acceptDNSNew := parseAcceptDNS(cfg.ExtraArgs, acceptDNS)
+	cfg.ExtraArgs = tsExtraArgs
+	if acceptDNS != acceptDNSNew {
+		cfg.AcceptDNS = &acceptDNSNew
+	}
+
+	// In Kubernetes clusters, people like to use the "$(POD_IP):PORT" combination to configure the TS_LOCAL_ADDR_PORT
+	// environment variable (we even do this by default in the operator when enabling metrics), leading to a v6 address
+	// and port combo we cannot parse, as netip.ParseAddrPort expects the host segment to be enclosed in square brackets.
+	// We perform a check here to see if TS_LOCAL_ADDR_PORT is using the pod's IPv6 address and is not using brackets,
+	// adding the brackets in if need be.
+	if cfg.PodIPv6 != "" && strings.Contains(cfg.LocalAddrPort, cfg.PodIPv6) && !strings.ContainsAny(cfg.LocalAddrPort, "[]") {
+		cfg.LocalAddrPort = strings.Replace(cfg.LocalAddrPort, cfg.PodIPv6, "["+cfg.PodIPv6+"]", 1)
+	}
+
 	if err := cfg.validate(); err != nil {
 		return nil, fmt.Errorf("invalid configuration: %v", err)
 	}
+
 	return cfg, nil
+}
+
+// parseAcceptDNS parses any values for Tailscale --accept-dns flag set via
+// TS_ACCEPT_DNS and TS_EXTRA_ARGS env vars. If TS_EXTRA_ARGS contains
+// --accept-dns flag, override the acceptDNS value with the one from
+// TS_EXTRA_ARGS.
+// The value of extraArgs can be empty string or one or more whitespace-separate
+// key value pairs for 'tailscale up' command. The value for boolean flags can
+// be omitted (default to true).
+func parseAcceptDNS(extraArgs string, acceptDNS bool) (string, bool) {
+	if !strings.Contains(extraArgs, "--accept-dns") {
+		return extraArgs, acceptDNS
+	}
+	// TODO(irbekrm): we should validate that TS_EXTRA_ARGS contains legit
+	// 'tailscale up' flag values separated by whitespace.
+	argsArr := strings.Fields(extraArgs)
+	i := -1
+	for key, val := range argsArr {
+		if strings.HasPrefix(val, "--accept-dns") {
+			i = key
+			break
+		}
+	}
+	if i == -1 {
+		return extraArgs, acceptDNS
+	}
+	a := strings.TrimSpace(argsArr[i])
+	var acceptDNSFromExtraArgsS string
+	keyval := strings.Split(a, "=")
+	if len(keyval) == 2 {
+		acceptDNSFromExtraArgsS = keyval[1]
+	} else if len(keyval) == 1 && keyval[0] == "--accept-dns" {
+		// If the arg is just --accept-dns, we assume it means true.
+		acceptDNSFromExtraArgsS = "true"
+	} else {
+		log.Printf("TS_EXTRA_ARGS contains --accept-dns, but it is not in the expected format --accept-dns=<true|false>, ignoring it")
+		return extraArgs, acceptDNS
+	}
+	acceptDNSFromExtraArgs, err := strconv.ParseBool(acceptDNSFromExtraArgsS)
+	if err != nil {
+		log.Printf("TS_EXTRA_ARGS contains --accept-dns=%q, which is not a valid boolean value, ignoring it", acceptDNSFromExtraArgsS)
+		return extraArgs, acceptDNS
+	}
+	if acceptDNSFromExtraArgs != acceptDNS {
+		log.Printf("TS_EXTRA_ARGS contains --accept-dns=%v, which overrides TS_ACCEPT_DNS=%v", acceptDNSFromExtraArgs, acceptDNS)
+	}
+	return strings.Join(append(argsArr[:i], argsArr[i+1:]...), " "), acceptDNSFromExtraArgs
 }
 
 func (s *settings) validate() error {
@@ -184,8 +274,46 @@ func (s *settings) validate() error {
 	if s.TailnetTargetFQDN != "" && s.TailnetTargetIP != "" {
 		return errors.New("Both TS_TAILNET_TARGET_IP and TS_TAILNET_FQDN cannot be set")
 	}
-	if s.TailscaledConfigFilePath != "" && (s.AcceptDNS != nil || s.AuthKey != "" || s.Routes != nil || s.ExtraArgs != "" || s.Hostname != "") {
-		return errors.New("TS_EXPERIMENTAL_VERSIONED_CONFIG_DIR cannot be set in combination with TS_HOSTNAME, TS_EXTRA_ARGS, TS_AUTHKEY, TS_ROUTES, TS_ACCEPT_DNS.")
+	if s.TailscaledConfigFilePath != "" &&
+		(s.AcceptDNS != nil ||
+			s.AuthKey != "" ||
+			s.Routes != nil ||
+			s.ExtraArgs != "" ||
+			s.Hostname != "" ||
+			s.ClientID != "" ||
+			s.ClientSecret != "" ||
+			s.IDToken != "" ||
+			s.Audience != "") {
+		conflictingArgs := []string{
+			"TS_HOSTNAME",
+			"TS_EXTRA_ARGS",
+			"TS_AUTHKEY",
+			"TS_ROUTES",
+			"TS_ACCEPT_DNS",
+			"TS_CLIENT_ID",
+			"TS_CLIENT_SECRET",
+			"TS_ID_TOKEN",
+			"TS_AUDIENCE",
+		}
+		return fmt.Errorf("TS_EXPERIMENTAL_VERSIONED_CONFIG_DIR cannot be set in combination with %s.", strings.Join(conflictingArgs, ", "))
+	}
+	if s.IDToken != "" && s.ClientID == "" {
+		return errors.New("TS_ID_TOKEN is set but TS_CLIENT_ID is not set")
+	}
+	if s.Audience != "" && s.ClientID == "" {
+		return errors.New("TS_AUDIENCE is set but TS_CLIENT_ID is not set")
+	}
+	if s.IDToken != "" && s.ClientSecret != "" {
+		return errors.New("TS_ID_TOKEN and TS_CLIENT_SECRET cannot both be set")
+	}
+	if s.IDToken != "" && s.Audience != "" {
+		return errors.New("TS_ID_TOKEN and TS_AUDIENCE cannot both be set")
+	}
+	if s.Audience != "" && s.ClientSecret != "" {
+		return errors.New("TS_AUDIENCE and TS_CLIENT_SECRET cannot both be set")
+	}
+	if s.AuthKey != "" && (s.ClientID != "" || s.ClientSecret != "" || s.IDToken != "" || s.Audience != "") {
+		return errors.New("TS_AUTHKEY cannot be used with TS_CLIENT_ID, TS_CLIENT_SECRET, TS_ID_TOKEN, or TS_AUDIENCE.")
 	}
 	if s.AllowProxyingClusterTrafficViaIngress && s.UserspaceMode {
 		return errors.New("EXPERIMENTAL_ALLOW_PROXYING_CLUSTER_TRAFFIC_VIA_INGRESS is not supported in userspace mode")
@@ -224,6 +352,13 @@ func (s *settings) validate() error {
 	if s.IngressProxiesCfgPath != "" && !(s.InKubernetes && s.KubeSecret != "") {
 		return errors.New("TS_INGRESS_PROXIES_CONFIG_PATH is only supported for Tailscale running on Kubernetes")
 	}
+
+	// Error out when passed a malformed duration in `TS_BOOT_TIMEOUT` env var.
+	if v := os.Getenv("TS_BOOT_TIMEOUT"); v != "" {
+		if _, err := time.ParseDuration(v); err != nil {
+			return fmt.Errorf("error parsing TS_BOOT_TIMEOUT value %q: %w", v, err)
+		}
+	}
 	return nil
 }
 
@@ -255,8 +390,8 @@ func (cfg *settings) setupKube(ctx context.Context, kc *kubeClient) error {
 		}
 	}
 
-	// Return early if we already have an auth key.
-	if cfg.AuthKey != "" || isOneStepConfig(cfg) {
+	// Return early if we already have an auth key or are using OAuth/WIF.
+	if cfg.AuthKey != "" || cfg.ClientID != "" || cfg.ClientSecret != "" || isOneStepConfig(cfg) {
 		return nil
 	}
 
@@ -334,15 +469,6 @@ func (cfg *settings) egressSvcsTerminateEPEnabled() bool {
 	return cfg.LocalAddrPort != "" && cfg.EgressProxiesCfgPath != ""
 }
 
-// defaultEnv returns the value of the given envvar name, or defVal if
-// unset.
-func defaultEnv(name, defVal string) string {
-	if v, ok := os.LookupEnv(name); ok {
-		return v
-	}
-	return defVal
-}
-
 // defaultEnvStringPointer returns a pointer to the given envvar value if set, else
 // returns nil. This is useful in cases where we need to distinguish between a
 // variable being set to empty string vs unset.
@@ -363,24 +489,4 @@ func defaultEnvBoolPointer(name string) *bool {
 		return nil
 	}
 	return &ret
-}
-
-func defaultEnvs(names []string, defVal string) string {
-	for _, name := range names {
-		if v, ok := os.LookupEnv(name); ok {
-			return v
-		}
-	}
-	return defVal
-}
-
-// defaultBool returns the boolean value of the given envvar name, or
-// defVal if unset or not a bool.
-func defaultBool(name string, defVal bool) bool {
-	v := os.Getenv(name)
-	ret, err := strconv.ParseBool(v)
-	if err != nil {
-		return defVal
-	}
-	return ret
 }

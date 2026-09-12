@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build linux
@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
-	"os"
 	"runtime"
 	"slices"
 	"strings"
@@ -299,7 +298,7 @@ func TestAddSetSubnetRouteMarkRule(t *testing.T) {
 		// nft add chain ip ts-filter-test ts-forward-test { type filter hook forward priority 0\; }
 		[]byte("\x02\x00\x00\x00\x13\x00\x01\x00\x74\x73\x2d\x66\x69\x6c\x74\x65\x72\x2d\x74\x65\x73\x74\x00\x00\x14\x00\x03\x00\x74\x73\x2d\x66\x6f\x72\x77\x61\x72\x64\x2d\x74\x65\x73\x74\x00\x14\x00\x04\x80\x08\x00\x01\x00\x00\x00\x00\x02\x08\x00\x02\x00\x00\x00\x00\x00\x0b\x00\x07\x00\x66\x69\x6c\x74\x65\x72\x00\x00"),
 		// nft add rule ip ts-filter-test ts-forward-test iifname "testTunn" counter meta mark set mark and 0xff00ffff xor 0x40000
-		[]byte("\x02\x00\x00\x00\x13\x00\x01\x00\x74\x73\x2d\x66\x69\x6c\x74\x65\x72\x2d\x74\x65\x73\x74\x00\x00\x14\x00\x02\x00\x74\x73\x2d\x66\x6f\x72\x77\x61\x72\x64\x2d\x74\x65\x73\x74\x00\x10\x01\x04\x80\x24\x00\x01\x80\x09\x00\x01\x00\x6d\x65\x74\x61\x00\x00\x00\x00\x14\x00\x02\x80\x08\x00\x02\x00\x00\x00\x00\x06\x08\x00\x01\x00\x00\x00\x00\x01\x30\x00\x01\x80\x08\x00\x01\x00\x63\x6d\x70\x00\x24\x00\x02\x80\x08\x00\x01\x00\x00\x00\x00\x01\x08\x00\x02\x00\x00\x00\x00\x00\x10\x00\x03\x80\x0c\x00\x01\x00\x74\x65\x73\x74\x54\x75\x6e\x6e\x2c\x00\x01\x80\x0c\x00\x01\x00\x63\x6f\x75\x6e\x74\x65\x72\x00\x1c\x00\x02\x80\x0c\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x0c\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x24\x00\x01\x80\x09\x00\x01\x00\x6d\x65\x74\x61\x00\x00\x00\x00\x14\x00\x02\x80\x08\x00\x02\x00\x00\x00\x00\x03\x08\x00\x01\x00\x00\x00\x00\x01\x44\x00\x01\x80\x0c\x00\x01\x00\x62\x69\x74\x77\x69\x73\x65\x00\x34\x00\x02\x80\x08\x00\x01\x00\x00\x00\x00\x01\x08\x00\x02\x00\x00\x00\x00\x01\x08\x00\x03\x00\x00\x00\x00\x04\x0c\x00\x04\x80\x08\x00\x01\x00\xff\x00\xff\xff\x0c\x00\x05\x80\x08\x00\x01\x00\x00\x04\x00\x00\x24\x00\x01\x80\x09\x00\x01\x00\x6d\x65\x74\x61\x00\x00\x00\x00\x14\x00\x02\x80\x08\x00\x02\x00\x00\x00\x00\x03\x08\x00\x03\x00\x00\x00\x00\x01"),
+		[]byte("\x02\x00\x00\x00\x13\x00\x01\x00\x74\x73\x2d\x66\x69\x6c\x74\x65\x72\x2d\x74\x65\x73\x74\x00\x00\x14\x00\x02\x00\x74\x73\x2d\x66\x6f\x72\x77\x61\x72\x64\x2d\x74\x65\x73\x74\x00\x10\x01\x04\x80\x24\x00\x01\x80\x09\x00\x01\x00\x6d\x65\x74\x61\x00\x00\x00\x00\x14\x00\x02\x80\x08\x00\x02\x00\x00\x00\x00\x06\x08\x00\x01\x00\x00\x00\x00\x01\x30\x00\x01\x80\x08\x00\x01\x00\x63\x6d\x70\x00\x24\x00\x02\x80\x08\x00\x01\x00\x00\x00\x00\x01\x08\x00\x02\x00\x00\x00\x00\x00\x10\x00\x03\x80\x0c\x00\x01\x00\x74\x65\x73\x74\x54\x75\x6e\x6e\x2c\x00\x01\x80\x0c\x00\x01\x00\x63\x6f\x75\x6e\x74\x65\x72\x00\x1c\x00\x02\x80\x0c\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x0c\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x24\x00\x01\x80\x09\x00\x01\x00\x6d\x65\x74\x61\x00\x00\x00\x00\x14\x00\x02\x80\x08\x00\x02\x00\x00\x00\x00\x03\x08\x00\x01\x00\x00\x00\x00\x01\x44\x00\x01\x80\x0c\x00\x01\x00\x62\x69\x74\x77\x69\x73\x65\x00\x34\x00\x02\x80\x08\x00\x01\x00\x00\x00\x00\x01\x08\x00\x02\x00\x00\x00\x00\x01\x08\x00\x03\x00\x00\x00\x00\x04\x0c\x00\x04\x80\x08\x00\x01\x00\xff\xff\x00\xff\x0c\x00\x05\x80\x08\x00\x01\x00\x00\x00\x04\x00\x24\x00\x01\x80\x09\x00\x01\x00\x6d\x65\x74\x61\x00\x00\x00\x00\x14\x00\x02\x80\x08\x00\x02\x00\x00\x00\x00\x03\x08\x00\x03\x00\x00\x00\x00\x01"),
 		// batch end
 		[]byte("\x00\x00\x00\x0a"),
 	}
@@ -427,7 +426,7 @@ func TestAddMatchSubnetRouteMarkRuleMasq(t *testing.T) {
 		// nft add chain ip ts-nat-test ts-postrouting-test { type nat hook postrouting priority 100; }
 		[]byte("\x02\x00\x00\x00\x10\x00\x01\x00\x74\x73\x2d\x6e\x61\x74\x2d\x74\x65\x73\x74\x00\x18\x00\x03\x00\x74\x73\x2d\x70\x6f\x73\x74\x72\x6f\x75\x74\x69\x6e\x67\x2d\x74\x65\x73\x74\x00\x14\x00\x04\x80\x08\x00\x01\x00\x00\x00\x00\x04\x08\x00\x02\x00\x00\x00\x00\x64\x08\x00\x07\x00\x6e\x61\x74\x00"),
 		// nft add rule ip ts-nat-test ts-postrouting-test meta mark & 0x00ff0000 == 0x00040000 counter masquerade
-		[]byte("\x02\x00\x00\x00\x10\x00\x01\x00\x74\x73\x2d\x6e\x61\x74\x2d\x74\x65\x73\x74\x00\x18\x00\x02\x00\x74\x73\x2d\x70\x6f\x73\x74\x72\x6f\x75\x74\x69\x6e\x67\x2d\x74\x65\x73\x74\x00\xd8\x00\x04\x80\x24\x00\x01\x80\x09\x00\x01\x00\x6d\x65\x74\x61\x00\x00\x00\x00\x14\x00\x02\x80\x08\x00\x02\x00\x00\x00\x00\x03\x08\x00\x01\x00\x00\x00\x00\x01\x44\x00\x01\x80\x0c\x00\x01\x00\x62\x69\x74\x77\x69\x73\x65\x00\x34\x00\x02\x80\x08\x00\x01\x00\x00\x00\x00\x01\x08\x00\x02\x00\x00\x00\x00\x01\x08\x00\x03\x00\x00\x00\x00\x04\x0c\x00\x04\x80\x08\x00\x01\x00\x00\xff\x00\x00\x0c\x00\x05\x80\x08\x00\x01\x00\x00\x00\x00\x00\x2c\x00\x01\x80\x08\x00\x01\x00\x63\x6d\x70\x00\x20\x00\x02\x80\x08\x00\x01\x00\x00\x00\x00\x01\x08\x00\x02\x00\x00\x00\x00\x00\x0c\x00\x03\x80\x08\x00\x01\x00\x00\x04\x00\x00\x2c\x00\x01\x80\x0c\x00\x01\x00\x63\x6f\x75\x6e\x74\x65\x72\x00\x1c\x00\x02\x80\x0c\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x0c\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x14\x00\x01\x80\x09\x00\x01\x00\x6d\x61\x73\x71\x00\x00\x00\x00\x04\x00\x02\x80"),
+		[]byte("\x02\x00\x00\x00\x10\x00\x01\x00\x74\x73\x2d\x6e\x61\x74\x2d\x74\x65\x73\x74\x00\x18\x00\x02\x00\x74\x73\x2d\x70\x6f\x73\x74\x72\x6f\x75\x74\x69\x6e\x67\x2d\x74\x65\x73\x74\x00\xd8\x00\x04\x80\x24\x00\x01\x80\x09\x00\x01\x00\x6d\x65\x74\x61\x00\x00\x00\x00\x14\x00\x02\x80\x08\x00\x02\x00\x00\x00\x00\x03\x08\x00\x01\x00\x00\x00\x00\x01\x44\x00\x01\x80\x0c\x00\x01\x00\x62\x69\x74\x77\x69\x73\x65\x00\x34\x00\x02\x80\x08\x00\x01\x00\x00\x00\x00\x01\x08\x00\x02\x00\x00\x00\x00\x01\x08\x00\x03\x00\x00\x00\x00\x04\x0c\x00\x04\x80\x08\x00\x01\x00\x00\x00\xff\x00\x0c\x00\x05\x80\x08\x00\x01\x00\x00\x00\x00\x00\x2c\x00\x01\x80\x08\x00\x01\x00\x63\x6d\x70\x00\x20\x00\x02\x80\x08\x00\x01\x00\x00\x00\x00\x01\x08\x00\x02\x00\x00\x00\x00\x00\x0c\x00\x03\x80\x08\x00\x01\x00\x00\x00\x04\x00\x2c\x00\x01\x80\x0c\x00\x01\x00\x63\x6f\x75\x6e\x74\x65\x72\x00\x1c\x00\x02\x80\x0c\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x0c\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x14\x00\x01\x80\x09\x00\x01\x00\x6d\x61\x73\x71\x00\x00\x00\x00\x04\x00\x02\x80"),
 		// batch end
 		[]byte("\x00\x00\x00\x0a"),
 	}
@@ -498,7 +497,7 @@ func TestAddMatchSubnetRouteMarkRuleAccept(t *testing.T) {
 		// nft add chain ip ts-filter-test ts-forward-test { type filter hook forward priority 0\; }
 		[]byte("\x02\x00\x00\x00\x13\x00\x01\x00\x74\x73\x2d\x66\x69\x6c\x74\x65\x72\x2d\x74\x65\x73\x74\x00\x00\x14\x00\x03\x00\x74\x73\x2d\x66\x6f\x72\x77\x61\x72\x64\x2d\x74\x65\x73\x74\x00\x14\x00\x04\x80\x08\x00\x01\x00\x00\x00\x00\x02\x08\x00\x02\x00\x00\x00\x00\x00\x0b\x00\x07\x00\x66\x69\x6c\x74\x65\x72\x00\x00"),
 		// nft add rule ip ts-filter-test ts-forward-test meta mark and 0x00ff0000 eq 0x00040000 counter accept
-		[]byte("\x02\x00\x00\x00\x13\x00\x01\x00\x74\x73\x2d\x66\x69\x6c\x74\x65\x72\x2d\x74\x65\x73\x74\x00\x00\x14\x00\x02\x00\x74\x73\x2d\x66\x6f\x72\x77\x61\x72\x64\x2d\x74\x65\x73\x74\x00\xf4\x00\x04\x80\x24\x00\x01\x80\x09\x00\x01\x00\x6d\x65\x74\x61\x00\x00\x00\x00\x14\x00\x02\x80\x08\x00\x02\x00\x00\x00\x00\x03\x08\x00\x01\x00\x00\x00\x00\x01\x44\x00\x01\x80\x0c\x00\x01\x00\x62\x69\x74\x77\x69\x73\x65\x00\x34\x00\x02\x80\x08\x00\x01\x00\x00\x00\x00\x01\x08\x00\x02\x00\x00\x00\x00\x01\x08\x00\x03\x00\x00\x00\x00\x04\x0c\x00\x04\x80\x08\x00\x01\x00\x00\xff\x00\x00\x0c\x00\x05\x80\x08\x00\x01\x00\x00\x00\x00\x00\x2c\x00\x01\x80\x08\x00\x01\x00\x63\x6d\x70\x00\x20\x00\x02\x80\x08\x00\x01\x00\x00\x00\x00\x01\x08\x00\x02\x00\x00\x00\x00\x00\x0c\x00\x03\x80\x08\x00\x01\x00\x00\x04\x00\x00\x2c\x00\x01\x80\x0c\x00\x01\x00\x63\x6f\x75\x6e\x74\x65\x72\x00\x1c\x00\x02\x80\x0c\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x0c\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x30\x00\x01\x80\x0e\x00\x01\x00\x69\x6d\x6d\x65\x64\x69\x61\x74\x65\x00\x00\x00\x1c\x00\x02\x80\x08\x00\x01\x00\x00\x00\x00\x00\x10\x00\x02\x80\x0c\x00\x02\x80\x08\x00\x01\x00\x00\x00\x00\x01"),
+		[]byte("\x02\x00\x00\x00\x13\x00\x01\x00\x74\x73\x2d\x66\x69\x6c\x74\x65\x72\x2d\x74\x65\x73\x74\x00\x00\x14\x00\x02\x00\x74\x73\x2d\x66\x6f\x72\x77\x61\x72\x64\x2d\x74\x65\x73\x74\x00\xf4\x00\x04\x80\x24\x00\x01\x80\x09\x00\x01\x00\x6d\x65\x74\x61\x00\x00\x00\x00\x14\x00\x02\x80\x08\x00\x02\x00\x00\x00\x00\x03\x08\x00\x01\x00\x00\x00\x00\x01\x44\x00\x01\x80\x0c\x00\x01\x00\x62\x69\x74\x77\x69\x73\x65\x00\x34\x00\x02\x80\x08\x00\x01\x00\x00\x00\x00\x01\x08\x00\x02\x00\x00\x00\x00\x01\x08\x00\x03\x00\x00\x00\x00\x04\x0c\x00\x04\x80\x08\x00\x01\x00\x00\x00\xff\x00\x0c\x00\x05\x80\x08\x00\x01\x00\x00\x00\x00\x00\x2c\x00\x01\x80\x08\x00\x01\x00\x63\x6d\x70\x00\x20\x00\x02\x80\x08\x00\x01\x00\x00\x00\x00\x01\x08\x00\x02\x00\x00\x00\x00\x00\x0c\x00\x03\x80\x08\x00\x01\x00\x00\x00\x04\x00\x2c\x00\x01\x80\x0c\x00\x01\x00\x63\x6f\x75\x6e\x74\x65\x72\x00\x1c\x00\x02\x80\x0c\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x0c\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x30\x00\x01\x80\x0e\x00\x01\x00\x69\x6d\x6d\x65\x64\x69\x61\x74\x65\x00\x00\x00\x1c\x00\x02\x80\x08\x00\x01\x00\x00\x00\x00\x00\x10\x00\x02\x80\x0c\x00\x02\x80\x08\x00\x01\x00\x00\x00\x00\x01"),
 		// batch end
 		[]byte("\x00\x00\x00\x0a"),
 	}
@@ -522,10 +521,7 @@ func TestAddMatchSubnetRouteMarkRuleAccept(t *testing.T) {
 
 func newSysConn(t *testing.T) *nftables.Conn {
 	t.Helper()
-	if os.Geteuid() != 0 {
-		t.Skip(t.Name(), " requires privileges to create a namespace in order to run")
-		return nil
-	}
+	tstest.RequireRoot(t)
 
 	runtime.LockOSThread()
 
@@ -637,7 +633,7 @@ func TestAddAndDelNetfilterChains(t *testing.T) {
 func getTsChains(
 	conn *nftables.Conn,
 	proto nftables.TableFamily) (*nftables.Chain, *nftables.Chain, *nftables.Chain, error) {
-	chains, err := conn.ListChainsOfTableFamily(nftables.TableFamilyIPv4)
+	chains, err := conn.ListChainsOfTableFamily(proto)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("list chains failed: %w", err)
 	}
@@ -662,17 +658,7 @@ func findV4BaseRules(
 	forwChain *nftables.Chain,
 	tunname string) ([]*nftables.Rule, error) {
 	want := []*nftables.Rule{}
-	rule, err := createRangeRule(inpChain.Table, inpChain, tunname, tsaddr.ChromeOSVMRange(), expr.VerdictReturn)
-	if err != nil {
-		return nil, fmt.Errorf("create rule: %w", err)
-	}
-	want = append(want, rule)
-	rule, err = createRangeRule(inpChain.Table, inpChain, tunname, tsaddr.CGNATRange(), expr.VerdictDrop)
-	if err != nil {
-		return nil, fmt.Errorf("create rule: %w", err)
-	}
-	want = append(want, rule)
-	rule, err = createDropOutgoingPacketFromCGNATRangeRuleWithTunname(forwChain.Table, forwChain, tunname)
+	rule, err := createDropOutgoingPacketFromCGNATRangeRuleWithTunname(forwChain.Table, forwChain, tunname)
 	if err != nil {
 		return nil, fmt.Errorf("create rule: %w", err)
 	}
@@ -749,7 +735,7 @@ func TestNFTAddAndDelNetfilterBase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("getTsChains() failed: %v", err)
 	}
-	checkChainRules(t, conn, inputV4, 3)
+	checkChainRules(t, conn, inputV4, 1)
 	checkChainRules(t, conn, forwardV4, 4)
 	checkChainRules(t, conn, postroutingV4, 0)
 
@@ -767,8 +753,8 @@ func TestNFTAddAndDelNetfilterBase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("getTsChains() failed: %v", err)
 	}
-	checkChainRules(t, conn, inputV6, 3)
-	checkChainRules(t, conn, forwardV6, 4)
+	checkChainRules(t, conn, inputV6, 1)
+	checkChainRules(t, conn, forwardV6, 3)
 	checkChainRules(t, conn, postroutingV6, 0)
 
 	_, err = findCommonBaseRules(conn, forwardV6, "testTunn")
@@ -784,6 +770,92 @@ func TestNFTAddAndDelNetfilterBase(t *testing.T) {
 	}
 	for _, chain := range chains {
 		checkChainRules(t, conn, chain, 0)
+	}
+}
+
+func findCGNATRules(
+	conn *nftables.Conn,
+	inpChain *nftables.Chain,
+	mode CGNATMode,
+	tunname string,
+) error {
+	want := []*nftables.Rule{}
+	switch mode {
+	case CGNATModeDrop:
+		rule, err := createRangeRule(inpChain.Table, inpChain, tunname, tsaddr.ChromeOSVMRange(), expr.VerdictReturn)
+		if err != nil {
+			return fmt.Errorf("create rule: %w", err)
+		}
+		want = append(want, rule)
+		rule, err = createRangeRule(inpChain.Table, inpChain, tunname, tsaddr.CGNATRange(), expr.VerdictDrop)
+		if err != nil {
+			return fmt.Errorf("create rule: %w", err)
+		}
+		want = append(want, rule)
+	case CGNATModeReturn:
+		rule, err := createRangeRule(inpChain.Table, inpChain, tunname, tsaddr.CGNATRange(), expr.VerdictReturn)
+		if err != nil {
+			return fmt.Errorf("create rule: %w", err)
+		}
+		want = append(want, rule)
+	default:
+		return fmt.Errorf("unknown mode %q", mode)
+	}
+	for _, rule := range want {
+		_, err := findRule(conn, rule)
+		if err != nil {
+			return fmt.Errorf("find rule: %w", err)
+		}
+	}
+	return nil
+}
+
+func TestNFTAddAndDelCGNATRules(t *testing.T) {
+	modes := []CGNATMode{CGNATModeDrop, CGNATModeReturn}
+	for _, mode := range modes {
+		t.Run(string(mode), func(t *testing.T) {
+			conn := newSysConn(t)
+
+			runner := newFakeNftablesRunnerWithConn(t, conn, false)
+
+			if err := runner.AddChains(); err != nil {
+				t.Fatalf("AddChains() failed: %v", err)
+			}
+			defer runner.DelChains()
+
+			inputV4, _, _, err := getTsChains(conn, nftables.TableFamilyIPv4)
+			if err != nil {
+				t.Fatalf("getTsChains() failed: %v", err)
+			}
+
+			checkChainRules(t, conn, inputV4, 0)
+
+			tunname := "tun0"
+
+			if err := runner.AddExternalCGNATRules(mode, tunname); err != nil {
+				t.Fatalf("add rules: %v", err)
+			}
+
+			switch mode {
+			case CGNATModeDrop:
+				checkChainRules(t, conn, inputV4, 2)
+			case CGNATModeReturn:
+				checkChainRules(t, conn, inputV4, 1)
+			default:
+				t.Fatalf("unknown mode %q", mode)
+			}
+
+			if err := findCGNATRules(conn, inputV4, mode, tunname); err != nil {
+				t.Fatalf("find rules: %v", err)
+			}
+
+			if err := runner.DelExternalCGNATRules(mode, tunname); err != nil {
+				t.Fatalf("delete rules: %v", err)
+			}
+
+			// Verify that all the rules have been deleted (0 remaining).
+			checkChainRules(t, conn, inputV4, 0)
+		})
 	}
 }
 
@@ -849,16 +921,16 @@ func TestNFTAddAndDelLoopbackRule(t *testing.T) {
 
 	runner.AddBase("testTunn")
 	defer runner.DelBase()
-	checkChainRules(t, conn, inputV4, 3)
-	checkChainRules(t, conn, inputV6, 3)
+	checkChainRules(t, conn, inputV4, 1)
+	checkChainRules(t, conn, inputV6, 1)
 
 	addr := netip.MustParseAddr("192.168.0.2")
 	addrV6 := netip.MustParseAddr("2001:db8::2")
 	runner.AddLoopbackRule(addr)
 	runner.AddLoopbackRule(addrV6)
 
-	checkChainRules(t, conn, inputV4, 4)
-	checkChainRules(t, conn, inputV6, 4)
+	checkChainRules(t, conn, inputV4, 2)
+	checkChainRules(t, conn, inputV6, 2)
 
 	existingLoopBackRule, err := findLoopBackRule(conn, nftables.TableFamilyIPv4, runner.nft4.Filter, inputV4, addr)
 	if err != nil {
@@ -881,8 +953,8 @@ func TestNFTAddAndDelLoopbackRule(t *testing.T) {
 	runner.DelLoopbackRule(addr)
 	runner.DelLoopbackRule(addrV6)
 
-	checkChainRules(t, conn, inputV4, 3)
-	checkChainRules(t, conn, inputV6, 3)
+	checkChainRules(t, conn, inputV4, 1)
+	checkChainRules(t, conn, inputV6, 1)
 }
 
 func TestNFTAddAndDelHookRule(t *testing.T) {
@@ -960,32 +1032,32 @@ func TestPickFirewallModeFromInstalledRules(t *testing.T) {
 		want FirewallMode
 	}{
 		{
-			name: "using iptables legacy",
+			name: "using-iptables-legacy",
 			det:  &testFWDetector{iptRuleCount: 1},
 			want: FirewallModeIPTables,
 		},
 		{
-			name: "using nftables",
+			name: "using-nftables",
 			det:  &testFWDetector{nftRuleCount: 1},
 			want: FirewallModeNfTables,
 		},
 		{
-			name: "using both iptables and nftables",
+			name: "using-both-iptables-and-nftables",
 			det:  &testFWDetector{iptRuleCount: 2, nftRuleCount: 2},
 			want: FirewallModeNfTables,
 		},
 		{
-			name: "not using any firewall, both available",
+			name: "no-firewall-both-available",
 			det:  &testFWDetector{},
 			want: FirewallModeNfTables,
 		},
 		{
-			name: "not using any firewall, iptables available only",
+			name: "no-firewall-iptables-only",
 			det:  &testFWDetector{iptRuleCount: 1, nftErr: errors.New("nft error")},
 			want: FirewallModeIPTables,
 		},
 		{
-			name: "not using any firewall, nftables available only",
+			name: "no-firewall-nftables-only",
 			det:  &testFWDetector{iptErr: errors.New("iptables error"), nftRuleCount: 1},
 			want: FirewallModeNfTables,
 		},
@@ -1066,7 +1138,286 @@ func checkSNATRule_nft(t *testing.T, runner *nftablesRunner, fam nftables.TableF
 	if chain == nil {
 		t.Fatal("POSTROUTING chain does not exist")
 	}
-	meta := []byte(fmt.Sprintf("dst:%s,src:%s", dst.String(), src.String()))
+	meta := fmt.Appendf(nil, "dst:%s,src:%s", dst.String(), src.String())
 	wantsRule := snatRule(chain.Table, chain, src, dst, meta)
 	checkRule(t, wantsRule, runner.conn)
+}
+
+// TestNFTAddAndDelConnmarkRules tests adding and removing connmark rules
+// in a real network namespace. This verifies the rules are correctly created
+// and cleaned up.
+func TestNFTAddAndDelConnmarkRules(t *testing.T) {
+	conn := newSysConn(t)
+	runner := newFakeNftablesRunnerWithConn(t, conn, true)
+
+	// Helper to get mangle chains
+	getMangleChains := func(fam nftables.TableFamily) (prerouting, output *nftables.Chain, err error) {
+		chains, err := conn.ListChainsOfTableFamily(fam)
+		if err != nil {
+			return nil, nil, err
+		}
+		for _, ch := range chains {
+			if ch.Table.Name != "mangle" {
+				continue
+			}
+			if ch.Name == "PREROUTING" {
+				prerouting = ch
+			} else if ch.Name == "OUTPUT" {
+				output = ch
+			}
+		}
+		return prerouting, output, nil
+	}
+
+	// Check initial state - mangle chains might not exist yet
+	prerouting4Before, output4Before, _ := getMangleChains(nftables.TableFamilyIPv4)
+	prerouting6Before, output6Before, _ := getMangleChains(nftables.TableFamilyIPv6)
+
+	var prerouting4RulesBefore, output4RulesBefore, prerouting6RulesBefore, output6RulesBefore int
+	if prerouting4Before != nil {
+		rules, _ := conn.GetRules(prerouting4Before.Table, prerouting4Before)
+		prerouting4RulesBefore = len(rules)
+	}
+	if output4Before != nil {
+		rules, _ := conn.GetRules(output4Before.Table, output4Before)
+		output4RulesBefore = len(rules)
+	}
+	if prerouting6Before != nil {
+		rules, _ := conn.GetRules(prerouting6Before.Table, prerouting6Before)
+		prerouting6RulesBefore = len(rules)
+	}
+	if output6Before != nil {
+		rules, _ := conn.GetRules(output6Before.Table, output6Before)
+		output6RulesBefore = len(rules)
+	}
+
+	// Add connmark rules
+	if err := runner.AddConnmarkSaveRule(); err != nil {
+		t.Fatalf("AddConnmarkSaveRule() failed: %v", err)
+	}
+
+	// Verify rules were added
+	prerouting4After, output4After, err := getMangleChains(nftables.TableFamilyIPv4)
+	if err != nil {
+		t.Fatalf("Failed to get IPv4 mangle chains: %v", err)
+	}
+	if prerouting4After == nil || output4After == nil {
+		t.Fatal("IPv4 mangle chains not created")
+	}
+
+	prerouting4Rules, err := conn.GetRules(prerouting4After.Table, prerouting4After)
+	if err != nil {
+		t.Fatalf("GetRules(PREROUTING) failed: %v", err)
+	}
+	output4Rules, err := conn.GetRules(output4After.Table, output4After)
+	if err != nil {
+		t.Fatalf("GetRules(OUTPUT) failed: %v", err)
+	}
+
+	// Should have added 1 rule to each chain
+	if len(prerouting4Rules) != prerouting4RulesBefore+1 {
+		t.Fatalf("PREROUTING rules: got %d, want %d", len(prerouting4Rules), prerouting4RulesBefore+1)
+	}
+	if len(output4Rules) != output4RulesBefore+1 {
+		t.Fatalf("OUTPUT rules: got %d, want %d", len(output4Rules), output4RulesBefore+1)
+	}
+
+	// Verify IPv6 rules
+	prerouting6After, output6After, err := getMangleChains(nftables.TableFamilyIPv6)
+	if err != nil {
+		t.Fatalf("Failed to get IPv6 mangle chains: %v", err)
+	}
+	if prerouting6After == nil || output6After == nil {
+		t.Fatal("IPv6 mangle chains not created")
+	}
+
+	prerouting6Rules, err := conn.GetRules(prerouting6After.Table, prerouting6After)
+	if err != nil {
+		t.Fatalf("GetRules(IPv6 PREROUTING) failed: %v", err)
+	}
+	output6Rules, err := conn.GetRules(output6After.Table, output6After)
+	if err != nil {
+		t.Fatalf("GetRules(IPv6 OUTPUT) failed: %v", err)
+	}
+
+	if len(prerouting6Rules) != prerouting6RulesBefore+1 {
+		t.Fatalf("IPv6 PREROUTING rules: got %d, want %d", len(prerouting6Rules), prerouting6RulesBefore+1)
+	}
+	if len(output6Rules) != output6RulesBefore+1 {
+		t.Fatalf("IPv6 OUTPUT rules: got %d, want %d", len(output6Rules), output6RulesBefore+1)
+	}
+
+	// Verify the rules contain conntrack expressions
+	foundCtInPrerouting := false
+	foundCtInOutput := false
+	for _, e := range prerouting4Rules[0].Exprs {
+		if _, ok := e.(*expr.Ct); ok {
+			foundCtInPrerouting = true
+			break
+		}
+	}
+	for _, e := range output4Rules[0].Exprs {
+		if _, ok := e.(*expr.Ct); ok {
+			foundCtInOutput = true
+			break
+		}
+	}
+	if !foundCtInPrerouting {
+		t.Error("PREROUTING rule doesn't contain conntrack expression")
+	}
+	if !foundCtInOutput {
+		t.Error("OUTPUT rule doesn't contain conntrack expression")
+	}
+
+	// Delete connmark rules
+	if err := runner.DelConnmarkSaveRule(); err != nil {
+		t.Fatalf("DelConnmarkSaveRule() failed: %v", err)
+	}
+
+	// Verify rules were deleted
+	prerouting4After, output4After, _ = getMangleChains(nftables.TableFamilyIPv4)
+	if prerouting4After != nil {
+		rules, _ := conn.GetRules(prerouting4After.Table, prerouting4After)
+		if len(rules) != prerouting4RulesBefore {
+			t.Fatalf("IPv4 PREROUTING rules after delete: got %d, want %d", len(rules), prerouting4RulesBefore)
+		}
+	}
+	if output4After != nil {
+		rules, _ := conn.GetRules(output4After.Table, output4After)
+		if len(rules) != output4RulesBefore {
+			t.Fatalf("IPv4 OUTPUT rules after delete: got %d, want %d", len(rules), output4RulesBefore)
+		}
+	}
+
+	prerouting6After, output6After, _ = getMangleChains(nftables.TableFamilyIPv6)
+	if prerouting6After != nil {
+		rules, _ := conn.GetRules(prerouting6After.Table, prerouting6After)
+		if len(rules) != prerouting6RulesBefore {
+			t.Fatalf("IPv6 PREROUTING rules after delete: got %d, want %d", len(rules), prerouting6RulesBefore)
+		}
+	}
+	if output6After != nil {
+		rules, _ := conn.GetRules(output6After.Table, output6After)
+		if len(rules) != output6RulesBefore {
+			t.Fatalf("IPv6 OUTPUT rules after delete: got %d, want %d", len(rules), output6RulesBefore)
+		}
+	}
+}
+
+// TestMakeConnmarkRestoreExprs tests the nftables expressions for restoring
+// marks from conntrack. This is a regression test that ensures the byte encoding
+// doesn't change unexpectedly.
+func TestMakeConnmarkRestoreExprs(t *testing.T) {
+	// Expected netlink bytes for the restore rule
+	// Generated by running makeConnmarkRestoreExprs() and capturing the output
+	want := [][]byte{
+		// batch begin
+		[]byte("\x00\x00\x00\x0a"),
+		// nft add table ip mangle
+		[]byte("\x02\x00\x00\x00\x0b\x00\x01\x00\x6d\x61\x6e\x67\x6c\x65\x00\x00\x08\x00\x02\x00\x00\x00\x00\x00"),
+		// nft add chain ip mangle PREROUTING { type filter hook prerouting priority mangle; }
+		[]byte("\x02\x00\x00\x00\x0b\x00\x01\x00\x6d\x61\x6e\x67\x6c\x65\x00\x00\x0f\x00\x03\x00\x50\x52\x45\x52\x4f\x55\x54\x49\x4e\x47\x00\x00\x14\x00\x04\x80\x08\x00\x01\x00\x00\x00\x00\x00\x08\x00\x02\x00\xff\xff\xff\x6a\x0b\x00\x07\x00\x66\x69\x6c\x74\x65\x72\x00\x00"),
+		// nft add rule ip mangle PREROUTING ct state established,related ct mark & 0xff0000 != 0 meta mark set ct mark & 0xff0000
+		[]byte("\x02\x00\x00\x00\x0b\x00\x01\x00\x6d\x61\x6e\x67\x6c\x65\x00\x00\x0f\x00\x02\x00\x50\x52\x45\x52\x4f\x55\x54\x49\x4e\x47\x00\x00\x48\x01\x04\x80\x20\x00\x01\x80\x07\x00\x01\x00\x63\x74\x00\x00\x14\x00\x02\x80\x08\x00\x02\x00\x00\x00\x00\x00\x08\x00\x01\x00\x00\x00\x00\x01\x44\x00\x01\x80\x0c\x00\x01\x00\x62\x69\x74\x77\x69\x73\x65\x00\x34\x00\x02\x80\x08\x00\x01\x00\x00\x00\x00\x01\x08\x00\x02\x00\x00\x00\x00\x01\x08\x00\x03\x00\x00\x00\x00\x04\x0c\x00\x04\x80\x08\x00\x01\x00\x06\x00\x00\x00\x0c\x00\x05\x80\x08\x00\x01\x00\x00\x00\x00\x00\x2c\x00\x01\x80\x08\x00\x01\x00\x63\x6d\x70\x00\x20\x00\x02\x80\x08\x00\x01\x00\x00\x00\x00\x01\x08\x00\x02\x00\x00\x00\x00\x01\x0c\x00\x03\x80\x08\x00\x01\x00\x00\x00\x00\x00\x20\x00\x01\x80\x07\x00\x01\x00\x63\x74\x00\x00\x14\x00\x02\x80\x08\x00\x02\x00\x00\x00\x00\x03\x08\x00\x01\x00\x00\x00\x00\x01\x44\x00\x01\x80\x0c\x00\x01\x00\x62\x69\x74\x77\x69\x73\x65\x00\x34\x00\x02\x80\x08\x00\x01\x00\x00\x00\x00\x01\x08\x00\x02\x00\x00\x00\x00\x01\x08\x00\x03\x00\x00\x00\x00\x04\x0c\x00\x04\x80\x08\x00\x01\x00\x00\x00\xff\x00\x0c\x00\x05\x80\x08\x00\x01\x00\x00\x00\x00\x00\x2c\x00\x01\x80\x08\x00\x01\x00\x63\x6d\x70\x00\x20\x00\x02\x80\x08\x00\x01\x00\x00\x00\x00\x01\x08\x00\x02\x00\x00\x00\x00\x01\x0c\x00\x03\x80\x08\x00\x01\x00\x00\x00\x00\x00\x24\x00\x01\x80\x09\x00\x01\x00\x6d\x65\x74\x61\x00\x00\x00\x00\x14\x00\x02\x80\x08\x00\x02\x00\x00\x00\x00\x03\x08\x00\x03\x00\x00\x00\x00\x01"),
+		// batch end
+		[]byte("\x00\x00\x00\x0a"),
+	}
+
+	testConn := newTestConn(t, want, nil)
+	table := testConn.AddTable(&nftables.Table{
+		Family: nftables.TableFamilyIPv4,
+		Name:   "mangle",
+	})
+	chain := testConn.AddChain(&nftables.Chain{
+		Name:     "PREROUTING",
+		Table:    table,
+		Type:     nftables.ChainTypeFilter,
+		Hooknum:  nftables.ChainHookPrerouting,
+		Priority: nftables.ChainPriorityMangle,
+	})
+	testConn.InsertRule(&nftables.Rule{
+		Table: table,
+		Chain: chain,
+		Exprs: makeConnmarkRestoreExprs(),
+	})
+	if err := testConn.Flush(); err != nil {
+		t.Fatalf("Flush() failed: %v", err)
+	}
+}
+
+// TestMakeConnmarkSaveExprs tests the nftables expressions for saving marks
+// to conntrack. This is a regression test that ensures the byte encoding
+// doesn't change unexpectedly.
+func TestMakeConnmarkSaveExprs(t *testing.T) {
+	// Expected netlink bytes for the save rule
+	// Generated by running makeConnmarkSaveExprs() and capturing the output
+	want := [][]byte{
+		// batch begin
+		[]byte("\x00\x00\x00\x0a"),
+		// nft add table ip mangle
+		[]byte("\x02\x00\x00\x00\x0b\x00\x01\x00\x6d\x61\x6e\x67\x6c\x65\x00\x00\x08\x00\x02\x00\x00\x00\x00\x00"),
+		// nft add chain ip mangle OUTPUT { type route hook output priority mangle; }
+		[]byte("\x02\x00\x00\x00\x0b\x00\x01\x00\x6d\x61\x6e\x67\x6c\x65\x00\x00\x0b\x00\x03\x00\x4f\x55\x54\x50\x55\x54\x00\x00\x14\x00\x04\x80\x08\x00\x01\x00\x00\x00\x00\x03\x08\x00\x02\x00\xff\xff\xff\x6a\x0a\x00\x07\x00\x72\x6f\x75\x74\x65\x00\x00\x00"),
+		// nft add rule ip mangle OUTPUT ct state new meta mark & 0xff0000 != 0 ct mark set meta mark & 0xff0000
+		[]byte("\x02\x00\x00\x00\x0b\x00\x01\x00\x6d\x61\x6e\x67\x6c\x65\x00\x00\x0b\x00\x02\x00\x4f\x55\x54\x50\x55\x54\x00\x00\xb0\x01\x04\x80\x20\x00\x01\x80\x07\x00\x01\x00\x63\x74\x00\x00\x14\x00\x02\x80\x08\x00\x02\x00\x00\x00\x00\x00\x08\x00\x01\x00\x00\x00\x00\x01\x44\x00\x01\x80\x0c\x00\x01\x00\x62\x69\x74\x77\x69\x73\x65\x00\x34\x00\x02\x80\x08\x00\x01\x00\x00\x00\x00\x01\x08\x00\x02\x00\x00\x00\x00\x01\x08\x00\x03\x00\x00\x00\x00\x04\x0c\x00\x04\x80\x08\x00\x01\x00\x08\x00\x00\x00\x0c\x00\x05\x80\x08\x00\x01\x00\x00\x00\x00\x00\x2c\x00\x01\x80\x08\x00\x01\x00\x63\x6d\x70\x00\x20\x00\x02\x80\x08\x00\x01\x00\x00\x00\x00\x01\x08\x00\x02\x00\x00\x00\x00\x01\x0c\x00\x03\x80\x08\x00\x01\x00\x00\x00\x00\x00\x24\x00\x01\x80\x09\x00\x01\x00\x6d\x65\x74\x61\x00\x00\x00\x00\x14\x00\x02\x80\x08\x00\x02\x00\x00\x00\x00\x03\x08\x00\x01\x00\x00\x00\x00\x01\x44\x00\x01\x80\x0c\x00\x01\x00\x62\x69\x74\x77\x69\x73\x65\x00\x34\x00\x02\x80\x08\x00\x01\x00\x00\x00\x00\x01\x08\x00\x02\x00\x00\x00\x00\x01\x08\x00\x03\x00\x00\x00\x00\x04\x0c\x00\x04\x80\x08\x00\x01\x00\x00\x00\xff\x00\x0c\x00\x05\x80\x08\x00\x01\x00\x00\x00\x00\x00\x2c\x00\x01\x80\x08\x00\x01\x00\x63\x6d\x70\x00\x20\x00\x02\x80\x08\x00\x01\x00\x00\x00\x00\x01\x08\x00\x02\x00\x00\x00\x00\x01\x0c\x00\x03\x80\x08\x00\x01\x00\x00\x00\x00\x00\x24\x00\x01\x80\x09\x00\x01\x00\x6d\x65\x74\x61\x00\x00\x00\x00\x14\x00\x02\x80\x08\x00\x02\x00\x00\x00\x00\x03\x08\x00\x01\x00\x00\x00\x00\x01\x44\x00\x01\x80\x0c\x00\x01\x00\x62\x69\x74\x77\x69\x73\x65\x00\x34\x00\x02\x80\x08\x00\x01\x00\x00\x00\x00\x01\x08\x00\x02\x00\x00\x00\x00\x01\x08\x00\x03\x00\x00\x00\x00\x04\x0c\x00\x04\x80\x08\x00\x01\x00\x00\x00\xff\x00\x0c\x00\x05\x80\x08\x00\x01\x00\x00\x00\x00\x00\x20\x00\x01\x80\x07\x00\x01\x00\x63\x74\x00\x00\x14\x00\x02\x80\x08\x00\x02\x00\x00\x00\x00\x03\x08\x00\x04\x00\x00\x00\x00\x01"),
+		// batch end
+		[]byte("\x00\x00\x00\x0a"),
+	}
+
+	testConn := newTestConn(t, want, nil)
+	table := testConn.AddTable(&nftables.Table{
+		Family: nftables.TableFamilyIPv4,
+		Name:   "mangle",
+	})
+	chain := testConn.AddChain(&nftables.Chain{
+		Name:     "OUTPUT",
+		Table:    table,
+		Type:     nftables.ChainTypeRoute,
+		Hooknum:  nftables.ChainHookOutput,
+		Priority: nftables.ChainPriorityMangle,
+	})
+	testConn.InsertRule(&nftables.Rule{
+		Table: table,
+		Chain: chain,
+		Exprs: makeConnmarkSaveExprs(),
+	})
+	if err := testConn.Flush(); err != nil {
+		t.Fatalf("Flush() failed: %v", err)
+	}
+}
+
+// TestGetOrCreateChainNilHooknum verifies that getOrCreateChain returns a clear
+// error when a ts- chain exists but has nil Hooknum/Priority, which happens when
+// the kernel lacks nftables support (CONFIG_NF_TABLES).
+func TestGetOrCreateChainNilHooknum(t *testing.T) {
+	conn := newSysConn(t)
+
+	table := conn.AddTable(&nftables.Table{
+		Family: nftables.TableFamilyIPv4,
+		Name:   "ts-filter-test",
+	})
+	// Add a ts- chain without hooknum/priority (regular chain), simulating
+	// the broken state returned by a kernel without nftables support.
+	conn.AddChain(&nftables.Chain{
+		Name:  "ts-input",
+		Table: table,
+	})
+	if err := conn.Flush(); err != nil {
+		t.Fatalf("Flush() failed: %v", err)
+	}
+
+	// Now try getOrCreateChain expecting a base chain with hooknum/priority.
+	_, err := getOrCreateChain(conn, chainInfo{
+		table:         table,
+		name:          "ts-input",
+		chainType:     nftables.ChainTypeFilter,
+		chainHook:     nftables.ChainHookInput,
+		chainPriority: nftables.ChainPriorityFilter,
+	})
+	if err == nil {
+		t.Fatal("expected error for chain with nil hooknum/priority, got nil")
+	}
+	if !strings.Contains(err.Error(), "nil hooknum") {
+		t.Fatalf("unexpected error: %v", err)
+	}
 }

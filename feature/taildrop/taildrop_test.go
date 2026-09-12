@@ -1,42 +1,12 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package taildrop
 
 import (
-	"path/filepath"
 	"strings"
 	"testing"
 )
-
-func TestJoinDir(t *testing.T) {
-	dir := t.TempDir()
-	tests := []struct {
-		in     string
-		want   string // just relative to m.Dir
-		wantOk bool
-	}{
-		{"", "", false},
-		{"foo", "foo", true},
-		{"./foo", "", false},
-		{"../foo", "", false},
-		{"foo/bar", "", false},
-		{"😋", "😋", true},
-		{"\xde\xad\xbe\xef", "", false},
-		{"foo.partial", "", false},
-		{"foo.deleted", "", false},
-		{strings.Repeat("a", 1024), "", false},
-		{"foo:bar", "", false},
-	}
-	for _, tt := range tests {
-		got, gotErr := joinDir(dir, tt.in)
-		got, _ = filepath.Rel(dir, got)
-		gotOk := gotErr == nil
-		if got != tt.want || gotOk != tt.wantOk {
-			t.Errorf("joinDir(%q) = (%v, %v), want (%v, %v)", tt.in, got, gotOk, tt.want, tt.wantOk)
-		}
-	}
-}
 
 func TestNextFilename(t *testing.T) {
 	tests := []struct {
@@ -64,6 +34,32 @@ func TestNextFilename(t *testing.T) {
 		}
 		if got2 := nextFilename(tt.want); got2 != tt.want2 {
 			t.Errorf("NextFilename(%q) = %q, want %q", tt.want, got2, tt.want2)
+		}
+	}
+}
+
+func TestValidateBaseName(t *testing.T) {
+	tests := []struct {
+		in     string
+		wantOk bool
+	}{
+		{"", false},
+		{"foo", true},
+		{"./foo", false},
+		{"../foo", false},
+		{"foo/bar", false},
+		{"😋", true},
+		{"\xde\xad\xbe\xef", false},
+		{"foo.partial", false},
+		{"foo.deleted", false},
+		{strings.Repeat("a", 1024), false},
+		{"foo:bar", false},
+	}
+	for _, tt := range tests {
+		err := validateBaseName(tt.in)
+		gotOk := err == nil
+		if gotOk != tt.wantOk {
+			t.Errorf("validateBaseName(%q) = %v, wantOk = %v", tt.in, err, tt.wantOk)
 		}
 	}
 }

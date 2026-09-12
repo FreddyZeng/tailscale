@@ -1,13 +1,14 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
-package syncs
+package syncs_test
 
 import (
 	"expvar"
 	"sync"
 	"testing"
 
+	. "tailscale.com/syncs"
 	"tailscale.com/tstest"
 )
 
@@ -29,7 +30,7 @@ func BenchmarkShardedInt(b *testing.B) {
 		})
 	})
 
-	b.Run("sharded int", func(b *testing.B) {
+	b.Run("sharded-int", func(b *testing.B) {
 		m := NewShardedInt()
 		b.RunParallel(func(pb *testing.PB) {
 			for pb.Next() {
@@ -59,16 +60,16 @@ func TestShardedInt(t *testing.T) {
 		}
 	})
 
-	t.Run("high concurrency", func(t *testing.T) {
+	t.Run("high-concurrency", func(t *testing.T) {
 		m := NewShardedInt()
 		wg := sync.WaitGroup{}
 		numWorkers := 1000
 		numIncrements := 1000
 		wg.Add(numWorkers)
-		for i := 0; i < numWorkers; i++ {
+		for range numWorkers {
 			go func() {
 				defer wg.Done()
-				for i := 0; i < numIncrements; i++ {
+				for range numIncrements {
 					m.Add(1)
 				}
 			}()
@@ -82,7 +83,7 @@ func TestShardedInt(t *testing.T) {
 		}
 	})
 
-	t.Run("encoding.TextAppender", func(t *testing.T) {
+	t.Run("encoding-TextAppender", func(t *testing.T) {
 		m := NewShardedInt()
 		m.Add(1)
 		b := make([]byte, 0, 10)

@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Program speedtest provides the speedtest command. The reason to keep it separate from
@@ -72,8 +72,7 @@ var speedtestArgs struct {
 func runSpeedtest(ctx context.Context, args []string) error {
 
 	if _, _, err := net.SplitHostPort(speedtestArgs.host); err != nil {
-		var addrErr *net.AddrError
-		if errors.As(err, &addrErr) && addrErr.Err == "missing port in address" {
+		if addrErr, ok := errors.AsType[*net.AddrError](err); ok && addrErr.Err == "missing port in address" {
 			// if no port is provided, append the default port
 			speedtestArgs.host = net.JoinHostPort(speedtestArgs.host, strconv.Itoa(speedtest.DefaultPort))
 		}

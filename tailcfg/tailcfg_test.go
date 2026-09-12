@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package tailcfg_test
@@ -13,17 +13,18 @@ import (
 	"testing"
 	"time"
 
+	"tailscale.com/ipn/ipnstate"
 	. "tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/peercap"
 	"tailscale.com/tstest/deptest"
 	"tailscale.com/types/key"
 	"tailscale.com/types/opt"
-	"tailscale.com/types/ptr"
 	"tailscale.com/util/must"
 )
 
 func fieldsOf(t reflect.Type) (fields []string) {
-	for i := range t.NumField() {
-		fields = append(fields, t.Field(i).Name)
+	for field := range t.Fields() {
+		fields = append(fields, field.Name)
 	}
 	return
 }
@@ -49,6 +50,7 @@ func TestHostinfoEqual(t *testing.T) {
 		"ShieldsUp",
 		"ShareeNode",
 		"NoLogsNoSupport",
+		"RemoteConfig",
 		"WireIngress",
 		"IngressEnabled",
 		"AllowsUpdate",
@@ -67,8 +69,11 @@ func TestHostinfoEqual(t *testing.T) {
 		"UserspaceRouter",
 		"AppConnector",
 		"ServicesHash",
+		"PeerRelay",
+		"ExitNodeID",
 		"Location",
 		"TPM",
+		"StateEncrypted",
 	}
 	if have := fieldsOf(reflect.TypeFor[Hostinfo]()); !reflect.DeepEqual(have, hiHandles) {
 		t.Errorf("Hostinfo.Equal check might be out of sync\nfields: %q\nhandled: %q\n",
@@ -243,6 +248,16 @@ func TestHostinfoEqual(t *testing.T) {
 			false,
 		},
 		{
+			&Hostinfo{PeerRelay: true},
+			&Hostinfo{PeerRelay: true},
+			true,
+		},
+		{
+			&Hostinfo{PeerRelay: true},
+			&Hostinfo{PeerRelay: false},
+			false,
+		},
+		{
 			&Hostinfo{ServicesHash: "73475cb40a568e8da8a045ced110137e159f890ac4da883b6b17dc651b3a8049"},
 			&Hostinfo{ServicesHash: "73475cb40a568e8da8a045ced110137e159f890ac4da883b6b17dc651b3a8049"},
 			true,
@@ -270,6 +285,21 @@ func TestHostinfoEqual(t *testing.T) {
 		{
 			&Hostinfo{IngressEnabled: false},
 			&Hostinfo{IngressEnabled: true},
+			false,
+		},
+		{
+			&Hostinfo{ExitNodeID: "stable-exit"},
+			&Hostinfo{ExitNodeID: "stable-exit"},
+			true,
+		},
+		{
+			&Hostinfo{ExitNodeID: ""},
+			&Hostinfo{},
+			true,
+		},
+		{
+			&Hostinfo{ExitNodeID: ""},
+			&Hostinfo{ExitNodeID: "stable-exit"},
 			false,
 		},
 	}
@@ -511,22 +541,22 @@ func TestNodeEqual(t *testing.T) {
 		},
 		{
 			&Node{},
-			&Node{SelfNodeV4MasqAddrForThisPeer: ptr.To(netip.MustParseAddr("100.64.0.1"))},
+			&Node{SelfNodeV4MasqAddrForThisPeer: new(netip.MustParseAddr("100.64.0.1"))},
 			false,
 		},
 		{
-			&Node{SelfNodeV4MasqAddrForThisPeer: ptr.To(netip.MustParseAddr("100.64.0.1"))},
-			&Node{SelfNodeV4MasqAddrForThisPeer: ptr.To(netip.MustParseAddr("100.64.0.1"))},
+			&Node{SelfNodeV4MasqAddrForThisPeer: new(netip.MustParseAddr("100.64.0.1"))},
+			&Node{SelfNodeV4MasqAddrForThisPeer: new(netip.MustParseAddr("100.64.0.1"))},
 			true,
 		},
 		{
 			&Node{},
-			&Node{SelfNodeV6MasqAddrForThisPeer: ptr.To(netip.MustParseAddr("2001::3456"))},
+			&Node{SelfNodeV6MasqAddrForThisPeer: new(netip.MustParseAddr("2001::3456"))},
 			false,
 		},
 		{
-			&Node{SelfNodeV6MasqAddrForThisPeer: ptr.To(netip.MustParseAddr("2001::3456"))},
-			&Node{SelfNodeV6MasqAddrForThisPeer: ptr.To(netip.MustParseAddr("2001::3456"))},
+			&Node{SelfNodeV6MasqAddrForThisPeer: new(netip.MustParseAddr("2001::3456"))},
+			&Node{SelfNodeV6MasqAddrForThisPeer: new(netip.MustParseAddr("2001::3456"))},
 			true,
 		},
 		{
@@ -587,10 +617,203 @@ func TestNodeEqual(t *testing.T) {
 	}
 }
 
+var nodeIsRouterCases = []struct {
+	name string
+	node Node
+	want bool
+}{
+	{
+		name: "empty",
+		node: Node{},
+		want: false,
+	},
+	{
+		name: "too-few-allowedips",
+		node: Node{
+			Addresses: []netip.Prefix{
+				netip.MustParsePrefix("100.64.0.1/32"),
+			},
+			AllowedIPs: []netip.Prefix{},
+		},
+		want: false,
+	},
+	{
+		name: "duplicates",
+		node: Node{
+			Addresses: []netip.Prefix{
+				netip.MustParsePrefix("100.64.0.1/32"),
+			},
+			AllowedIPs: []netip.Prefix{
+				netip.MustParsePrefix("100.64.0.1/32"),
+				netip.MustParsePrefix("100.64.0.1/32"),
+			},
+		},
+		want: false,
+	},
+	{
+		name: "plain-ipv4",
+		node: Node{
+			Addresses: []netip.Prefix{
+				netip.MustParsePrefix("100.64.0.1/32"),
+			},
+			AllowedIPs: []netip.Prefix{
+				netip.MustParsePrefix("100.64.0.1/32"),
+			},
+		},
+		want: false,
+	},
+	{
+		name: "plain-ipv6",
+		node: Node{
+			Addresses: []netip.Prefix{
+				netip.MustParsePrefix("fd7a:115c:a1e0::1/128"),
+			},
+			AllowedIPs: []netip.Prefix{
+				netip.MustParsePrefix("fd7a:115c:a1e0::1/128"),
+			},
+		},
+		want: false,
+	},
+	{
+		name: "plain-ipv4-ipv6",
+		node: Node{
+			Addresses: []netip.Prefix{
+				netip.MustParsePrefix("100.64.0.1/32"),
+				netip.MustParsePrefix("fd7a:115c:a1e0::1/128"),
+			},
+			AllowedIPs: []netip.Prefix{
+				netip.MustParsePrefix("100.64.0.1/32"),
+				netip.MustParsePrefix("fd7a:115c:a1e0::1/128"),
+			},
+		},
+		want: false,
+	},
+	{
+		name: "exit-node-ipv4",
+		node: Node{
+			Addresses: []netip.Prefix{
+				netip.MustParsePrefix("100.64.0.1/32"),
+			},
+			AllowedIPs: []netip.Prefix{
+				netip.MustParsePrefix("100.64.0.1/32"),
+				netip.MustParsePrefix("0.0.0.0/0"),
+			},
+		},
+		want: true,
+	},
+	{
+		name: "exit-node-ipv6",
+		node: Node{
+			Addresses: []netip.Prefix{
+				netip.MustParsePrefix("fd7a:115c:a1e0::1/128"),
+			},
+			AllowedIPs: []netip.Prefix{
+				netip.MustParsePrefix("fd7a:115c:a1e0::1/128"),
+				netip.MustParsePrefix("::/0"),
+			},
+		},
+		want: true,
+	},
+	{
+		name: "exit-node-ipv4-ipv6",
+		node: Node{
+			Addresses: []netip.Prefix{
+				netip.MustParsePrefix("100.64.0.1/32"),
+				netip.MustParsePrefix("fd7a:115c:a1e0::1/128"),
+			},
+			AllowedIPs: []netip.Prefix{
+				netip.MustParsePrefix("100.64.0.1/32"),
+				netip.MustParsePrefix("fd7a:115c:a1e0::1/128"),
+				netip.MustParsePrefix("0.0.0.0/0"),
+				netip.MustParsePrefix("::/0"),
+			},
+		},
+		want: true,
+	},
+	{
+		name: "subnet-router-ipv4",
+		node: Node{
+			Addresses: []netip.Prefix{
+				netip.MustParsePrefix("100.64.0.1/32"),
+			},
+			AllowedIPs: []netip.Prefix{
+				netip.MustParsePrefix("100.64.0.1/32"),
+				netip.MustParsePrefix("192.0.2.0/24"),
+			},
+		},
+		want: true,
+	},
+	{
+		name: "subnet-router-ipv6",
+		node: Node{
+			Addresses: []netip.Prefix{
+				netip.MustParsePrefix("fd7a:115c:a1e0::1/128"),
+			},
+			AllowedIPs: []netip.Prefix{
+				netip.MustParsePrefix("fd7a:115c:a1e0::1/128"),
+				netip.MustParsePrefix("2001:db8::/32"),
+			},
+		},
+		want: true,
+	},
+	{
+		name: "subnet-router-ipv4-ipv6",
+		node: Node{
+			Addresses: []netip.Prefix{
+				netip.MustParsePrefix("100.64.0.1/32"),
+				netip.MustParsePrefix("fd7a:115c:a1e0::1/128"),
+			},
+			AllowedIPs: []netip.Prefix{
+				netip.MustParsePrefix("100.64.0.1/32"),
+				netip.MustParsePrefix("fd7a:115c:a1e0::1/128"),
+				netip.MustParsePrefix("192.0.2.0/24"),
+				netip.MustParsePrefix("2001:db8::/32"),
+			},
+		},
+		want: true,
+	},
+}
+
+func TestNodeIsRouter(t *testing.T) {
+	for _, tc := range nodeIsRouterCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.node.IsRouter(); got != tc.want {
+				t.Errorf("node: got %t, want %t", got, tc.want)
+			}
+
+			nv := tc.node.View()
+			if got := nv.IsRouter(); got != tc.want {
+				t.Errorf("view: got %t, want %t", got, tc.want)
+			}
+
+			// Check that [ipnstate.PeerStatus.IsRouter] matches.
+			ps := peerStatusFromNode(nv)
+			if got := ps.IsRouter(); got != tc.want {
+				t.Errorf("peer status: got %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
+func peerStatusFromNode(n NodeView) *ipnstate.PeerStatus {
+	ps := &ipnstate.PeerStatus{
+		ID:        n.StableID(),
+		NodeID:    n.ID(),
+		PublicKey: n.Key(),
+		DNSName:   n.Name(),
+	}
+	for _, p := range n.Addresses().All() {
+		if p.IsSingleIP() {
+			ps.TailscaleIPs = append(ps.TailscaleIPs, p.Addr())
+		}
+	}
+	ps.AllowedIPs = new(n.AllowedIPs())
+	return ps
+}
+
 func TestNetInfoFields(t *testing.T) {
 	handled := []string{
 		"MappingVariesByDestIP",
-		"HairPinning",
 		"WorkingIPv6",
 		"OSHasIPv6",
 		"WorkingUDP",
@@ -801,28 +1024,28 @@ func TestMarshalToRawMessageAndBack(t *testing.T) {
 		Ports    []int            `json:"ports,omitempty"`
 		ToggleOn bool             `json:"toggleOn,omitempty"`
 		Name     string           `json:"name,omitempty"`
-		Groups   inner            `json:"groups,omitempty"`
+		Groups   inner            `json:"groups"`
 		Addrs    []netip.AddrPort `json:"addrs"`
 	}
 	tests := []struct {
 		name    string
-		capType PeerCapability
+		capType peercap.Cap
 		val     testRule
 	}{
 		{
 			name:    "empty",
 			val:     testRule{},
-			capType: PeerCapability("foo"),
+			capType: peercap.Cap("foo"),
 		},
 		{
-			name:    "some values",
+			name:    "some-values",
 			val:     testRule{Ports: []int{80, 443}, Name: "foo"},
-			capType: PeerCapability("foo"),
+			capType: peercap.Cap("foo"),
 		},
 		{
-			name:    "all values",
+			name:    "all-values",
 			val:     testRule{Ports: []int{80, 443}, Name: "foo", ToggleOn: true, Groups: inner{Groups: []string{"foo", "bar"}}, Addrs: []netip.AddrPort{testip}},
-			capType: PeerCapability("foo"),
+			capType: peercap.Cap("foo"),
 		},
 	}
 	for _, tc := range tests {
@@ -880,77 +1103,185 @@ func TestCheckTag(t *testing.T) {
 }
 
 func TestDisplayMessageEqual(t *testing.T) {
-	base := DisplayMessage{
-		Title:               "title",
-		Text:                "text",
-		Severity:            SeverityHigh,
-		ImpactsConnectivity: false,
-	}
-
 	type test struct {
 		name      string
-		value     DisplayMessage
+		value1    DisplayMessage
+		value2    DisplayMessage
 		wantEqual bool
 	}
 
 	for _, test := range []test{
 		{
 			name: "same",
-			value: DisplayMessage{
+			value1: DisplayMessage{
 				Title:               "title",
 				Text:                "text",
 				Severity:            SeverityHigh,
 				ImpactsConnectivity: false,
+				PrimaryAction: &DisplayMessageAction{
+					URL:   "https://example.com",
+					Label: "Open",
+				},
+			},
+			value2: DisplayMessage{
+				Title:               "title",
+				Text:                "text",
+				Severity:            SeverityHigh,
+				ImpactsConnectivity: false,
+				PrimaryAction: &DisplayMessageAction{
+					URL:   "https://example.com",
+					Label: "Open",
+				},
 			},
 			wantEqual: true,
 		},
 		{
 			name: "different-title",
-			value: DisplayMessage{
-				Title:               "different title",
-				Text:                "text",
-				Severity:            SeverityHigh,
-				ImpactsConnectivity: false,
+			value1: DisplayMessage{
+				Title: "title",
+			},
+			value2: DisplayMessage{
+				Title: "different title",
 			},
 			wantEqual: false,
 		},
 		{
 			name: "different-text",
-			value: DisplayMessage{
-				Title:               "title",
-				Text:                "different text",
-				Severity:            SeverityHigh,
-				ImpactsConnectivity: false,
+			value1: DisplayMessage{
+				Text: "some text",
+			},
+			value2: DisplayMessage{
+				Text: "different text",
 			},
 			wantEqual: false,
 		},
 		{
 			name: "different-severity",
-			value: DisplayMessage{
-				Title:               "title",
-				Text:                "text",
-				Severity:            SeverityMedium,
-				ImpactsConnectivity: false,
+			value1: DisplayMessage{
+				Severity: SeverityHigh,
+			},
+			value2: DisplayMessage{
+				Severity: SeverityMedium,
 			},
 			wantEqual: false,
 		},
 		{
 			name: "different-impactsConnectivity",
-			value: DisplayMessage{
-				Title:               "title",
-				Text:                "text",
-				Severity:            SeverityHigh,
+			value1: DisplayMessage{
 				ImpactsConnectivity: true,
+			},
+			value2: DisplayMessage{
+				ImpactsConnectivity: false,
+			},
+			wantEqual: false,
+		},
+		{
+			name:   "different-primaryAction-nil-non-nil",
+			value1: DisplayMessage{},
+			value2: DisplayMessage{
+				PrimaryAction: &DisplayMessageAction{
+					URL:   "https://example.com",
+					Label: "Open",
+				},
+			},
+			wantEqual: false,
+		},
+		{
+			name: "different-primaryAction-url",
+			value1: DisplayMessage{
+				PrimaryAction: &DisplayMessageAction{
+					URL:   "https://example.com",
+					Label: "Open",
+				},
+			},
+			value2: DisplayMessage{
+				PrimaryAction: &DisplayMessageAction{
+					URL:   "https://zombo.com",
+					Label: "Open",
+				},
+			},
+			wantEqual: false,
+		},
+		{
+			name: "different-primaryAction-label",
+			value1: DisplayMessage{
+				PrimaryAction: &DisplayMessageAction{
+					URL:   "https://example.com",
+					Label: "Open",
+				},
+			},
+			value2: DisplayMessage{
+				PrimaryAction: &DisplayMessageAction{
+					URL:   "https://example.com",
+					Label: "Learn more",
+				},
 			},
 			wantEqual: false,
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			got := base.Equal(test.value)
+			got := test.value1.Equal(test.value2)
 
 			if got != test.wantEqual {
-				t.Errorf("Equal: got %t, want %t", got, test.wantEqual)
+				value1 := must.Get(json.MarshalIndent(test.value1, "", "  "))
+				value2 := must.Get(json.MarshalIndent(test.value2, "", "  "))
+				t.Errorf("value1.Equal(value2): got %t, want %t\nvalue1:\n%s\nvalue2:\n%s", got, test.wantEqual, value1, value2)
 			}
 		})
+	}
+}
+
+func TestServiceActionTypeValid(t *testing.T) {
+	tests := []struct {
+		typ  ServiceActionType
+		want bool
+	}{
+		{ServiceActionTypeAWSS3, true},
+		{ServiceActionTypeCockroachDB, true},
+		{ServiceActionTypeElasticSearch, true},
+		{ServiceActionTypeHTTP, true},
+		{ServiceActionTypeKubernetes, true},
+		{ServiceActionTypeMongoDB, true},
+		{ServiceActionTypeMSSQL, true},
+		{ServiceActionTypeMySQL, true},
+		{ServiceActionTypePostgreSQL, true},
+		{ServiceActionTypeRDP, true},
+		{ServiceActionTypeVNC, true},
+		{ServiceActionTypeSSH, true},
+		{ServiceActionTypeTCP, true},
+		{"ftp", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		if got := tt.typ.Valid(); got != tt.want {
+			t.Errorf("ServiceActionType(%q).Valid() = %v, want %v", tt.typ, got, tt.want)
+		}
+	}
+}
+
+// TestSSHActionJSON verifies that SSHAction round-trips through
+// encoding/json with SessionDuration encoded as int64 nanoseconds.
+// It notably guards against jsonv2 `format` tag options in struct
+// tags, which Go 1.27's encoding/json rejects at runtime.
+// See https://github.com/tailscale/tailscale/issues/20528.
+func TestSSHActionJSON(t *testing.T) {
+	a := SSHAction{
+		Accept:          true,
+		SessionDuration: 5 * time.Second,
+	}
+	got, err := json.Marshal(a)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	const want = `{"accept":true,"sessionDuration":5000000000}`
+	if string(got) != want {
+		t.Errorf("Marshal = %s; want %s", got, want)
+	}
+	var back SSHAction
+	if err := json.Unmarshal(got, &back); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if !reflect.DeepEqual(back, a) {
+		t.Errorf("round trip = %+v; want %+v", back, a)
 	}
 }

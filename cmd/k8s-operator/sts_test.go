@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !plan9
@@ -8,6 +8,7 @@ package main
 import (
 	_ "embed"
 	"fmt"
+	"maps"
 	"reflect"
 	"regexp"
 	"strings"
@@ -22,7 +23,6 @@ import (
 	"sigs.k8s.io/yaml"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
 	"tailscale.com/kube/kubetypes"
-	"tailscale.com/types/ptr"
 )
 
 // Test_statefulSetNameBase tests that parent name portion in a StatefulSet name
@@ -41,10 +41,7 @@ func Test_statefulSetNameBase(t *testing.T) {
 		if _, err := b.WriteString("a"); err != nil {
 			t.Fatalf("error writing to string builder: %v", err)
 		}
-		baseLength := b.Len()
-		if baseLength > 43 {
-			baseLength = 43 // currently 43 is the max base length
-		}
+		baseLength := min(b.Len(), 43)                                              // currently 43 is the max base length
 		wantsNameR := regexp.MustCompile(`^ts-a{` + fmt.Sprint(baseLength) + `}-$`) // to match a string like ts-aaaa-
 		gotName := statefulSetNameBase(b.String())
 		if !wantsNameR.MatchString(gotName) {
@@ -61,6 +58,7 @@ func Test_applyProxyClassToStatefulSet(t *testing.T) {
 	// Setup
 	proxyClassAllOpts := &tsapi.ProxyClass{
 		Spec: tsapi.ProxyClassSpec{
+			UseLetsEncryptStagingEnvironment: true,
 			StatefulSet: &tsapi.StatefulSet{
 				Labels:      tsapi.Labels{"foo": "bar"},
 				Annotations: map[string]string{"foo.io/bar": "foo"},
@@ -68,13 +66,14 @@ func Test_applyProxyClassToStatefulSet(t *testing.T) {
 					Labels:      tsapi.Labels{"bar": "foo"},
 					Annotations: map[string]string{"bar.io/foo": "foo"},
 					SecurityContext: &corev1.PodSecurityContext{
-						RunAsUser: ptr.To(int64(0)),
+						RunAsUser: new(int64(0)),
 					},
-					ImagePullSecrets: []corev1.LocalObjectReference{{Name: "docker-creds"}},
-					NodeName:         "some-node",
-					NodeSelector:     map[string]string{"beta.kubernetes.io/os": "linux"},
-					Affinity:         &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{}}},
-					Tolerations:      []corev1.Toleration{{Key: "", Operator: "Exists"}},
+					ImagePullSecrets:  []corev1.LocalObjectReference{{Name: "docker-creds"}},
+					NodeName:          "some-node",
+					NodeSelector:      map[string]string{"beta.kubernetes.io/os": "linux"},
+					Affinity:          &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{}}},
+					Tolerations:       []corev1.Toleration{{Key: "", Operator: "Exists"}},
+					PriorityClassName: "high-priority",
 					TopologySpreadConstraints: []corev1.TopologySpreadConstraint{
 						{
 							WhenUnsatisfiable: "DoNotSchedule",
@@ -85,9 +84,18 @@ func Test_applyProxyClassToStatefulSet(t *testing.T) {
 							},
 						},
 					},
+					DNSPolicy: new(corev1.DNSClusterFirstWithHostNet),
+					DNSConfig: &corev1.PodDNSConfig{
+						Nameservers: []string{"1.1.1.1", "8.8.8.8"},
+						Searches:    []string{"example.com", "test.local"},
+						Options: []corev1.PodDNSConfigOption{
+							{Name: "ndots", Value: new("2")},
+							{Name: "edns0"},
+						},
+					},
 					TailscaleContainer: &tsapi.Container{
 						SecurityContext: &corev1.SecurityContext{
-							Privileged: ptr.To(true),
+							Privileged: new(true),
 						},
 						Resources: corev1.ResourceRequirements{
 							Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1000m"), corev1.ResourceMemory: resource.MustParse("128Mi")},
@@ -99,8 +107,8 @@ func Test_applyProxyClassToStatefulSet(t *testing.T) {
 					},
 					TailscaleInitContainer: &tsapi.Container{
 						SecurityContext: &corev1.SecurityContext{
-							Privileged: ptr.To(true),
-							RunAsUser:  ptr.To(int64(0)),
+							Privileged: new(true),
+							RunAsUser:  new(int64(0)),
 						},
 						Resources: corev1.ResourceRequirements{
 							Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1000m"), corev1.ResourceMemory: resource.MustParse("128Mi")},
@@ -197,6 +205,9 @@ func Test_applyProxyClassToStatefulSet(t *testing.T) {
 	wantSS.Spec.Template.Spec.Containers[0].ImagePullPolicy = "IfNotPresent"
 	wantSS.Spec.Template.Spec.InitContainers[0].Image = "ghcr.io/my-repo/tailscale:v0.01testsomething"
 	wantSS.Spec.Template.Spec.InitContainers[0].ImagePullPolicy = "IfNotPresent"
+	wantSS.Spec.Template.Spec.PriorityClassName = proxyClassAllOpts.Spec.StatefulSet.Pod.PriorityClassName
+	wantSS.Spec.Template.Spec.DNSPolicy = corev1.DNSClusterFirstWithHostNet
+	wantSS.Spec.Template.Spec.DNSConfig = proxyClassAllOpts.Spec.StatefulSet.Pod.DNSConfig
 
 	gotSS := applyProxyClassToStatefulSet(proxyClassAllOpts, nonUserspaceProxySS.DeepCopy(), new(tailscaleSTSConfig), zl.Sugar())
 	if diff := cmp.Diff(gotSS, wantSS); diff != "" {
@@ -235,6 +246,9 @@ func Test_applyProxyClassToStatefulSet(t *testing.T) {
 	wantSS.Spec.Template.Spec.Containers[0].Env = append(wantSS.Spec.Template.Spec.Containers[0].Env, []corev1.EnvVar{{Name: "foo", Value: "bar"}, {Name: "TS_USERSPACE", Value: "true"}, {Name: "bar"}}...)
 	wantSS.Spec.Template.Spec.Containers[0].ImagePullPolicy = "IfNotPresent"
 	wantSS.Spec.Template.Spec.Containers[0].Image = "ghcr.io/my-repo/tailscale:v0.01testsomething"
+	wantSS.Spec.Template.Spec.PriorityClassName = proxyClassAllOpts.Spec.StatefulSet.Pod.PriorityClassName
+	wantSS.Spec.Template.Spec.DNSPolicy = corev1.DNSClusterFirstWithHostNet
+	wantSS.Spec.Template.Spec.DNSConfig = proxyClassAllOpts.Spec.StatefulSet.Pod.DNSConfig
 	gotSS = applyProxyClassToStatefulSet(proxyClassAllOpts, userspaceProxySS.DeepCopy(), new(tailscaleSTSConfig), zl.Sugar())
 	if diff := cmp.Diff(gotSS, wantSS); diff != "" {
 		t.Errorf("Unexpected result applying ProxyClass with all options to a StatefulSet for a userspace proxy (-got +want):\n%s", diff)
@@ -276,7 +290,7 @@ func Test_applyProxyClassToStatefulSet(t *testing.T) {
 		corev1.EnvVar{Name: "TS_ENABLE_METRICS", Value: "true"},
 	)
 	wantSS.Spec.Template.Spec.Containers[0].Ports = []corev1.ContainerPort{{Name: "metrics", Protocol: "TCP", ContainerPort: 9002}}
-	gotSS = applyProxyClassToStatefulSet(proxyClassWithMetricsDebug(true, ptr.To(false)), nonUserspaceProxySS.DeepCopy(), new(tailscaleSTSConfig), zl.Sugar())
+	gotSS = applyProxyClassToStatefulSet(proxyClassWithMetricsDebug(true, new(false)), nonUserspaceProxySS.DeepCopy(), new(tailscaleSTSConfig), zl.Sugar())
 	if diff := cmp.Diff(gotSS, wantSS); diff != "" {
 		t.Errorf("Unexpected result applying ProxyClass with metrics enabled to a StatefulSet (-got +want):\n%s", diff)
 	}
@@ -288,10 +302,14 @@ func Test_applyProxyClassToStatefulSet(t *testing.T) {
 		corev1.EnvVar{Name: "TS_TAILSCALED_EXTRA_ARGS", Value: "--debug=$(TS_DEBUG_ADDR_PORT)"},
 	)
 	wantSS.Spec.Template.Spec.Containers[0].Ports = []corev1.ContainerPort{{Name: "debug", Protocol: "TCP", ContainerPort: 9001}}
-	gotSS = applyProxyClassToStatefulSet(proxyClassWithMetricsDebug(false, ptr.To(true)), nonUserspaceProxySS.DeepCopy(), new(tailscaleSTSConfig), zl.Sugar())
+	gotSS = applyProxyClassToStatefulSet(proxyClassWithMetricsDebug(false, new(true)), nonUserspaceProxySS.DeepCopy(), new(tailscaleSTSConfig), zl.Sugar())
 	if diff := cmp.Diff(gotSS, wantSS); diff != "" {
 		t.Errorf("Unexpected result applying ProxyClass with metrics enabled to a StatefulSet (-got +want):\n%s", diff)
 	}
+
+	// 8. A Kubernetes API proxy with letsencrypt staging enabled
+	gotSS = applyProxyClassToStatefulSet(proxyClassAllOpts, nonUserspaceProxySS.DeepCopy(), &tailscaleSTSConfig{proxyType: string(tsapi.ProxyGroupTypeKubernetesAPIServer)}, zl.Sugar())
+	verifyEnvVar(t, gotSS, "TS_DEBUG_ACME_DIRECTORY_URL", letsEncryptStagingEndpoint)
 }
 
 func Test_mergeStatefulSetLabelsOrAnnots(t *testing.T) {
@@ -303,76 +321,76 @@ func Test_mergeStatefulSetLabelsOrAnnots(t *testing.T) {
 		want    map[string]string
 	}{
 		{
-			name:    "no custom labels specified and none present in current labels, return current labels",
+			name:    "no-custom-labels-none-present",
 			current: map[string]string{kubetypes.LabelManaged: "true", LabelParentName: "foo", LabelParentType: "svc", LabelParentNamespace: "foo"},
 			want:    map[string]string{kubetypes.LabelManaged: "true", LabelParentName: "foo", LabelParentType: "svc", LabelParentNamespace: "foo"},
 			managed: tailscaleManagedLabels,
 		},
 		{
-			name:    "no custom labels specified, but some present in current labels, return tailscale managed labels only from the current labels",
+			name:    "no-custom-labels-some-present",
 			current: map[string]string{"foo": "bar", "something.io/foo": "bar", kubetypes.LabelManaged: "true", LabelParentName: "foo", LabelParentType: "svc", LabelParentNamespace: "foo"},
 			want:    map[string]string{kubetypes.LabelManaged: "true", LabelParentName: "foo", LabelParentType: "svc", LabelParentNamespace: "foo"},
 			managed: tailscaleManagedLabels,
 		},
 		{
-			name:    "custom labels specified, current labels only contain tailscale managed labels, return a union of both",
+			name:    "custom-labels-with-managed-only",
 			current: map[string]string{kubetypes.LabelManaged: "true", LabelParentName: "foo", LabelParentType: "svc", LabelParentNamespace: "foo"},
 			custom:  map[string]string{"foo": "bar", "something.io/foo": "bar"},
 			want:    map[string]string{"foo": "bar", "something.io/foo": "bar", kubetypes.LabelManaged: "true", LabelParentName: "foo", LabelParentType: "svc", LabelParentNamespace: "foo"},
 			managed: tailscaleManagedLabels,
 		},
 		{
-			name:    "custom labels specified, current labels contain tailscale managed labels and custom labels, some of which re not present in the new custom labels, return a union of managed labels and the desired custom labels",
+			name:    "custom-labels-stale-removed",
 			current: map[string]string{"foo": "bar", "bar": "baz", "app": "1234", kubetypes.LabelManaged: "true", LabelParentName: "foo", LabelParentType: "svc", LabelParentNamespace: "foo"},
 			custom:  map[string]string{"foo": "bar", "something.io/foo": "bar"},
 			want:    map[string]string{"foo": "bar", "something.io/foo": "bar", "app": "1234", kubetypes.LabelManaged: "true", LabelParentName: "foo", LabelParentType: "svc", LabelParentNamespace: "foo"},
 			managed: tailscaleManagedLabels,
 		},
 		{
-			name:    "no current labels present, return custom labels only",
+			name:    "no-current-labels-return-custom",
 			custom:  map[string]string{"foo": "bar", "something.io/foo": "bar"},
 			want:    map[string]string{"foo": "bar", "something.io/foo": "bar"},
 			managed: tailscaleManagedLabels,
 		},
 		{
-			name:    "no current labels present, no custom labels specified, return empty map",
+			name:    "no-current-no-custom-return-empty",
 			want:    map[string]string{},
 			managed: tailscaleManagedLabels,
 		},
 		{
-			name:    "no custom annots specified and none present in current annots, return current annots",
+			name:    "no-custom-annots-none-present",
 			current: map[string]string{podAnnotationLastSetClusterIP: "1.2.3.4"},
 			want:    map[string]string{podAnnotationLastSetClusterIP: "1.2.3.4"},
 			managed: tailscaleManagedAnnotations,
 		},
 		{
-			name:    "no custom annots specified, but some present in current annots, return tailscale managed annots only from the current annots",
+			name:    "no-custom-annots-some-present",
 			current: map[string]string{"foo": "bar", "something.io/foo": "bar", podAnnotationLastSetClusterIP: "1.2.3.4"},
 			want:    map[string]string{podAnnotationLastSetClusterIP: "1.2.3.4"},
 			managed: tailscaleManagedAnnotations,
 		},
 		{
-			name:    "custom annots specified, current annots only contain tailscale managed annots, return a union of both",
+			name:    "custom-annots-with-managed-only",
 			current: map[string]string{podAnnotationLastSetClusterIP: "1.2.3.4"},
 			custom:  map[string]string{"foo": "bar", "something.io/foo": "bar"},
 			want:    map[string]string{"foo": "bar", "something.io/foo": "bar", podAnnotationLastSetClusterIP: "1.2.3.4"},
 			managed: tailscaleManagedAnnotations,
 		},
 		{
-			name:    "custom annots specified, current annots contain tailscale managed annots and custom annots, some of which are not present in the new custom annots, return a union of managed annots and the desired custom annots",
+			name:    "custom-annots-stale-removed",
 			current: map[string]string{"foo": "bar", "something.io/foo": "bar", podAnnotationLastSetClusterIP: "1.2.3.4"},
 			custom:  map[string]string{"something.io/foo": "bar"},
 			want:    map[string]string{"something.io/foo": "bar", podAnnotationLastSetClusterIP: "1.2.3.4"},
 			managed: tailscaleManagedAnnotations,
 		},
 		{
-			name:    "no current annots present, return custom annots only",
+			name:    "no-current-annots-return-custom",
 			custom:  map[string]string{"foo": "bar", "something.io/foo": "bar"},
 			want:    map[string]string{"foo": "bar", "something.io/foo": "bar"},
 			managed: tailscaleManagedAnnotations,
 		},
 		{
-			name:    "no current labels present, no custom labels specified, return empty map",
+			name:    "no-current-annots-no-custom-return-empty",
 			want:    map[string]string{},
 			managed: tailscaleManagedAnnotations,
 		},
@@ -388,7 +406,5 @@ func Test_mergeStatefulSetLabelsOrAnnots(t *testing.T) {
 
 // updateMap updates map a with the values from map b.
 func updateMap(a, b map[string]string) {
-	for key, val := range b {
-		a[key] = val
-	}
+	maps.Copy(a, b)
 }

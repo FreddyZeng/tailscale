@@ -1,19 +1,24 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
-// Package monitor provides facilities for monitoring network
-// interface and route changes. It primarily exists to know when
-// portable devices move between different networks.
+// Package netmon provides facilities for monitoring network interface and
+// route changes. It primarily exists to know when portable devices move
+// between different networks.
 package netmon
 
 import (
-	"encoding/json"
 	"errors"
+	"fmt"
+	"log"
 	"net/netip"
 	"runtime"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
+	"tailscale.com/feature/buildfeatures"
+	"tailscale.com/syncs"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/eventbus"
@@ -26,6 +31,15 @@ import (
 // Usually there are also minor network change events on wake that let
 // us check the wall time sooner than this.
 const pollWallTimeInterval = 15 * time.Second
+
+// majorTimeJumpThreshold is the minimum sleep duration that warrants
+// treating a time jump as a major event requiring socket rebinding,
+// even if the interface state appears unchanged. After a long sleep,
+// NAT mappings are likely stale and DHCP leases may have expired
+// (the renewal happens after wake, so local state may not yet reflect it).
+// Short sleeps (e.g., macOS DarkWake maintenance cycles of ~55s) should
+// not trigger rebinding if the network state is unchanged.
+const majorTimeJumpThreshold = 10 * time.Minute
 
 // message represents a message returned from an osMon.
 type message interface {
@@ -43,40 +57,38 @@ type osMon interface {
 	// until the osMon is closed. After a Close, the returned
 	// error is ignored.
 	Receive() (message, error)
-
-	// IsInterestingInterface reports whether the provided interface should
-	// be considered for network change events.
-	IsInterestingInterface(iface string) bool
 }
+
+// IsInterestingInterface is the function used to determine whether
+// a given interface name is interesting enough to pay attention to
+// for network change monitoring purposes.
+//
+// If nil, all interfaces are considered interesting.
+var IsInterestingInterface func(Interface, []netip.Prefix) bool
 
 // Monitor represents a monitoring instance.
 type Monitor struct {
 	logf    logger.Logf
 	b       *eventbus.Client
-	changed *eventbus.Publisher[*ChangeDelta]
+	changed *eventbus.Publisher[ChangeDelta]
 
 	om     osMon         // nil means not supported on this platform
 	change chan bool     // send false to wake poller, true to also force ChangeDeltas be sent
 	stop   chan struct{} // closed on Stop
 	static bool          // static Monitor that doesn't actually monitor
 
-	// Things that must be set early, before use,
-	// and not change at runtime.
-	tsIfName string // tailscale interface name, if known/set ("tailscale0", "utun3", ...)
-
-	mu         sync.Mutex // guards all following fields
-	cbs        set.HandleSet[ChangeFunc]
-	ruleDelCB  set.HandleSet[RuleDeleteCallback]
-	ifState    *State
-	gwValid    bool       // whether gw and gwSelfIP are valid
-	gw         netip.Addr // our gateway's IP
-	gwSelfIP   netip.Addr // our own IP address (that corresponds to gw)
-	started    bool
-	closed     bool
-	goroutines sync.WaitGroup
-	wallTimer  *time.Timer // nil until Started; re-armed AfterFunc per tick
-	lastWall   time.Time
-	timeJumped bool // whether we need to send a changed=true after a big time jump
+	mu           syncs.Mutex // guards all following fields
+	cbs          set.HandleSet[ChangeFunc]
+	ifState      *State
+	gwValid      bool       // whether gw and gwSelfIP are valid
+	gw           netip.Addr // our gateway's IP
+	gwSelfIP     netip.Addr // our own IP address (that corresponds to gw)
+	started      bool
+	closed       bool
+	goroutines   sync.WaitGroup
+	wallTimer    *time.Timer // nil until Started; re-armed AfterFunc per tick
+	lastWall     time.Time
+	jumpDuration time.Duration // wall-clock time elapsed during detected time jump; 0 if no time jump observed since reset
 }
 
 // ChangeFunc is a callback function registered with Monitor that's called when the
@@ -84,35 +96,275 @@ type Monitor struct {
 type ChangeFunc func(*ChangeDelta)
 
 // ChangeDelta describes the difference between two network states.
+//
+// Use NewChangeDelta to construct a delta and compute the cached fields.
 type ChangeDelta struct {
-	// Monitor is the network monitor that sent this delta.
-	Monitor *Monitor
-
-	// Old is the old interface state, if known.
+	// old is the old interface state, if known.
 	// It's nil if the old state is unknown.
-	// Do not mutate it.
-	Old *State
+	old *State
 
 	// New is the new network state.
 	// It is always non-nil.
-	// Do not mutate it.
-	New *State
+	new *State
 
-	// Major is our legacy boolean of whether the network changed in some major
-	// way.
+	// JumpDuration is non-zero when a wall-clock time jump was detected,
+	// indicating the machine likely just woke from sleep. It is approximately
+	// how long the machine was asleep (the wall-clock delta since the last
+	// check, not an exact sleep measurement). Use TimeJumped() to check
+	// whether a time jump occurred.
+	JumpDuration time.Duration
+
+	DefaultRouteInterface string
+
+	// Computed Fields
+
+	DefaultInterfaceChanged     bool // whether default route interface changed
+	IsLessExpensive             bool // whether new state's default interface is less expensive than old.
+	HasPACOrProxyConfigChanged  bool // whether PAC/HTTP proxy config changed
+	InterfaceIPsChanged         bool // whether any interface IPs changed in a meaningful way
+	AvailableProtocolsChanged   bool // whether we have seen a change in available IPv4/IPv6
+	DefaultInterfaceMaybeViable bool // whether the default interface is potentially viable (has usable IPs, is up and is not the tunnel itself)
+	IsInitialState              bool // whether this is the initial state (old == nil, new != nil)
+
+	// RebindLikelyRequired combines the various fields above to report whether this change likely requires us
+	// to rebind sockets.  This is a very conservative estimate and covers a number ofcases where a rebind
+	// may not be strictly necessary.  Consumers of the ChangeDelta should consider checking the individual fields
+	// above or the state of their sockets.
+	RebindLikelyRequired bool
+}
+
+// TimeJumped reports whether a wall-clock time jump was detected,
+// indicating the machine likely just woke from sleep. When true,
+// JumpDuration contains the approximate duration.
+func (cd *ChangeDelta) TimeJumped() bool {
+	return cd.JumpDuration > 0
+}
+
+// CurrentState returns the current (new) state after the change.
+func (cd *ChangeDelta) CurrentState() *State {
+	return cd.new
+}
+
+// NewChangeDelta builds a ChangeDelta and eagerly computes the cached fields.
+// jumpDuration, if non-zero, indicates a wall-clock time jump was detected
+// (the machine likely woke from sleep) and is the approximate duration of the jump.
+// forceViability, if true, forces DefaultInterfaceMaybeViable to be true regardless of the
+// actual state of the default interface.  This is useful in testing.
+func NewChangeDelta(old, new *State, jumpDuration time.Duration, forceViability bool) (*ChangeDelta, error) {
+	cd := ChangeDelta{
+		old:          old,
+		new:          new,
+		JumpDuration: jumpDuration,
+	}
+
+	if cd.new == nil {
+		log.Printf("[unexpected] NewChangeDelta called with nil new state")
+		return nil, errors.New("new state cannot be nil")
+	} else if cd.old == nil && cd.new != nil {
+		cd.DefaultInterfaceChanged = cd.new.DefaultRouteInterface != ""
+		cd.IsLessExpensive = false
+		cd.HasPACOrProxyConfigChanged = true
+		cd.InterfaceIPsChanged = true
+		cd.IsInitialState = true
+	} else {
+		cd.AvailableProtocolsChanged = (cd.old.HaveV4 != cd.new.HaveV4) || (cd.old.HaveV6 != cd.new.HaveV6)
+		cd.DefaultInterfaceChanged = cd.old.DefaultRouteInterface != cd.new.DefaultRouteInterface
+		cd.IsLessExpensive = cd.old.IsExpensive && !cd.new.IsExpensive
+		cd.HasPACOrProxyConfigChanged = (cd.old.PAC != cd.new.PAC) || (cd.old.HTTPProxy != cd.new.HTTPProxy)
+		cd.InterfaceIPsChanged = cd.isInterestingInterfaceChange()
+	}
+
+	cd.DefaultRouteInterface = new.DefaultRouteInterface
+	defIf := new.Interface[cd.DefaultRouteInterface]
+
+	tsIfName, err := TailscaleInterfaceName()
+
+	// The default interface is not viable if it is down or it is the Tailscale interface itself.
+	if !forceViability && (!defIf.IsUp() || (err == nil && cd.DefaultRouteInterface == tsIfName)) {
+		cd.DefaultInterfaceMaybeViable = false
+	} else {
+		cd.DefaultInterfaceMaybeViable = true
+	}
+
+	// Compute rebind requirement. The default interface needs to be viable and
+	// one of the other conditions needs to be true.
 	//
-	// Deprecated: do not remove. As of 2023-08-23 we're in a renewed effort to
-	// remove it and ask specific qustions of ChangeDelta instead. Look at Old
-	// and New (or add methods to ChangeDelta) instead of using Major.
-	Major bool
+	// Short time jumps (e.g., macOS DarkWake maintenance cycles of ~55s) are
+	// excluded — if the network state is unchanged after a brief sleep, there's
+	// no reason to rebind. However, a major time jump (over majorTimeJumpThreshold)
+	// warrants a rebind even if the local state looks the same, because NAT
+	// mappings are likely stale and DHCP leases may have changed (the renewal
+	// happens after wake, so local state may not yet reflect it).
+	majorTimeJump := cd.JumpDuration >= majorTimeJumpThreshold
+	cd.RebindLikelyRequired = (cd.old == nil ||
+		majorTimeJump ||
+		cd.DefaultInterfaceChanged ||
+		cd.InterfaceIPsChanged ||
+		cd.IsLessExpensive ||
+		cd.HasPACOrProxyConfigChanged ||
+		cd.AvailableProtocolsChanged) &&
+		cd.DefaultInterfaceMaybeViable
 
-	// TimeJumped is whether there was a big jump in wall time since the last
-	// time we checked. This is a hint that a mobile sleeping device might have
-	// come out of sleep.
-	TimeJumped bool
+	return &cd, nil
+}
 
-	// TODO(bradfitz): add some lazy cached fields here as needed with methods
-	// on *ChangeDelta to let callers ask specific questions
+// StateDesc returns a description of the old and new states for logging.
+func (cd *ChangeDelta) StateDesc() string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "old: %v new: %v", cd.old, cd.new)
+	if cd.old != nil && cd.new != nil {
+		if diff := cd.old.InterfaceDiff(cd.new); diff != "" {
+			fmt.Fprintf(&sb, " diff: %s", diff)
+		}
+	}
+	if cd.RebindLikelyRequired {
+		var reasons []string
+		if cd.old == nil {
+			reasons = append(reasons, "initial-state")
+		}
+		if cd.TimeJumped() {
+			reasons = append(reasons, fmt.Sprintf("time-jumped(%v)", cd.JumpDuration.Round(time.Second)))
+		}
+		if cd.DefaultInterfaceChanged {
+			reasons = append(reasons, "default-if-changed")
+		}
+		if cd.InterfaceIPsChanged {
+			reasons = append(reasons, "ips-changed")
+		}
+		if cd.IsLessExpensive {
+			reasons = append(reasons, "less-expensive")
+		}
+		if cd.HasPACOrProxyConfigChanged {
+			reasons = append(reasons, "pac-proxy-changed")
+		}
+		if cd.AvailableProtocolsChanged {
+			reasons = append(reasons, "protocols-changed")
+		}
+		fmt.Fprintf(&sb, " rebind-reason=[%s]", strings.Join(reasons, ","))
+	}
+	return sb.String()
+}
+
+// InterfaceIPDisappeared reports whether the given IP address exists on any interface
+// in the old state, but not in the new state.
+func (cd *ChangeDelta) InterfaceIPDisappeared(ip netip.Addr) bool {
+	if cd.old == nil {
+		return false
+	}
+	if cd.new == nil && cd.old.HasIP(ip) {
+		return true
+	}
+	return cd.old.HasIP(ip) && !cd.new.HasIP(ip)
+}
+
+// AnyInterfaceUp reports whether any interfaces are up in the new state.
+func (cd *ChangeDelta) AnyInterfaceUp() bool {
+	if cd.new == nil {
+		return false
+	}
+	return cd.new.AnyInterfaceUp()
+}
+
+// isInterestingInterfaceChange reports whether any interfaces have changed in a meaningful way.
+// This excludes interfaces that are not interesting per IsInterestingInterface and
+// filters out changes to interface IPs that are uninteresting (e.g. link-local addresses).
+func (cd *ChangeDelta) isInterestingInterfaceChange() bool {
+	// If there is no old state, everything is considered changed.
+	if cd.old == nil {
+		return true
+	}
+
+	// Compare interfaces in both directions.  Old to new and new to old.
+	tsIfName, ifNameErr := TailscaleInterfaceName()
+
+	for iname, oldInterface := range cd.old.Interface {
+		if ifNameErr == nil && iname == tsIfName {
+			// Ignore changes in the Tailscale interface itself
+			continue
+		}
+		oldIps := filterRoutableIPs(cd.old.InterfaceIPs[iname])
+		if IsInterestingInterface != nil && !IsInterestingInterface(oldInterface, oldIps) {
+			continue
+		}
+
+		// Old interfaces with no routable addresses are not interesting
+		if len(oldIps) == 0 {
+			continue
+		}
+
+		// The old interface doesn't exist in the new interface set and it has
+		// a global unicast IP.  That's considered a change from the perspective
+		// of anything that may have been bound to it. If it didn't have a global
+		// unicast IP, it's not interesting.
+		newInterface, ok := cd.new.Interface[iname]
+		if !ok {
+			return true
+		}
+		newIps, ok := cd.new.InterfaceIPs[iname]
+		if !ok {
+			return true
+		}
+		newIps = filterRoutableIPs(newIps)
+
+		// Only consider routable IP changes and up/down state transitions
+		// as interesting. Transient metadata changes (Flags like FlagRunning,
+		// MTU, etc.) should not trigger a major link change, as they cause
+		// false "major" events on macOS and Windows when the OS notifies us
+		// of interface changes that don't affect connectivity.
+		if oldInterface.IsUp() != newInterface.IsUp() || !prefixesEqual(oldIps, newIps) {
+			return true
+		}
+	}
+
+	for iname, newInterface := range cd.new.Interface {
+		if ifNameErr == nil && iname == tsIfName {
+			// Ignore changes in the Tailscale interface itself
+			continue
+		}
+		newIps := filterRoutableIPs(cd.new.InterfaceIPs[iname])
+		if IsInterestingInterface != nil && !IsInterestingInterface(newInterface, newIps) {
+			continue
+		}
+
+		// New interfaces with no routable addresses are not interesting
+		if len(newIps) == 0 {
+			continue
+		}
+
+		oldInterface, ok := cd.old.Interface[iname]
+		if !ok {
+			return true
+		}
+
+		oldIps, ok := cd.old.InterfaceIPs[iname]
+		if !ok {
+			// Redundant but we can't dig up the "old" IPs for this interface.
+			return true
+		}
+		oldIps = filterRoutableIPs(oldIps)
+
+		// Only consider routable IP changes and up/down state transitions.
+		if newInterface.IsUp() != oldInterface.IsUp() || !prefixesEqual(oldIps, newIps) {
+			return true
+		}
+	}
+	return false
+}
+
+func filterRoutableIPs(addrs []netip.Prefix) []netip.Prefix {
+	var filtered []netip.Prefix
+	for _, pfx := range addrs {
+		a := pfx.Addr()
+		// Skip link-local multicast addresses.
+		if a.IsLinkLocalMulticast() {
+			continue
+		}
+
+		if isUsableV4(a) || isUsableV6(a) {
+			filtered = append(filtered, pfx)
+		}
+	}
+	return filtered
 }
 
 // New instantiates and starts a monitoring instance.
@@ -127,7 +379,7 @@ func New(bus *eventbus.Bus, logf logger.Logf) (*Monitor, error) {
 		stop:     make(chan struct{}),
 		lastWall: wallTime(),
 	}
-	m.changed = eventbus.Publish[*ChangeDelta](m.b)
+	m.changed = eventbus.Publish[ChangeDelta](m.b)
 	st, err := m.interfaceStateUncached()
 	if err != nil {
 		return nil, err
@@ -166,17 +418,14 @@ func (m *Monitor) InterfaceState() *State {
 	return m.ifState
 }
 
-func (m *Monitor) interfaceStateUncached() (*State, error) {
-	return getState(m.tsIfName)
+// ProbeLocks acquires and releases the monitor's internal mutex.
+func (m *Monitor) ProbeLocks() {
+	m.mu.Lock()
+	m.mu.Unlock()
 }
 
-// SetTailscaleInterfaceName sets the name of the Tailscale interface. For
-// example, "tailscale0", "tun0", "utun3", etc.
-//
-// This must be called only early in tailscaled startup before the monitor is
-// used.
-func (m *Monitor) SetTailscaleInterfaceName(ifName string) {
-	m.tsIfName = ifName
+func (m *Monitor) interfaceStateUncached() (*State, error) {
+	return getState(tsIfProps.tsIfName())
 }
 
 // GatewayAndSelfIP returns the current network's default gateway, and
@@ -185,6 +434,9 @@ func (m *Monitor) SetTailscaleInterfaceName(ifName string) {
 // It's the same as interfaces.LikelyHomeRouterIP, but it caches the
 // result until the monitor detects a network change.
 func (m *Monitor) GatewayAndSelfIP() (gw, myIP netip.Addr, ok bool) {
+	if !buildfeatures.HasPortMapper {
+		return
+	}
 	if m.static {
 		return
 	}
@@ -221,29 +473,6 @@ func (m *Monitor) RegisterChangeCallback(callback ChangeFunc) (unregister func()
 		m.mu.Lock()
 		defer m.mu.Unlock()
 		delete(m.cbs, handle)
-	}
-}
-
-// RuleDeleteCallback is a callback when a Linux IP policy routing
-// rule is deleted. The table is the table number (52, 253, 354) and
-// priority is the priority order number (for Tailscale rules
-// currently: 5210, 5230, 5250, 5270)
-type RuleDeleteCallback func(table uint8, priority uint32)
-
-// RegisterRuleDeleteCallback adds callback to the set of parties to be
-// notified (in their own goroutine) when a Linux ip rule is deleted.
-// To remove this callback, call unregister (or close the monitor).
-func (m *Monitor) RegisterRuleDeleteCallback(callback RuleDeleteCallback) (unregister func()) {
-	if m.static {
-		return func() {}
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	handle := m.ruleDelCB.Add(callback)
-	return func() {
-		m.mu.Lock()
-		defer m.mu.Unlock()
-		delete(m.ruleDelCB, handle)
 	}
 }
 
@@ -359,34 +588,11 @@ func (m *Monitor) pump() {
 			time.Sleep(time.Second)
 			continue
 		}
-		if rdm, ok := msg.(ipRuleDeletedMessage); ok {
-			m.notifyRuleDeleted(rdm)
-			continue
-		}
 		if msg.ignore() {
 			continue
 		}
 		m.Poll()
 	}
-}
-
-func (m *Monitor) notifyRuleDeleted(rdm ipRuleDeletedMessage) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for _, cb := range m.ruleDelCB {
-		go cb(rdm.table, rdm.priority)
-	}
-}
-
-// isInterestingInterface reports whether the provided interface should be
-// considered when checking for network state changes.
-// The ips parameter should be the IPs of the provided interface.
-func (m *Monitor) isInterestingInterface(i Interface, ips []netip.Prefix) bool {
-	if !m.om.IsInterestingInterface(i.Name) {
-		return false
-	}
-
-	return true
 }
 
 // debounce calls the callback function with a delay between events
@@ -410,7 +616,10 @@ func (m *Monitor) debounce() {
 		select {
 		case <-m.stop:
 			return
-		case <-time.After(250 * time.Millisecond):
+		// 1s is reasonable debounce time for network changes.  Events such as undocking a laptop
+		// or roaming onto wifi will often generate multiple events in quick succession as interfaces
+		// flap.  We want to avoid spamming consumers of these events.
+		case <-time.After(1000 * time.Millisecond):
 		}
 	}
 }
@@ -437,147 +646,53 @@ func (m *Monitor) handlePotentialChange(newState *State, forceCallbacks bool) {
 		return
 	}
 
-	delta := &ChangeDelta{
-		Monitor:    m,
-		Old:        oldState,
-		New:        newState,
-		TimeJumped: timeJumped,
+	jumpDuration := m.jumpDuration
+	delta, err := NewChangeDelta(oldState, newState, jumpDuration, false)
+	if err != nil {
+		m.logf("[unexpected] error creating ChangeDelta: %v", err)
+		return
 	}
 
-	delta.Major = m.IsMajorChangeFrom(oldState, newState)
-	if delta.Major {
+	if delta.RebindLikelyRequired {
 		m.gwValid = false
-
-		if s1, s2 := oldState.String(), delta.New.String(); s1 == s2 {
-			m.logf("[unexpected] network state changed, but stringification didn't: %v", s1)
-			m.logf("[unexpected] old: %s", jsonSummary(oldState))
-			m.logf("[unexpected] new: %s", jsonSummary(newState))
-		}
 	}
 	m.ifState = newState
 	// See if we have a queued or new time jump signal.
 	if timeJumped {
 		m.resetTimeJumpedLocked()
-		if !delta.Major {
-			// Only log if it wasn't an interesting change.
-			m.logf("time jumped (probably wake from sleep); synthesizing major change event")
-			delta.Major = true
-		}
+		m.logf("time jump detected (slept %v), probably wake from sleep", jumpDuration.Round(time.Second))
 	}
 	metricChange.Add(1)
-	if delta.Major {
+	if delta.RebindLikelyRequired {
 		metricChangeMajor.Add(1)
 	}
-	if delta.TimeJumped {
+	if delta.TimeJumped() {
 		metricChangeTimeJump.Add(1)
 	}
-	m.changed.Publish(delta)
+	m.changed.Publish(*delta)
 	for _, cb := range m.cbs {
 		go cb(delta)
 	}
 }
 
-// IsMajorChangeFrom reports whether the transition from s1 to s2 is
-// a "major" change, where major roughly means it's worth tearing down
-// a bunch of connections and rebinding.
-//
-// TODO(bradiftz): tigten this definition.
-func (m *Monitor) IsMajorChangeFrom(s1, s2 *State) bool {
-	if s1 == nil && s2 == nil {
+// reports whether a and b contain the same set of prefixes regardless of order.
+func prefixesEqual(a, b []netip.Prefix) bool {
+	if len(a) != len(b) {
 		return false
 	}
-	if s1 == nil || s2 == nil {
-		return true
-	}
-	if s1.HaveV6 != s2.HaveV6 ||
-		s1.HaveV4 != s2.HaveV4 ||
-		s1.IsExpensive != s2.IsExpensive ||
-		s1.DefaultRouteInterface != s2.DefaultRouteInterface ||
-		s1.HTTPProxy != s2.HTTPProxy ||
-		s1.PAC != s2.PAC {
-		return true
-	}
-	for iname, i := range s1.Interface {
-		if iname == m.tsIfName {
-			// Ignore changes in the Tailscale interface itself.
-			continue
-		}
-		ips := s1.InterfaceIPs[iname]
-		if !m.isInterestingInterface(i, ips) {
-			continue
-		}
-		i2, ok := s2.Interface[iname]
-		if !ok {
-			return true
-		}
-		ips2, ok := s2.InterfaceIPs[iname]
-		if !ok {
-			return true
-		}
-		if !i.Equal(i2) || !prefixesMajorEqual(ips, ips2) {
-			return true
-		}
-	}
-	// Iterate over s2 in case there is a field in s2 that doesn't exist in s1
-	for iname, i := range s2.Interface {
-		if iname == m.tsIfName {
-			// Ignore changes in the Tailscale interface itself.
-			continue
-		}
-		ips := s2.InterfaceIPs[iname]
-		if !m.isInterestingInterface(i, ips) {
-			continue
-		}
-		i1, ok := s1.Interface[iname]
-		if !ok {
-			return true
-		}
-		ips1, ok := s1.InterfaceIPs[iname]
-		if !ok {
-			return true
-		}
-		if !i.Equal(i1) || !prefixesMajorEqual(ips, ips1) {
-			return true
-		}
-	}
-	return false
-}
 
-// prefixesMajorEqual reports whether a and b are equal after ignoring
-// boring things like link-local, loopback, and multicast addresses.
-func prefixesMajorEqual(a, b []netip.Prefix) bool {
-	// trim returns a subslice of p with link local unicast,
-	// loopback, and multicast prefixes removed from the front.
-	trim := func(p []netip.Prefix) []netip.Prefix {
-		for len(p) > 0 {
-			a := p[0].Addr()
-			if a.IsLinkLocalUnicast() || a.IsLoopback() || a.IsMulticast() {
-				p = p[1:]
-				continue
-			}
-			break
-		}
-		return p
-	}
-	for {
-		a = trim(a)
-		b = trim(b)
-		if len(a) == 0 || len(b) == 0 {
-			return len(a) == 0 && len(b) == 0
-		}
-		if a[0] != b[0] {
-			return false
-		}
-		a, b = a[1:], b[1:]
-	}
-}
+	aa := make([]netip.Prefix, len(a))
+	bb := make([]netip.Prefix, len(b))
+	copy(aa, a)
+	copy(bb, b)
 
-func jsonSummary(x any) any {
-	j, err := json.Marshal(x)
-	if err != nil {
-		return err
+	less := func(x, y netip.Prefix) int {
+		return x.Addr().Compare(y.Addr())
 	}
-	return j
+
+	slices.SortFunc(aa, less)
+	slices.SortFunc(bb, less)
+	return slices.Equal(aa, bb)
 }
 
 func wallTime() time.Time {
@@ -613,21 +728,14 @@ func (m *Monitor) checkWallTimeAdvanceLocked() bool {
 		panic("unreachable") // if callers are correct
 	}
 	now := wallTime()
-	if now.Sub(m.lastWall) > pollWallTimeInterval*3/2 {
-		m.timeJumped = true // it is reset by debounce.
+	if elapsed := now.Sub(m.lastWall); elapsed > pollWallTimeInterval*3/2 {
+		m.jumpDuration = elapsed
 	}
 	m.lastWall = now
-	return m.timeJumped
+	return m.jumpDuration != 0
 }
 
 // resetTimeJumpedLocked consumes the signal set by checkWallTimeAdvanceLocked.
 func (m *Monitor) resetTimeJumpedLocked() {
-	m.timeJumped = false
+	m.jumpDuration = 0
 }
-
-type ipRuleDeletedMessage struct {
-	table    uint8
-	priority uint32
-}
-
-func (ipRuleDeletedMessage) ignore() bool { return true }

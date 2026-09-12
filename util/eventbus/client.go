@@ -1,12 +1,13 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package eventbus
 
 import (
 	"reflect"
-	"sync"
 
+	"tailscale.com/syncs"
+	"tailscale.com/types/logger"
 	"tailscale.com/util/set"
 )
 
@@ -21,14 +22,17 @@ type Client struct {
 	bus          *Bus
 	publishDebug hook[PublishedEvent]
 
-	mu  sync.Mutex
-	pub set.Set[publisher]
-	sub *subscribeState // Lazily created on first subscribe
+	mu   syncs.Mutex
+	pub  set.Set[publisher]
+	sub  *subscribeState // Lazily created on first subscribe
+	stop stopFlag        // signaled on Close
 }
 
 func (c *Client) Name() string { return c.name }
 
-// Close closes the client. Implicitly closes all publishers and
+func (c *Client) logger() logger.Logf { return c.bus.logger() }
+
+// Close closes the client. It implicitly closes all publishers and
 // subscribers obtained from this client.
 func (c *Client) Close() {
 	var (
@@ -47,7 +51,15 @@ func (c *Client) Close() {
 	for p := range pub {
 		p.Close()
 	}
+	c.stop.Stop()
 }
+
+func (c *Client) isClosed() bool { return c.pub == nil && c.sub == nil }
+
+// Done returns a channel that is closed when [Client.Close] is called.
+// The channel is closed after all the publishers and subscribers governed by
+// the client have been closed.
+func (c *Client) Done() <-chan struct{} { return c.stop.Done() }
 
 func (c *Client) snapshotSubscribeQueue() []DeliveredEvent {
 	return c.peekSubscribeState().snapshotQueue()
@@ -76,6 +88,10 @@ func (c *Client) subscribeTypes() []reflect.Type {
 func (c *Client) subscribeState() *subscribeState {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.subscribeStateLocked()
+}
+
+func (c *Client) subscribeStateLocked() *subscribeState {
 	if c.sub == nil {
 		c.sub = newSubscribeState(c)
 	}
@@ -85,6 +101,9 @@ func (c *Client) subscribeState() *subscribeState {
 func (c *Client) addPublisher(pub publisher) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.isClosed() {
+		panic("cannot Publish on a closed client")
+	}
 	c.pub.Add(pub)
 }
 
@@ -110,18 +129,66 @@ func (c *Client) shouldPublish(t reflect.Type) bool {
 	return c.publishDebug.active() || c.bus.shouldPublish(t)
 }
 
-// Subscribe requests delivery of events of type T through the given
-// Queue. Panics if the queue already has a subscriber for T.
+// Subscribe requests delivery of events of type T through the given client.
+// It panics if c already has a subscriber for type T, or if c is closed.
 func Subscribe[T any](c *Client) *Subscriber[T] {
-	return newSubscriber[T](c.subscribeState())
-}
-
-// Publisher returns a publisher for event type T using the given
-// client.
-func Publish[T any](c *Client) *Publisher[T] {
-	ret := newPublisher[T](c)
+	// Hold the client lock throughout the subscription process so that a caller
+	// attempting to subscribe on a closed client will get a useful diagnostic
+	// instead of a random panic from inside the subscriber plumbing.
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.pub.Add(ret)
-	return ret
+
+	// The caller should not race subscriptions with close, give them a useful
+	// diagnostic at the call site.
+	if c.isClosed() {
+		panic("cannot Subscribe on a closed client")
+	}
+
+	r := c.subscribeStateLocked()
+	s := newSubscriber[T](r, logfForCaller(c.logger()))
+	// Register the non-generic core with the bus rather than the typed facade,
+	// mirroring SubscribeFunc and Publish: this keeps the bus's outputs map
+	// and subscriber-interface itab out of per-T cost.
+	r.addSubscriber(s.core)
+	return s
+}
+
+// SubscribeFunc is like [Subscribe], but calls the provided func for each
+// event of type T.
+//
+// A SubscriberFunc calls f synchronously from the client's goroutine.
+// This means the callback must not block for an extended period of time,
+// as this will block the subscriber and slow event processing for all
+// subscriptions on c.
+func SubscribeFunc[T any](c *Client, f func(T)) *SubscriberFunc[T] {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// The caller should not race subscriptions with close, give them a useful
+	// diagnostic at the call site.
+	if c.isClosed() {
+		panic("cannot SubscribeFunc on a closed client")
+	}
+
+	r := c.subscribeStateLocked()
+	s := newSubscriberFunc[T](r, f, logfForCaller(c.logger()))
+	// Register the non-generic core, not the typed facade. Doing
+	// so means the bus's outputs map and the subscriber interface
+	// itab are not parameterized by T, eliminating per-T itab and
+	// dictionary cost.
+	r.addSubscriber(s.core)
+	return s
+}
+
+// Publish returns a publisher for event type T using the given client.
+// It panics if c is closed.
+func Publish[T any](c *Client) *Publisher[T] {
+	p := newPublisher[T](c)
+	// Register the non-generic core with the client so the
+	// per-Client publisher set, the publisher interface itab, and
+	// the publisher equality function are not parameterized by T.
+	// This eliminates per-T itab/dictionary/eq cost for every new
+	// event type passed through Publish[T].
+	c.addPublisher(p.core)
+	return p
 }

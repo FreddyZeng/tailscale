@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package setting
@@ -9,8 +9,8 @@ import (
 	"testing"
 
 	"tailscale.com/types/lazy"
-	"tailscale.com/types/ptr"
 	"tailscale.com/util/syspolicy/internal"
+	"tailscale.com/util/syspolicy/pkey"
 )
 
 func TestSettingDefinition(t *testing.T) {
@@ -18,7 +18,7 @@ func TestSettingDefinition(t *testing.T) {
 		name                   string
 		setting                *Definition
 		osOverride             string
-		wantKey                Key
+		wantKey                pkey.Key
 		wantScope              Scope
 		wantType               Type
 		wantIsSupported        bool
@@ -137,7 +137,7 @@ func TestSettingDefinition(t *testing.T) {
 			if !tt.setting.Equal(tt.setting) {
 				t.Errorf("the setting should be equal to itself")
 			}
-			if tt.setting != nil && !tt.setting.Equal(ptr.To(*tt.setting)) {
+			if tt.setting != nil && !tt.setting.Equal(new(*tt.setting)) {
 				t.Errorf("the setting should be equal to its shallow copy")
 			}
 			if gotKey := tt.setting.Key(); gotKey != tt.wantKey {
@@ -163,10 +163,10 @@ func TestSettingDefinition(t *testing.T) {
 }
 
 func TestRegisterSettingDefinition(t *testing.T) {
-	const testPolicySettingKey Key = "TestPolicySetting"
+	const testPolicySettingKey pkey.Key = "TestPolicySetting"
 	tests := []struct {
 		name    string
-		key     Key
+		key     pkey.Key
 		wantEq  *Definition
 		wantErr error
 	}{
@@ -310,8 +310,8 @@ func TestListSettingDefinitions(t *testing.T) {
 		t.Fatalf("SetDefinitionsForTest failed: %v", err)
 	}
 
-	cmp := func(l, r *Definition) int {
-		return strings.Compare(string(l.Key()), string(r.Key()))
+	cmp := func(a, b *Definition) int {
+		return strings.Compare(string(a.Key()), string(b.Key()))
 	}
 	want := append([]*Definition{}, definitions...)
 	slices.SortFunc(want, cmp)

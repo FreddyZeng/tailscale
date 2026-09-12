@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package tailssh
@@ -9,6 +9,32 @@ import (
 	"strings"
 )
 
+// isDangerousEnvVar reports whether the given environment variable name
+// is unconditionally prohibited from being forwarded, regardless of
+// acceptEnv policy. This prevents privilege escalation via dynamic
+// linker environment variables (e.g. LD_PRELOAD, LD_LIBRARY_PATH,
+// DYLD_INSERT_LIBRARIES) or leaking of secrets (e.g. GOTRACEBACK)
+// even when a wildcard acceptEnv pattern like "*" is configured.
+func isDangerousEnvVar(name string) bool {
+	upper := strings.ToUpper(name)
+	return strings.HasPrefix(upper, "LD_") || strings.HasPrefix(upper, "DYLD_") ||
+		upper == "GOTRACEBACK"
+}
+
+// forbiddenEnvKey reports whether name must never be accepted from the client as a
+// forwarded environment variable, independent of the acceptEnv policy. Names are
+// restricted to a known-safe charset so they cannot corrupt the "su -w" allowlist
+// built from them, truncate on exec, or confuse downstream consumers of the user's
+// environment.
+func forbiddenEnvKey(name string) bool {
+	for _, r := range name {
+		if r != '_' && r != '-' && (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') {
+			return true
+		}
+	}
+	return name == ""
+}
+
 // filterEnv filters a passed in environ string slice (a slice with strings
 // representing environment variables in the form "key=value") based on
 // the supplied slice of acceptEnv values.
@@ -18,6 +44,10 @@ import (
 //
 // acceptEnv values may contain * and ? wildcard characters which match against
 // zero or one or more characters and a single character respectively.
+//
+// Certain dangerous environment variables (such as those controlling the
+// dynamic linker) are always rejected regardless of the acceptEnv policy.
+// See isDangerousEnvVar.
 func filterEnv(acceptEnv []string, environ []string) ([]string, error) {
 	var acceptedPairs []string
 
@@ -30,6 +60,23 @@ func filterEnv(acceptEnv []string, environ []string) ([]string, error) {
 		variableName, _, ok := strings.Cut(envPair, "=")
 		if !ok {
 			return nil, fmt.Errorf(`invalid environment variable: %q. Variables must be in "KEY=VALUE" format`, envPair)
+		}
+
+		// Reject NUL bytes: envp entries are NUL-terminated, so a NUL would silently truncate on exec
+		if strings.Contains(envPair, "\x00") {
+			continue
+		}
+
+		// Always reject dangerous environment variables that could
+		// enable privilege escalation, regardless of acceptEnv policy.
+		if isDangerousEnvVar(variableName) {
+			continue
+		}
+
+		// Always reject names that would corrupt the incubator's "su -w"
+		// allowlist (see reservedEnvKey), regardless of acceptEnv policy.
+		if forbiddenEnvKey(variableName) {
+			continue
 		}
 
 		// Short circuit if we have a direct match between the environment

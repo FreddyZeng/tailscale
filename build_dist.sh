@@ -18,7 +18,7 @@ fi
 
 eval `CGO_ENABLED=0 GOOS=$($go env GOHOSTOS) GOARCH=$($go env GOHOSTARCH) $go run ./cmd/mkversion`
 
-if [ "$1" = "shellvars" ]; then
+if [ "$#" -ge 1 ] && [ "$1" = "shellvars" ]; then
 	cat <<EOF
 VERSION_MINOR="$VERSION_MINOR"
 VERSION_SHORT="$VERSION_SHORT"
@@ -41,7 +41,22 @@ while [ "$#" -gt 1 ]; do
 		fi
 		shift
 		ldflags="$ldflags -w -s"
-		tags="${tags:+$tags,}ts_omit_aws,ts_omit_bird,ts_omit_tap,ts_omit_kube,ts_omit_completion,ts_omit_ssh,ts_omit_wakeonlan,ts_omit_capture,ts_omit_relayserver,ts_omit_taildrop,ts_omit_tpm"
+		tags="${tags:+$tags,},$(GOOS= GOARCH= $go run ./cmd/featuretags --min --add=osrouter)"
+		;;
+	--min)
+	    # --min is like --extra-small but even smaller, removing all features,
+		# even if it results in a useless binary (e.g. removing both netstack +
+		# osrouter). It exists for benchmarking purposes only.
+		shift
+		ldflags="$ldflags -w -s"
+		tags="${tags:+$tags,},$(GOOS= GOARCH= $go run ./cmd/featuretags --min)"
+		;;
+	--strip)
+		# --min overrides your flags, when you're using custom tags and want to
+		# additionally strip symbols to help reduce the size, this is the easiest
+		# way to do it.
+		shift
+		ldflags="$ldflags -w -s"
 		;;
 	--box)
 		if [ ! -z "${TAGS:-}" ]; then
@@ -57,4 +72,4 @@ while [ "$#" -gt 1 ]; do
 	esac
 done
 
-exec $go build ${tags:+-tags=$tags} -ldflags "$ldflags" "$@"
+exec $go build ${tags:+-tags=$tags} -trimpath -ldflags "$ldflags" "$@"

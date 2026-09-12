@@ -1,5 +1,7 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
+
+//go:build !ts_omit_tailnetlock
 
 package tka
 
@@ -176,7 +178,7 @@ func (s NodeKeySignature) UnverifiedAuthorizingKeyID() (tkatype.KeyID, error) {
 	return s.authorizingKeyID()
 }
 
-// authorizingKeyID returns the KeyID of the key trusted by network-lock which authorizes
+// authorizingKeyID returns the KeyID of the key trusted by tailnet-lock which authorizes
 // this signature.
 func (s NodeKeySignature) authorizingKeyID() (tkatype.KeyID, error) {
 	switch s.SigKind {
@@ -275,7 +277,7 @@ func (s *NodeKeySignature) verifySignature(nodeKey key.NodePublic, verificationK
 		// Recurse to verify the signature on the nested structure.
 		var nestedPub key.NodePublic
 		// SigCredential signatures certify an indirection key rather than a node
-		// key, so theres no need to check the node key.
+		// key, so there's no need to check the node key.
 		if s.Nested.SigKind != SigCredential {
 			if err := nestedPub.UnmarshalBinary(s.Nested.Pubkey); err != nil {
 				return fmt.Errorf("nested pubkey: %v", err)
@@ -347,14 +349,14 @@ func (s *NodeKeySignature) rotationDetails() (*RotationDetails, error) {
 
 // ResignNKS re-signs a node-key signature for a new node-key.
 //
-// This only matters on network-locked tailnets, because node-key signatures are
+// This only matters on tailnet-locked tailnets, because node-key signatures are
 // how other nodes know that a node-key is authentic. When the node-key is
 // rotated then the existing signature becomes invalid, so this function is
 // responsible for generating a new wrapping signature to certify the new node-key.
 //
 // The signature itself is a SigRotation signature, which embeds the old signature
 // and certifies the new node-key as a replacement for the old by signing the new
-// signature with RotationPubkey (which is the node's own network-lock key).
+// signature with RotationPubkey (which is the node's own tailnet-lock key).
 func ResignNKS(priv key.NLPrivate, nodeKey key.NodePublic, oldNKS tkatype.MarshaledSignature) (tkatype.MarshaledSignature, error) {
 	var oldSig NodeKeySignature
 	if err := oldSig.Unserialize(oldNKS); err != nil {

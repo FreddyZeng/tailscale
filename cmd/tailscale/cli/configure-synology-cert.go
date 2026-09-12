@@ -1,5 +1,7 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
+
+//go:build linux && !ts_omit_acme && !ts_omit_synology
 
 package cli
 
@@ -14,6 +16,7 @@ import (
 	"os/exec"
 	"path"
 	"runtime"
+	"slices"
 	"strings"
 
 	"github.com/peterbourgon/ff/v3/ffcli"
@@ -21,6 +24,10 @@ import (
 	"tailscale.com/ipn"
 	"tailscale.com/version/distro"
 )
+
+func init() {
+	maybeConfigSynologyCertCmd = synologyConfigureCertCmd
+}
 
 func synologyConfigureCertCmd() *ffcli.Command {
 	if runtime.GOOS != "linux" || distro.Get() != distro.Synology {
@@ -79,11 +86,8 @@ func runConfigureSynologyCert(ctx context.Context, args []string) error {
 			domain = st.CertDomains[0]
 		} else {
 			var found bool
-			for _, d := range st.CertDomains {
-				if d == domain {
-					found = true
-					break
-				}
+			if slices.Contains(st.CertDomains, domain) {
+				found = true
 			}
 			if !found {
 				return fmt.Errorf("Domain %q was not one of the valid domain options: %q.", domain, st.CertDomains)

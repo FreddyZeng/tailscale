@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !plan9
@@ -6,50 +6,65 @@
 package main
 
 import (
-	"context"
 	"fmt"
+	"net/url"
 	"os"
 
-	"golang.org/x/oauth2/clientcredentials"
-	"tailscale.com/internal/client/tailscale"
-	"tailscale.com/tailcfg"
+	"go.uber.org/zap"
+	"tailscale.com/client/tailscale/v2"
+
+	"tailscale.com/ipn"
 )
 
-// defaultTailnet is a value that can be used in Tailscale API calls instead of tailnet name to indicate that the API
-// call should be performed on the default tailnet for the provided credentials.
 const (
-	defaultTailnet = "-"
-	defaultBaseURL = "https://api.tailscale.com"
+	oidcJWTPath = "/var/run/secrets/tailscale/serviceaccount/token"
 )
 
-func newTSClient(ctx context.Context, clientIDPath, clientSecretPath string) (tsClient, error) {
-	clientID, err := os.ReadFile(clientIDPath)
-	if err != nil {
-		return nil, fmt.Errorf("error reading client ID %q: %w", clientIDPath, err)
+func newTSClient(logger *zap.SugaredLogger, clientID, clientIDPath, clientSecretPath, loginServer string) (*tailscale.Client, error) {
+	baseURL := ipn.DefaultControlURL
+	if loginServer != "" {
+		baseURL = loginServer
 	}
-	clientSecret, err := os.ReadFile(clientSecretPath)
-	if err != nil {
-		return nil, fmt.Errorf("reading client secret %q: %w", clientSecretPath, err)
-	}
-	credentials := clientcredentials.Config{
-		ClientID:     string(clientID),
-		ClientSecret: string(clientSecret),
-		TokenURL:     "https://login.tailscale.com/api/v2/oauth/token",
-	}
-	c := tailscale.NewClient(defaultTailnet, nil)
-	c.UserAgent = "tailscale-k8s-operator"
-	c.HTTPClient = credentials.Client(ctx)
-	return c, nil
-}
 
-type tsClient interface {
-	CreateKey(ctx context.Context, caps tailscale.KeyCapabilities) (string, *tailscale.Key, error)
-	Device(ctx context.Context, deviceID string, fields *tailscale.DeviceFieldsOpts) (*tailscale.Device, error)
-	DeleteDevice(ctx context.Context, nodeStableID string) error
-	// GetVIPService is a method for getting a Tailscale Service. VIPService is the original name for Tailscale Service.
-	GetVIPService(ctx context.Context, name tailcfg.ServiceName) (*tailscale.VIPService, error)
-	// CreateOrUpdateVIPService is a method for creating or updating a Tailscale Service.
-	CreateOrUpdateVIPService(ctx context.Context, svc *tailscale.VIPService) error
-	// DeleteVIPService is a method for deleting a Tailscale Service.
-	DeleteVIPService(ctx context.Context, name tailcfg.ServiceName) error
+	base, err := url.Parse(baseURL)
+	if err != nil {
+		return nil, err
+	}
+
+	client := &tailscale.Client{
+		UserAgent: "tailscale-k8s-operator",
+		BaseURL:   base,
+	}
+
+	if clientID == "" {
+		// Use static client credentials mounted to disk.
+		clientIDBytes, err := os.ReadFile(clientIDPath)
+		if err != nil {
+			return nil, fmt.Errorf("error reading client ID %q: %w", clientIDPath, err)
+		}
+		clientSecretBytes, err := os.ReadFile(clientSecretPath)
+		if err != nil {
+			return nil, fmt.Errorf("reading client secret %q: %w", clientSecretPath, err)
+		}
+
+		client.Auth = &tailscale.OAuth{
+			ClientID:     string(clientIDBytes),
+			ClientSecret: string(clientSecretBytes),
+		}
+	} else {
+		// Use workload identity federation.
+		client.Auth = &tailscale.IdentityFederation{
+			ClientID: clientID,
+			IDTokenFunc: func() (string, error) {
+				token, err := os.ReadFile(oidcJWTPath)
+				if err != nil {
+					return "", err
+				}
+
+				return string(token), nil
+			},
+		}
+	}
+
+	return client, nil
 }

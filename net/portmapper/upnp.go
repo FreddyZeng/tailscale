@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !js
@@ -25,14 +25,46 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/tailscale/goupnp"
-	"github.com/tailscale/goupnp/dcps/internetgateway2"
-	"github.com/tailscale/goupnp/soap"
+	"github.com/huin/goupnp"
+	"github.com/huin/goupnp/dcps/internetgateway2"
+	"github.com/huin/goupnp/soap"
 	"tailscale.com/envknob"
 	"tailscale.com/net/netns"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/ctxkey"
 	"tailscale.com/util/mak"
 )
+
+// upnpHTTPClientKey is a context key for storing an HTTP client to use
+// for UPnP requests. This allows us to use a custom HTTP client (with custom
+// dialer, timeouts, etc.) while using the upstream goupnp library which only
+// supports a global HTTPClientDefault.
+var upnpHTTPClientKey = ctxkey.New[*http.Client]("portmapper.upnpHTTPClient", nil)
+
+// delegatingRoundTripper implements http.RoundTripper by delegating to
+// the HTTP client stored in the request's context. This allows us to use
+// per-request HTTP client configuration with the upstream goupnp library.
+type delegatingRoundTripper struct {
+	inner *http.Client
+}
+
+func (d delegatingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if c := upnpHTTPClientKey.Value(req.Context()); c != nil {
+		return c.Transport.RoundTrip(req)
+	}
+	return d.inner.Do(req)
+}
+
+func init() {
+	// The upstream goupnp library uses a global HTTP client for all
+	// requests, while we want to be able to use a per-Client
+	// [http.Client]. We replace its global HTTP client with one that
+	// delegates to the HTTP client stored in the request's context.
+	old := goupnp.HTTPClientDefault
+	goupnp.HTTPClientDefault = &http.Client{
+		Transport: delegatingRoundTripper{old},
+	}
+}
 
 // References:
 //
@@ -79,14 +111,17 @@ func (u *upnpMapping) MappingDebug() string {
 		u.loc)
 }
 func (u *upnpMapping) Release(ctx context.Context) {
-	u.client.DeletePortMapping(ctx, "", u.external.Port(), upnpProtocolUDP)
+	u.client.DeletePortMappingCtx(ctx, "", u.external.Port(), upnpProtocolUDP)
 }
 
 // upnpClient is an interface over the multiple different clients exported by goupnp,
 // exposing the functions we need for portmapping. Those clients are auto-generated from XML-specs,
 // which is why they're not very idiomatic.
+//
+// The method names use the *Ctx suffix to match the upstream goupnp library's convention
+// for context-aware methods.
 type upnpClient interface {
-	AddPortMapping(
+	AddPortMappingCtx(
 		ctx context.Context,
 
 		// remoteHost is the remote device sending packets to this device, in the format of x.x.x.x.
@@ -119,9 +154,9 @@ type upnpClient interface {
 		leaseDurationSec uint32,
 	) error
 
-	DeletePortMapping(ctx context.Context, remoteHost string, externalPort uint16, protocol string) error
-	GetExternalIPAddress(ctx context.Context) (externalIPAddress string, err error)
-	GetStatusInfo(ctx context.Context) (status string, lastConnError string, uptime uint32, err error)
+	DeletePortMappingCtx(ctx context.Context, remoteHost string, externalPort uint16, protocol string) error
+	GetExternalIPAddressCtx(ctx context.Context) (externalIPAddress string, err error)
+	GetStatusInfoCtx(ctx context.Context) (status string, lastConnError string, uptime uint32, err error)
 }
 
 // tsPortMappingDesc gets sent to UPnP clients as a human-readable label for the portmapping.
@@ -171,7 +206,7 @@ func addAnyPortMapping(
 	// First off, try using AddAnyPortMapping; if there's a conflict, the
 	// router will pick another port and return it.
 	if upnp, ok := upnp.(*internetgateway2.WANIPConnection2); ok {
-		return upnp.AddAnyPortMapping(
+		return upnp.AddAnyPortMappingCtx(
 			ctx,
 			"",
 			externalPort,
@@ -186,7 +221,7 @@ func addAnyPortMapping(
 
 	// Fall back to using AddPortMapping, which requests a mapping to/from
 	// a specific external port.
-	err = upnp.AddPortMapping(
+	err = upnp.AddPortMappingCtx(
 		ctx,
 		"",
 		externalPort,
@@ -209,7 +244,7 @@ func addAnyPortMapping(
 // The meta is the most recently parsed UDP discovery packet response
 // from the Internet Gateway Device.
 func getUPnPRootDevice(ctx context.Context, logf logger.Logf, debug DebugKnobs, gw netip.Addr, meta uPnPDiscoResponse) (rootDev *goupnp.RootDevice, loc *url.URL, err error) {
-	if debug.DisableUPnP {
+	if debug.DisableUPnP() {
 		return nil, nil, nil
 	}
 
@@ -244,7 +279,7 @@ func getUPnPRootDevice(ctx context.Context, logf logger.Logf, debug DebugKnobs, 
 	defer cancel()
 
 	// This part does a network fetch.
-	root, err := goupnp.DeviceByURL(ctx, u)
+	root, err := goupnp.DeviceByURLCtx(ctx, u)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -252,14 +287,14 @@ func getUPnPRootDevice(ctx context.Context, logf logger.Logf, debug DebugKnobs, 
 }
 
 // selectBestService picks the "best" service from the given UPnP root device
-// to use to create a port mapping. It may return (nil, nil) if no supported
-// service was found in the provided *goupnp.RootDevice.
+// to use to create a port mapping. If selecting the service required querying
+// its external IP, it also returns that address. It may return a nil client if
+// no supported service was found in the provided *goupnp.RootDevice.
 //
 // loc is the parsed location that was used to fetch the given RootDevice.
 //
-// The provided ctx is not retained in the returned upnpClient, but
-// its associated HTTP client is (if set via goupnp.WithHTTPClient).
-func selectBestService(ctx context.Context, logf logger.Logf, root *goupnp.RootDevice, loc *url.URL) (client upnpClient, err error) {
+// The provided ctx is not retained in the returned upnpClient.
+func selectBestService(ctx context.Context, logf logger.Logf, root *goupnp.RootDevice, loc *url.URL) (client upnpClient, externalIP netip.Addr, err error) {
 	method := "none"
 	defer func() {
 		if client == nil {
@@ -274,9 +309,9 @@ func selectBestService(ctx context.Context, logf logger.Logf, root *goupnp.RootD
 	// First, get all available clients from the device, and append to our
 	// list of possible clients. Order matters here; we want to prefer
 	// WANIPConnection2 over WANIPConnection1 or WANPPPConnection.
-	wanIP2, _ := internetgateway2.NewWANIPConnection2ClientsFromRootDevice(ctx, root, loc)
-	wanIP1, _ := internetgateway2.NewWANIPConnection1ClientsFromRootDevice(ctx, root, loc)
-	wanPPP, _ := internetgateway2.NewWANPPPConnection1ClientsFromRootDevice(ctx, root, loc)
+	wanIP2, _ := internetgateway2.NewWANIPConnection2ClientsFromRootDevice(root, loc)
+	wanIP1, _ := internetgateway2.NewWANIPConnection1ClientsFromRootDevice(root, loc)
+	wanPPP, _ := internetgateway2.NewWANPPPConnection1ClientsFromRootDevice(root, loc)
 
 	var clients []upnpClient
 	for _, v := range wanIP2 {
@@ -291,12 +326,12 @@ func selectBestService(ctx context.Context, logf logger.Logf, root *goupnp.RootD
 
 	// These are legacy services that were deprecated in 2015, but are
 	// still in use by older devices; try them just in case.
-	legacyClients, _ := goupnp.NewServiceClientsFromRootDevice(ctx, root, loc, urn_LegacyWANPPPConnection_1)
+	legacyClients, _ := goupnp.NewServiceClientsFromRootDevice(root, loc, urn_LegacyWANPPPConnection_1)
 	metricUPnPSelectLegacy.Add(int64(len(legacyClients)))
 	for _, client := range legacyClients {
 		clients = append(clients, &legacyWANPPPConnection1{client})
 	}
-	legacyClients, _ = goupnp.NewServiceClientsFromRootDevice(ctx, root, loc, urn_LegacyWANIPConnection_1)
+	legacyClients, _ = goupnp.NewServiceClientsFromRootDevice(root, loc, urn_LegacyWANIPConnection_1)
 	metricUPnPSelectLegacy.Add(int64(len(legacyClients)))
 	for _, client := range legacyClients {
 		clients = append(clients, &legacyWANIPConnection1{client})
@@ -305,12 +340,12 @@ func selectBestService(ctx context.Context, logf logger.Logf, root *goupnp.RootD
 	// If we have no clients, then return right now; if we only have one,
 	// just select and return it.
 	if len(clients) == 0 {
-		return nil, nil
+		return nil, netip.Addr{}, nil
 	}
 	if len(clients) == 1 {
 		method = "single"
 		metricUPnPSelectSingle.Add(1)
-		return clients[0], nil
+		return clients[0], netip.Addr{}, nil
 	}
 
 	metricUPnPSelectMultiple.Add(1)
@@ -346,7 +381,7 @@ func selectBestService(ctx context.Context, logf logger.Logf, root *goupnp.RootD
 		}
 
 		// Check if the device has an external IP address.
-		extIP, err := svc.GetExternalIPAddress(ctx)
+		extIP, err := svc.GetExternalIPAddressCtx(ctx)
 		if err != nil {
 			continue
 		}
@@ -361,7 +396,7 @@ func selectBestService(ctx context.Context, logf logger.Logf, root *goupnp.RootD
 		if !externalIP.IsPrivate() {
 			method = "ext-public"
 			metricUPnPSelectExternalPublic.Add(1)
-			return svc, nil
+			return svc, externalIP, nil
 		}
 	}
 
@@ -381,11 +416,11 @@ func selectBestService(ctx context.Context, logf logger.Logf, root *goupnp.RootD
 			if hasExtIP {
 				method = "ext-private"
 				metricUPnPSelectExternalPrivate.Add(1)
-				return svc, nil
+				return svc, externalIPs[svc], nil
 			} else if try == 1 {
 				method = "up"
 				metricUPnPSelectUp.Add(1)
-				return svc, nil
+				return svc, netip.Addr{}, nil
 			}
 		}
 	}
@@ -393,13 +428,13 @@ func selectBestService(ctx context.Context, logf logger.Logf, root *goupnp.RootD
 	// Nothing is up, but we have something (length of clients checked
 	// above); just return the first one.
 	metricUPnPSelectNone.Add(1)
-	return clients[0], nil
+	return clients[0], netip.Addr{}, nil
 }
 
 // serviceIsConnected returns whether a given UPnP service is connected, based
 // on the NewConnectionStatus field returned from GetStatusInfo.
 func serviceIsConnected(ctx context.Context, logf logger.Logf, svc upnpClient) bool {
-	status, _ /* NewLastConnectionError */, _ /* NewUptime */, err := svc.GetStatusInfo(ctx)
+	status, _ /* NewLastConnectionError */, _ /* NewUptime */, err := svc.GetStatusInfoCtx(ctx)
 	if err != nil {
 		return false
 	}
@@ -434,7 +469,7 @@ func (c *Client) getUPnPPortMapping(
 	internal netip.AddrPort,
 	prevPort uint16,
 ) (external netip.AddrPort, ok bool) {
-	if disableUPnpEnv() || c.debug.DisableUPnP || (c.controlKnobs != nil && c.controlKnobs.DisableUPnP.Load()) {
+	if disableUPnpEnv() || c.debug.DisableUPnP() {
 		return netip.AddrPort{}, false
 	}
 
@@ -454,7 +489,7 @@ func (c *Client) getUPnPPortMapping(
 	c.mu.Lock()
 	oldMapping, ok := c.mapping.(*upnpMapping)
 	metas := c.uPnPMetas
-	ctx = goupnp.WithHTTPClient(ctx, c.upnpHTTPClientLocked())
+	ctx = upnpHTTPClientKey.WithValue(ctx, c.upnpHTTPClientLocked())
 	c.mu.Unlock()
 
 	// Wrapper for a uPnPDiscoResponse with an optional existing root
@@ -540,7 +575,7 @@ func (c *Client) getUPnPPortMapping(
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		c.mapping = upnp
-		c.localPort = externalAddrPort.Port()
+		c.localPort = internal.Port()
 		return upnp.external, true
 	}
 
@@ -568,7 +603,7 @@ func (c *Client) tryUPnPPortmapWithDevice(
 	// Select the best mapping service from the given root device. This
 	// makes network requests, and can vary from mapping to mapping if the
 	// upstream device's connection status changes.
-	client, err := selectBestService(ctx, c.logf, rootDev, loc)
+	client, externalIP, err := selectBestService(ctx, c.logf, rootDev, loc)
 	if err != nil {
 		return netip.AddrPort{}, nil, err
 	}
@@ -585,6 +620,35 @@ func (c *Client) tryUPnPPortmapWithDevice(
 		})
 
 		return netip.AddrPort{}, nil, fmt.Errorf("no supported UPnP clients")
+	}
+
+	// Obtain and validate the external IP before creating the mapping. In
+	// particular, MikroTik only supports permanent leases, so forgetting a
+	// successfully-created mapping after a later request fails leaks the rule
+	// forever and each retry creates another one.
+	if !externalIP.IsValid() {
+		extIP, err := client.GetExternalIPAddressCtx(ctx)
+		c.vlogf("client.GetExternalIPAddress: %v, %v", extIP, err)
+		if err != nil {
+			return netip.AddrPort{}, nil, err
+		}
+		externalIP, err = netip.ParseAddr(extIP)
+		if err != nil {
+			return netip.AddrPort{}, nil, err
+		}
+	}
+
+	// Do a bit of validation on the external IP; we've seen cases where
+	// UPnP devices return the public IP 0.0.0.0, which obviously doesn't
+	// work as an endpoint.
+	//
+	// See: https://github.com/tailscale/corp/issues/23538
+	if externalIP.IsUnspecified() {
+		c.logf("UPnP returned unspecified external IP %v", externalIP)
+		return netip.AddrPort{}, nil, fmt.Errorf("UPnP returned unspecified external IP")
+	} else if externalIP.IsLoopback() {
+		c.logf("UPnP returned loopback external IP %v", externalIP)
+		return netip.AddrPort{}, nil, fmt.Errorf("UPnP returned loopback external IP")
 	}
 
 	// Start by trying to make a temporary lease with a duration.
@@ -626,30 +690,6 @@ func (c *Client) tryUPnPPortmapWithDevice(
 	}
 	if err != nil {
 		return netip.AddrPort{}, nil, err
-	}
-
-	// TODO cache this ip somewhere?
-	extIP, err := client.GetExternalIPAddress(ctx)
-	c.vlogf("client.GetExternalIPAddress: %v, %v", extIP, err)
-	if err != nil {
-		return netip.AddrPort{}, nil, err
-	}
-	externalIP, err := netip.ParseAddr(extIP)
-	if err != nil {
-		return netip.AddrPort{}, nil, err
-	}
-
-	// Do a bit of validation on the external IP; we've seen cases where
-	// UPnP devices return the public IP 0.0.0.0, which obviously doesn't
-	// work as an endpoint.
-	//
-	// See: https://github.com/tailscale/corp/issues/23538
-	if externalIP.IsUnspecified() {
-		c.logf("UPnP returned unspecified external IP %v", externalIP)
-		return netip.AddrPort{}, nil, fmt.Errorf("UPnP returned unspecified external IP")
-	} else if externalIP.IsLoopback() {
-		c.logf("UPnP returned loopback external IP %v", externalIP)
-		return netip.AddrPort{}, nil, fmt.Errorf("UPnP returned loopback external IP")
 	}
 
 	return netip.AddrPortFrom(externalIP, newPort), client, nil

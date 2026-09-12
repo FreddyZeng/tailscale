@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package cli
@@ -8,6 +8,12 @@ import (
 	"strings"
 
 	"github.com/peterbourgon/ff/v3/ffcli"
+)
+
+var (
+	maybeJetKVMConfigureCmd,
+	maybeConfigSynologyCertCmd,
+	_ func() *ffcli.Command // non-nil only on Linux/arm for JetKVM
 )
 
 func configureCmd() *ffcli.Command {
@@ -26,9 +32,13 @@ services on the host to use Tailscale in more ways.
 		Subcommands: nonNilCmds(
 			configureKubeconfigCmd(),
 			synologyConfigureCmd(),
-			synologyConfigureCertCmd(),
+			flashApplianceCmd(),
+			pveApplianceCmd(),
+			ccall(maybeConfigSynologyCertCmd),
 			ccall(maybeSysExtCmd),
 			ccall(maybeVPNConfigCmd),
+			ccall(maybeJetKVMConfigureCmd),
+			ccall(maybeSystrayCmd),
 		),
 	}
 }

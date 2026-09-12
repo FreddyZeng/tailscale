@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package tailscale provides a minimal control plane API client for internal
@@ -24,6 +24,9 @@ func init() {
 
 // AuthMethod is an alias to tailscale.com/client/tailscale.
 type AuthMethod = tsclient.AuthMethod
+
+// APIKey is an alias to tailscale.com/client/tailscale.
+type APIKey = tsclient.APIKey
 
 // Device is an alias to tailscale.com/client/tailscale.
 type Device = tsclient.Device

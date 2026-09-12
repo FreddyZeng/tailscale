@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package tstun
@@ -33,7 +33,7 @@ func (t *fakeTUN) Close() error {
 	return nil
 }
 
-func (t *fakeTUN) Read(out [][]byte, sizes []int, offset int) (int, error) {
+func (t *fakeTUN) Read(slab []byte, packets []tun.ReadPacket) (int, error) {
 	<-t.closechan
 	return 0, io.EOF
 }

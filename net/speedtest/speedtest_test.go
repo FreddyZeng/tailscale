@@ -1,23 +1,33 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package speedtest
 
 import (
+	"flag"
 	"net"
 	"testing"
 	"time"
+
+	"tailscale.com/cmd/testwrapper/flakytest"
 )
 
+var manualTest = flag.Bool("do-speedtest", false, "if true, run the speedtest TestDownload test. Otherwise skip it because it's slow and flaky; see https://github.com/tailscale/tailscale/issues/17338")
+
 func TestDownload(t *testing.T) {
+	if !*manualTest {
+		t.Skip("skipping slow test without --do-speedtest")
+	}
+	flakytest.Mark(t, "https://github.com/tailscale/tailscale/issues/17338")
+
 	// start a listener and find the port where the server will be listening.
-	l, err := net.Listen("tcp", ":0")
+	ln, err := net.Listen("tcp", ":0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { l.Close() })
+	t.Cleanup(func() { ln.Close() })
 
-	serverIP := l.Addr().String()
+	serverIP := ln.Addr().String()
 	t.Log("server IP found:", serverIP)
 
 	type state struct {
@@ -30,14 +40,14 @@ func TestDownload(t *testing.T) {
 	stateChan := make(chan state, 1)
 
 	go func() {
-		err := Serve(l)
+		err := Serve(ln)
 		stateChan <- state{err: err}
 	}()
 
 	// ensure that the test returns an appropriate number of Result structs
 	expectedLen := int(DefaultDuration.Seconds()) + 1
 
-	t.Run("download test", func(t *testing.T) {
+	t.Run("download-test", func(t *testing.T) {
 		// conduct a download test
 		results, err := RunClient(Download, DefaultDuration, serverIP)
 
@@ -55,7 +65,7 @@ func TestDownload(t *testing.T) {
 		}
 	})
 
-	t.Run("upload test", func(t *testing.T) {
+	t.Run("upload-test", func(t *testing.T) {
 		// conduct an upload test
 		results, err := RunClient(Upload, DefaultDuration, serverIP)
 
@@ -74,7 +84,7 @@ func TestDownload(t *testing.T) {
 	})
 
 	// causes the server goroutine to finish
-	l.Close()
+	ln.Close()
 
 	testState := <-stateChan
 	if testState.err != nil {

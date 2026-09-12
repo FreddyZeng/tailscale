@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package s4u is an API for accessing Service-For-User (S4U) functionality on Windows.
@@ -938,10 +938,10 @@ func mergeEnv(existingEnv []string, extraEnv map[string]string) []string {
 		result = append(result, strings.Join([]string{k, v}, "="))
 	}
 
-	slices.SortFunc(result, func(l, r string) int {
-		kl, _, _ := strings.Cut(l, "=")
-		kr, _, _ := strings.Cut(r, "=")
-		return strings.Compare(kl, kr)
+	slices.SortFunc(result, func(a, b string) int {
+		ka, _, _ := strings.Cut(a, "=")
+		kb, _, _ := strings.Cut(b, "=")
+		return strings.Compare(ka, kb)
 	})
 	return result
 }

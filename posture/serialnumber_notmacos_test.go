@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Build on Windows, Linux and *BSD
@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"tailscale.com/types/logger"
+	"tailscale.com/util/syspolicy/policyclient"
 )
 
 func TestGetSerialNumberNotMac(t *testing.T) {
@@ -21,7 +22,7 @@ func TestGetSerialNumberNotMac(t *testing.T) {
 	// Comment out skip for local testing.
 	t.Skip()
 
-	sns, err := GetSerialNumbers(logger.Discard)
+	sns, err := GetSerialNumbers(policyclient.NoPolicyClient{}, logger.Discard)
 	if err != nil {
 		t.Fatalf("failed to get serial number: %s", err)
 	}

@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build cgo || !darwin
@@ -33,6 +33,7 @@ import (
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/util/slicesx"
 	"tailscale.com/util/stringsx"
 )
@@ -48,7 +49,12 @@ var (
 )
 
 // Run starts the systray menu and blocks until the menu exits.
-func (menu *Menu) Run() {
+// If client is nil, a default local.Client is used.
+func (menu *Menu) Run(client *local.Client) {
+	if client == nil {
+		client = &local.Client{}
+	}
+	menu.lc = client
 	menu.updateState()
 
 	// exit cleanly on SIGINT and SIGTERM
@@ -61,7 +67,13 @@ func (menu *Menu) Run() {
 		case <-menu.bgCtx.Done():
 		}
 	}()
-	go menu.lc.IncrementCounter(menu.bgCtx, "systray_start", 1)
+	go menu.lc.SetGauge(menu.bgCtx, "systray_running", 1)
+	defer menu.lc.SetGauge(menu.bgCtx, "systray_running", 0)
+
+	// set initial title, which is used by the systray package as the ID of the StatusNotifierItem.
+	// This value will get overwritten later as the client status changes.
+	// This must be called before systray.Run.
+	systray.SetTitle("tailscale")
 
 	systray.Run(menu.onReady, menu.onExit)
 }
@@ -70,7 +82,7 @@ func (menu *Menu) Run() {
 type Menu struct {
 	mu sync.Mutex // protects the entire Menu
 
-	lc          local.Client
+	lc          *local.Client
 	status      *ipnstate.Status
 	curProfile  ipn.LoginProfile
 	allProfiles []ipn.LoginProfile
@@ -127,7 +139,7 @@ func init() {
 
 	desktop := strings.ToLower(os.Getenv("XDG_CURRENT_DESKTOP"))
 	switch desktop {
-	case "gnome":
+	case "gnome", "ubuntu:gnome":
 		// GNOME expands submenus downward in the main menu, rather than flyouts to the side.
 		// Either as a result of that or another limitation, there seems to be a maximum depth of submenus.
 		// Mullvad countries that have a city submenu are not being rendered, and so can't be selected.
@@ -152,8 +164,32 @@ func init() {
 // onReady is called by the systray package when the menu is ready to be built.
 func (menu *Menu) onReady() {
 	log.Printf("starting")
+	if os.Getuid() == 0 || os.Getuid() != os.Geteuid() || os.Getenv("SUDO_USER") != "" || os.Getenv("DOAS_USER") != "" {
+		fmt.Fprintln(os.Stderr, `
+It appears that you might be running the systray with sudo/doas.
+This can lead to issues with D-Bus, and should be avoided.
+
+The systray application should be run with the same user as your desktop session.
+This usually means that you should run the application like:
+
+tailscale systray
+
+See https://tailscale.com/kb/1597/linux-systray for more information.`)
+	}
 	setAppIcon(disconnected)
+
 	menu.rebuild()
+
+	menu.mu.Lock()
+	if menu.readonly {
+		fmt.Fprintln(os.Stderr, `
+No permission to manage Tailscale. Set operator by running:
+
+sudo tailscale set --operator=$USER
+
+See https://tailscale.com/s/cli-operator for more information.`)
+	}
+	menu.mu.Unlock()
 }
 
 // updateState updates the Menu state from the Tailscale local client.
@@ -258,21 +294,23 @@ func (menu *Menu) rebuild() {
 		accounts := systray.AddMenuItem(account, "")
 		setRemoteIcon(accounts, menu.curProfile.UserProfile.ProfilePicURL)
 		time.Sleep(newMenuDelay)
-		for _, profile := range menu.allProfiles {
-			title := profileTitle(profile)
-			var item *systray.MenuItem
-			if profile.ID == menu.curProfile.ID {
-				item = accounts.AddSubMenuItemCheckbox(title, "", true)
-			} else {
-				item = accounts.AddSubMenuItem(title, "")
-			}
-			setRemoteIcon(item, profile.UserProfile.ProfilePicURL)
-			onClick(ctx, item, func(ctx context.Context) {
-				select {
-				case <-ctx.Done():
-				case menu.accountsCh <- profile.ID:
+		if len(menu.allProfiles) > 1 {
+			for _, profile := range menu.allProfiles {
+				title := profileTitle(profile)
+				var item *systray.MenuItem
+				if profile.ID == menu.curProfile.ID {
+					item = accounts.AddSubMenuItemCheckbox(title, "", true)
+				} else {
+					item = accounts.AddSubMenuItem(title, "")
 				}
-			})
+				setRemoteIcon(item, profile.UserProfile.ProfilePicURL)
+				onClick(ctx, item, func(ctx context.Context) {
+					select {
+					case <-ctx.Done():
+					case menu.accountsCh <- profile.ID:
+					}
+				})
+			}
 		}
 	}
 
@@ -289,11 +327,14 @@ func (menu *Menu) rebuild() {
 		menu.rebuildExitNodeMenu(ctx)
 	}
 
-	if menu.status != nil {
-		menu.more = systray.AddMenuItem("More settings", "")
+	menu.more = systray.AddMenuItem("More settings", "")
+	if menu.status != nil && menu.status.BackendState == "Running" {
+		// web client is only available if backend is running
 		onClick(ctx, menu.more, func(_ context.Context) {
 			webbrowser.Open("http://100.100.100.100/")
 		})
+	} else {
+		menu.more.Disable()
 	}
 
 	// TODO(#15528): this menu item shouldn't be necessary at all,
@@ -315,16 +356,27 @@ func (menu *Menu) rebuild() {
 
 // profileTitle returns the title string for a profile menu item.
 func profileTitle(profile ipn.LoginProfile) string {
-	title := profile.Name
+	tailnet := ""
 	if profile.NetworkProfile.DomainName != "" {
-		if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
-			// windows and mac don't support multi-line menu
-			title += " (" + profile.NetworkProfile.DomainName + ")"
-		} else {
-			title += "\n" + profile.NetworkProfile.DomainName
-		}
+		tailnet = profile.NetworkProfile.DisplayNameOrDefault()
 	}
-	return title
+	// windows and mac don't support multi-line menu items.
+	multiline := runtime.GOOS != "windows" && runtime.GOOS != "darwin"
+
+	return formatProfileTitle(profile.Name, tailnet, multiline)
+}
+
+// formatProfileTitle builds a profile menu label from a login name and an
+// optional tailnet name. The tailnet portion is omitted when it matches the
+// login name, so single-user tailnets don't show the same string twice.
+func formatProfileTitle(name, tailnet string, multiline bool) string {
+	if tailnet == "" || strings.EqualFold(name, tailnet) {
+		return name
+	}
+	if multiline {
+		return name + "\n" + tailnet
+	}
+	return name + " (" + tailnet + ")"
 }
 
 var (
@@ -340,6 +392,7 @@ func setRemoteIcon(menu *systray.MenuItem, urlStr string) {
 	}
 
 	cacheMu.Lock()
+	defer cacheMu.Unlock()
 	b, ok := httpCache[urlStr]
 	if !ok {
 		resp, err := http.Get(urlStr)
@@ -363,7 +416,6 @@ func setRemoteIcon(menu *systray.MenuItem, urlStr string) {
 			resp.Body.Close()
 		}
 	}
-	cacheMu.Unlock()
 
 	if len(b) > 0 {
 		menu.SetIcon(b)
@@ -480,7 +532,7 @@ func (menu *Menu) watchIPNBus() {
 }
 
 func (menu *Menu) watchIPNBusInner() error {
-	watcher, err := menu.lc.WatchIPNBus(menu.bgCtx, ipn.NotifyNoPrivateKeys)
+	watcher, err := menu.lc.WatchIPNBus(menu.bgCtx, 0)
 	if err != nil {
 		return fmt.Errorf("watching ipn bus: %w", err)
 	}
@@ -493,6 +545,15 @@ func (menu *Menu) watchIPNBusInner() error {
 			n, err := watcher.Next()
 			if err != nil {
 				return fmt.Errorf("ipnbus error: %w", err)
+			}
+			if url := n.BrowseToURL; url != nil {
+				// Avoid opening the browser when running as root, just in case.
+				runningAsRoot := os.Getuid() == 0
+				if !runningAsRoot {
+					if err := webbrowser.Open(*url); err != nil {
+						log.Printf("failed to open BrowseToURL: %v", err)
+					}
+				}
 			}
 			var rebuild bool
 			if n.State != nil {
@@ -520,9 +581,9 @@ func (menu *Menu) copyTailscaleIP(device *ipnstate.PeerStatus) {
 	err := clipboard.WriteAll(ip)
 	if err != nil {
 		log.Printf("clipboard error: %v", err)
+	} else {
+		menu.sendNotification(fmt.Sprintf("Copied Address for %v", name), ip)
 	}
-
-	menu.sendNotification(fmt.Sprintf("Copied Address for %v", name), ip)
 }
 
 // sendNotification sends a desktop notification with the given title and content.
@@ -564,22 +625,26 @@ func (menu *Menu) rebuildExitNodeMenu(ctx context.Context) {
 	setExitNodeOnClick(noExitNodeMenu, "")
 
 	// Show recommended exit node if available.
-	if status.Self.CapMap.Contains(tailcfg.NodeAttrSuggestExitNodeUI) {
+	if status.Self.CapMap.Contains(nodecap.SuggestExitNodeUI) {
 		sugg, err := menu.lc.SuggestExitNode(ctx)
 		if err == nil {
+			// Location is invalid for suggested exit nodes that have
+			// no location, such as regular tailnet exit nodes.
+			var suggCountryCode, suggCity string
+			if loc := sugg.Location; loc.Valid() {
+				suggCountryCode, suggCity = loc.CountryCode(), loc.City()
+			}
 			title := "Recommended: "
 			if loc := sugg.Location; loc.Valid() && loc.Country() != "" {
-				flag := countryFlag(loc.CountryCode())
-				title += fmt.Sprintf("%s %s: %s", flag, loc.Country(), loc.City())
+				flag := countryFlag(suggCountryCode)
+				title += fmt.Sprintf("%s %s: %s", flag, loc.Country(), suggCity)
 			} else {
 				title += strings.Split(sugg.Name, ".")[0]
 			}
 			menu.exitNodes.AddSeparator()
-			rm := menu.exitNodes.AddSubMenuItemCheckbox(title, "", false)
+			active := recommendedIsActive(status, sugg.ID, suggCountryCode, suggCity)
+			rm := menu.exitNodes.AddSubMenuItemCheckbox(title, "", active)
 			setExitNodeOnClick(rm, sugg.ID)
-			if status.ExitNodeStatus != nil && sugg.ID == status.ExitNodeStatus.ID {
-				rm.Check()
-			}
 		}
 	}
 
@@ -601,12 +666,10 @@ func (menu *Menu) rebuildExitNodeMenu(ctx context.Context) {
 			if !ps.Online {
 				name += " (offline)"
 			}
-			sm := menu.exitNodes.AddSubMenuItemCheckbox(name, "", false)
+			active := status.ExitNodeStatus != nil && ps.ID == status.ExitNodeStatus.ID
+			sm := menu.exitNodes.AddSubMenuItemCheckbox(name, "", active)
 			if !ps.Online {
 				sm.Disable()
-			}
-			if status.ExitNodeStatus != nil && ps.ID == status.ExitNodeStatus.ID {
-				sm.Check()
 			}
 			setExitNodeOnClick(sm, ps.ID)
 		}
@@ -695,6 +758,30 @@ func (mc *mvCountry) sortedCities() []*mvCity {
 		return stringsx.CompareFold(a.name, b.name)
 	})
 	return cities
+}
+
+// recommendedIsActive reports whether the suggested exit node corresponds to
+// the currently active exit node in status.
+func recommendedIsActive(status *ipnstate.Status, suggID tailcfg.StableNodeID, suggCountry, suggCity string) bool {
+	if status == nil || status.ExitNodeStatus == nil || status.ExitNodeStatus.ID.IsZero() {
+		return false
+	}
+	if suggID == status.ExitNodeStatus.ID {
+		return true
+	}
+	if suggCountry == "" || suggCity == "" {
+		return false
+	}
+	for _, p := range status.Peer {
+		if p.ID != status.ExitNodeStatus.ID {
+			continue
+		}
+		if loc := p.Location; loc != nil && loc.CountryCode == suggCountry && loc.City == suggCity {
+			return true
+		}
+		return false
+	}
+	return false
 }
 
 // countryFlag takes a 2-character ASCII string and returns the corresponding emoji flag.

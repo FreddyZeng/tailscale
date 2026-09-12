@@ -1,7 +1,7 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
-//go:build !ios && !android
+//go:build !ios && !android && !ts_omit_hujsonconf
 
 package conffile
 

@@ -66,6 +66,14 @@
                   displayName="$(string.SINCE_V1_84)">
         <and><reference ref="TAILSCALE_PRODUCT"/></and>
       </definition>
+      <definition name="SINCE_V1_86"
+                  displayName="$(string.SINCE_V1_86)">
+        <and><reference ref="TAILSCALE_PRODUCT"/></and>
+      </definition>
+      <definition name="SINCE_V1_90"
+                  displayName="$(string.SINCE_V1_90)">
+        <and><reference ref="TAILSCALE_PRODUCT"/></and>
+      </definition>
     </definitions>
   </supportedOn>
   <categories>
@@ -111,6 +119,18 @@
       <supportedOn ref="SINCE_V1_56" />
       <elements>
         <text id="ExitNodeIDPrompt" valueName="ExitNodeID" required="true" />
+        <enum id="ExitNode_UserOverride" valueName="ExitNode.AllowOverride">
+          <item displayName="$(string.NotAllowed)">
+            <value>
+              <decimal value="0" />
+            </value>
+          </item>
+          <item displayName="$(string.Allowed)">
+            <value>
+              <decimal value="1" />
+            </value>
+          </item>
+        </enum>
       </elements>
     </policy>
     <policy name="AllowedSuggestedExitNodes" class="Machine" displayName="$(string.AllowedSuggestedExitNodes)" explainText="$(string.AllowedSuggestedExitNodes_Help)" presentation="$(presentation.AllowedSuggestedExitNodes)" key="Software\Policies\Tailscale\AllowedSuggestedExitNodes">
@@ -171,6 +191,16 @@
         <text id="ReconnectAfterDelay" valueName="ReconnectAfter" required="true" />
       </elements>
     </policy>
+    <policy name="AllowTailscaledRestart" class="Machine" displayName="$(string.AllowTailscaledRestart)" explainText="$(string.AllowTailscaledRestart_Help)" key="Software\Policies\Tailscale" valueName="AllowTailscaledRestart">
+      <parentCategory ref="Settings_Category" />
+      <supportedOn ref="SINCE_V1_90" />
+      <enabledValue>
+        <decimal value="1" />
+      </enabledValue>
+      <disabledValue>
+        <decimal value="0" />
+      </disabledValue>
+    </policy>
     <policy name="ExitNodeAllowLANAccess" class="Machine" displayName="$(string.ExitNodeAllowLANAccess)" explainText="$(string.ExitNodeAllowLANAccess_Help)" key="Software\Policies\Tailscale" valueName="ExitNodeAllowLANAccess">
       <parentCategory ref="Settings_Category" />
       <supportedOn ref="PARTIAL_FULL_SINCE_V1_56" />
@@ -201,7 +231,7 @@
         <string>never</string>
       </disabledValue>
     </policy>
-    <policy name="DNSRegistration" class="Machine" displayName="$(string.DNSRegistration)" explainText="$(string.DNSRegistration_Help)" presentation="$(presentation.DNSRegistration)" key="Software\Policies\Tailscale" valueName="EnableDNSRegistration">
+    <policy name="DNSRegistration" class="Machine" displayName="$(string.DNSRegistration)" explainText="$(string.DNSRegistration_Help)" presentation="$(presentation.DNSRegistration)" key="Software\Policies\Tailscale" valueName="DNSRegistrationConfigured">
       <parentCategory ref="Settings_Category" />
       <supportedOn ref="SINCE_V1_84" />
       <elements>
@@ -220,6 +250,16 @@
       </elements>
     </policy>
     <policy name="InstallUpdates" class="Machine" displayName="$(string.InstallUpdates)" explainText="$(string.InstallUpdates_Help)" key="Software\Policies\Tailscale" valueName="InstallUpdates">
+      <parentCategory ref="Settings_Category" />
+      <supportedOn ref="PARTIAL_FULL_SINCE_V1_56" />
+      <enabledValue>
+        <string>always</string>
+      </enabledValue>
+      <disabledValue>
+        <string>never</string>
+      </disabledValue>
+    </policy>
+    <policy name="CheckUpdates" class="Machine" displayName="$(string.CheckUpdates)" explainText="$(string.CheckUpdates_Help)" key="Software\Policies\Tailscale" valueName="CheckUpdates">
       <parentCategory ref="Settings_Category" />
       <supportedOn ref="PARTIAL_FULL_SINCE_V1_56" />
       <enabledValue>
@@ -364,6 +404,16 @@
       <elements>
         <text id="KeyExpirationNoticePrompt" valueName="KeyExpirationNotice" required="true" />
       </elements>
+    </policy>
+    <policy name="EncryptState" class="Machine" displayName="$(string.EncryptState)" explainText="$(string.EncryptState_Help)" key="Software\Policies\Tailscale" valueName="EncryptState">
+      <parentCategory ref="Top_Category" />
+      <supportedOn ref="SINCE_V1_86" />
+      <enabledValue>
+        <decimal value="1" />
+      </enabledValue>
+      <disabledValue>
+        <decimal value="0" />
+      </disabledValue>
     </policy>
   </policies>
 </policyDefinitions>

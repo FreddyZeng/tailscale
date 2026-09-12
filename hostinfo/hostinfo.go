@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package hostinfo answers questions about the host environment that Tailscale is
@@ -23,7 +23,6 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/lazy"
 	"tailscale.com/types/opt"
-	"tailscale.com/types/ptr"
 	"tailscale.com/util/cloudenv"
 	"tailscale.com/util/dnsname"
 	"tailscale.com/util/lineiter"
@@ -75,13 +74,14 @@ func New() *tailcfg.Hostinfo {
 
 // non-nil on some platforms
 var (
-	osVersion      func() string
-	packageType    func() string
-	distroName     func() string
-	distroVersion  func() string
-	distroCodeName func() string
-	unameMachine   func() string
-	deviceModel    func() string
+	osVersion            func() string
+	packageType          func() string
+	distroName           func() string
+	distroVersion        func() string
+	distroCodeName       func() string
+	unameMachine         func() string
+	deviceModel          func() string
+	systemdLogindDesktop func() bool
 )
 
 func condCall[T any](fn func() T) T {
@@ -93,8 +93,8 @@ func condCall[T any](fn func() T) T {
 }
 
 var (
-	lazyInContainer = &lazyAtomicValue[opt.Bool]{f: ptr.To(inContainer)}
-	lazyGoArchVar   = &lazyAtomicValue[string]{f: ptr.To(goArchVar)}
+	lazyInContainer = &lazyAtomicValue[opt.Bool]{f: new(inContainer)}
+	lazyGoArchVar   = &lazyAtomicValue[string]{f: new(goArchVar)}
 )
 
 type lazyAtomicValue[T any] struct {
@@ -233,6 +233,12 @@ func FirewallMode() string {
 	return s
 }
 
+// desktop reports whether the system is running a Linux desktop environment.
+// The result is undefined for non-Linux systems.
+// It checks systemd-logind, and then via reading the list of open unix sockets
+// and seeing if any of them matches names of wayland, x11 or mir.
+// The detection runs for a minute after starting tailscaled, after that the
+// value is cached and returned directly from the cache.
 func desktop() (ret opt.Bool) {
 	if runtime.GOOS != "linux" {
 		return opt.Bool("")
@@ -243,10 +249,19 @@ func desktop() (ret opt.Bool) {
 	}
 
 	seenDesktop := false
-	for lr := range lineiter.File("/proc/net/unix") {
-		line, _ := lr.Value()
-		seenDesktop = seenDesktop || mem.Contains(mem.B(line), mem.S(".X11-unix"))
-		seenDesktop = seenDesktop || mem.Contains(mem.B(line), mem.S("/wayland-1"))
+	if systemdLogindDesktop != nil {
+		seenDesktop = systemdLogindDesktop()
+	}
+	if !seenDesktop {
+		for lr := range lineiter.File("/proc/net/unix") {
+			line, _ := lr.Value()
+			if seenDesktop = mem.Contains(mem.B(line), mem.S(".X11-unix")) ||
+				mem.Contains(mem.B(line), mem.S("/wayland-")) ||
+				mem.Contains(mem.B(line), mem.S("mir_socket")) ||
+				mem.Contains(mem.B(line), mem.S("gamescope-")); seenDesktop {
+				break
+			}
+		}
 	}
 	ret.Set(seenDesktop)
 

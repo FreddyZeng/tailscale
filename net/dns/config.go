@@ -1,5 +1,7 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
+
+//go:generate go run tailscale.com/cmd/viewer --type=Config --clonefunc
 
 // Package dns contains code to configure and manage DNS settings.
 package dns
@@ -8,6 +10,8 @@ import (
 	"bufio"
 	"fmt"
 	"net/netip"
+	"reflect"
+	"slices"
 	"sort"
 
 	"tailscale.com/control/controlknobs"
@@ -17,10 +21,15 @@ import (
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/types/dnstype"
 	"tailscale.com/util/dnsname"
+	"tailscale.com/util/set"
 )
 
 // Config is a DNS configuration.
 type Config struct {
+	// AcceptDNS true if [Prefs.CorpDNS] is enabled (or --accept-dns=true).
+	// This should be used for error handling and health reporting
+	// purposes only.
+	AcceptDNS bool
 	// DefaultResolvers are the DNS resolvers to use for DNS names
 	// which aren't covered by more specific per-domain routes below.
 	// If empty, the OS's default resolvers (the ones that predate
@@ -44,9 +53,22 @@ type Config struct {
 	// it to resolve, you also need to add appropriate routes to
 	// Routes.
 	Hosts map[dnsname.FQDN][]netip.Addr
+	// SubdomainHosts is a set of FQDNs from Hosts that should also
+	// resolve subdomain queries to the same IPs. For example, if
+	// "node.tailnet.ts.net" is in SubdomainHosts, then queries for
+	// "anything.node.tailnet.ts.net" will resolve to node's IPs.
+	SubdomainHosts set.Set[dnsname.FQDN]
 	// OnlyIPv6, if true, uses the IPv6 service IP (for MagicDNS)
 	// instead of the IPv4 version (100.100.100.100).
 	OnlyIPv6 bool
+	// MagicDNSHostsUnrouted is whether MagicDNS host records are
+	// served on demand via [resolver.MagicDNSHosts] (so are not
+	// listed in Hosts) without being covered by any Routes entry;
+	// that is, MagicDNS domain routing is off. It preserves the
+	// effect the node records had when they were listed in Hosts:
+	// hasHostsWithoutSplitDNSRoutes reports true, keeping quad-100
+	// in the OS resolver path so the names still resolve.
+	MagicDNSHostsUnrouted bool
 }
 
 var magicDNSDualStack = envknob.RegisterBool("TS_DEBUG_MAGIC_DNS_DUAL_STACK")
@@ -59,11 +81,9 @@ func (c *Config) serviceIPs(knobs *controlknobs.Knobs) []netip.Addr {
 		return []netip.Addr{tsaddr.TailscaleServiceIPv6()}
 	}
 
-	// TODO(bradfitz,mikeodr,raggi): include IPv6 here too; tailscale/tailscale#15404
-	// And add a controlknobs knob to disable dual stack.
-	//
-	// For now, opt-in for testing.
-	if magicDNSDualStack() {
+	// See https://github.com/tailscale/tailscale/issues/15404 for the background
+	// on the opt-in debug knob and the controlknob opt-out.
+	if magicDNSDualStack() || !knobs.ShouldForceRegisterMagicDNSIPv4Only() {
 		return []netip.Addr{
 			tsaddr.TailscaleServiceIP(),
 			tsaddr.TailscaleServiceIPv6(),
@@ -115,14 +135,32 @@ func (c Config) hasDefaultIPResolversOnly() bool {
 // hasHostsWithoutSplitDNSRoutes reports whether c contains any Host entries
 // that aren't covered by a SplitDNS route suffix.
 func (c Config) hasHostsWithoutSplitDNSRoutes() bool {
-	// TODO(bradfitz): this could be more efficient, but we imagine
-	// the number of SplitDNS routes and/or hosts will be small.
+	if c.MagicDNSHostsUnrouted {
+		return true
+	}
+	// Hosts is small here on most platforms: per-node records are
+	// served via [resolver.MagicDNSHosts] (accounted for above), so
+	// only control's DNS.ExtraRecords remain. On Windows it still
+	// carries every node's records for the hosts-file path.
 	for host := range c.Hosts {
 		if !c.hasSplitDNSRouteForHost(host) {
 			return true
 		}
 	}
 	return false
+}
+
+// requiresPrimaryResolver reports whether c can only be served correctly with
+// quad-100 installed as the OS's primary (catch-all) resolver, rather than
+// scoped to a set of match domains.
+//
+// That's the case when c has names quad-100 must answer that no route suffix
+// covers, so there is no suffix to scope to. dnsConfigForNetmap pairs every
+// ExtraRecord it emits with a route, so in practice this is the
+// MagicDNS-names-present but MagicDNS-domain-routing-off case
+// (MagicDNSHostsUnrouted).
+func (c Config) requiresPrimaryResolver() bool {
+	return c.hasHostsWithoutSplitDNSRoutes()
 }
 
 // hasSplitDNSRouteForHost reports whether c contains a SplitDNS route
@@ -181,21 +219,16 @@ func sameResolverNames(a, b []*dnstype.Resolver) bool {
 		if a[i].Addr != b[i].Addr {
 			return false
 		}
-		if !sameIPs(a[i].BootstrapResolution, b[i].BootstrapResolution) {
+		if !slices.Equal(a[i].BootstrapResolution, b[i].BootstrapResolution) {
 			return false
 		}
 	}
 	return true
 }
 
-func sameIPs(a, b []netip.Addr) bool {
-	if len(a) != len(b) {
-		return false
+func (c *Config) Equal(o *Config) bool {
+	if c == nil || o == nil {
+		return c == o
 	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
+	return reflect.DeepEqual(c, o)
 }

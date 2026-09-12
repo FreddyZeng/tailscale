@@ -1,9 +1,10 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package controlhttp
 
 import (
+	"crypto/x509"
 	"net/http"
 	"net/url"
 	"sync/atomic"
@@ -78,12 +79,15 @@ type Dialer struct {
 	// dropped.
 	Logf logger.Logf
 
-	// NetMon is the [netmon.Monitor] to use for this Dialer. It must be
-	// non-nil.
+	// NetMon is the [netmon.Monitor] to use for this Dialer.
+	// It is optional.
 	NetMon *netmon.Monitor
 
 	// HealthTracker, if non-nil, is the health tracker to use.
 	HealthTracker *health.Tracker
+
+	// ExtraRootCAs, if non-nil, specifies additional trusted root CAs for TLS.
+	ExtraRootCAs *x509.CertPool
 
 	// DialPlan, if set, contains instructions from the control server on
 	// how to connect to it. If present, we will try the methods in this
@@ -98,7 +102,6 @@ type Dialer struct {
 	logPort80Failure atomic.Bool
 
 	// For tests only
-	drainFinished        chan struct{}
 	omitCertErrorLogging bool
 	testFallbackDelay    time.Duration
 

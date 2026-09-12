@@ -1,5 +1,7 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
+
+//go:build !ts_omit_clientupdate
 
 package cli
 
@@ -8,14 +10,26 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"runtime"
-	"strings"
 
 	"github.com/peterbourgon/ff/v3/ffcli"
 	"tailscale.com/clientupdate"
+	"tailscale.com/util/prompt"
 	"tailscale.com/version"
 	"tailscale.com/version/distro"
 )
+
+func init() {
+	maybeUpdateCmd = func() *ffcli.Command { return updateCmd }
+
+	clientupdateLatestTailscaleVersion.Set(func(track string) (string, error) {
+		if track == "" {
+			return clientupdate.LatestTailscaleVersion(clientupdate.CurrentTrack)
+		}
+		return clientupdate.LatestTailscaleVersion(track)
+	})
+}
 
 var updateCmd = &ffcli.Command{
 	Name:       "update",
@@ -40,7 +54,7 @@ var updateCmd = &ffcli.Command{
 			distro.Get() != distro.Synology &&
 			runtime.GOOS != "freebsd" &&
 			runtime.GOOS != "darwin" {
-			fs.StringVar(&updateArgs.track, "track", "", `which track to check for updates: "stable" or "unstable" (dev); empty means same as current`)
+			fs.StringVar(&updateArgs.track, "track", "", `which track to check for updates: "stable", "release-candidate", or "unstable" (dev); empty means same as current`)
 			fs.StringVar(&updateArgs.version, "version", "", `explicit version to update/downgrade to`)
 		}
 		return fs
@@ -54,8 +68,19 @@ var updateArgs struct {
 	version string // explicit version; empty means auto
 }
 
+const gokrazyUpdateFromURLMagicArg = "--gokrazy-update-from-url"
+
 func runUpdate(ctx context.Context, args []string) error {
 	if len(args) > 0 {
+		if runtime.GOOS == "linux" && distro.Get() == distro.Gokrazy {
+			gokArgs, err := gokrazyUpdateArgsFromMagicArg(args)
+			if err != nil {
+				return err
+			}
+			if gokArgs != nil {
+				return clientupdate.GokrazyUpdateFromURL.Get()(ctx, *gokArgs)
+			}
+		}
 		return flag.ErrHelp
 	}
 	if updateArgs.version != "" && updateArgs.track != "" {
@@ -87,19 +112,38 @@ func confirmUpdate(ver string) bool {
 	}
 
 	msg := fmt.Sprintf("This will update Tailscale from %v to %v. Continue?", version.Short(), ver)
-	return promptYesNo(msg)
+	return prompt.YesNo(msg, true)
 }
 
-// PromptYesNo takes a question and prompts the user to answer the
-// question with a yes or no. It appends a [y/n] to the message.
-func promptYesNo(msg string) bool {
-	fmt.Print(msg + " [y/n] ")
-	var resp string
-	fmt.Scanln(&resp)
-	resp = strings.ToLower(resp)
-	switch resp {
-	case "y", "yes", "sure":
-		return true
+// gokrazyUpdateArgsFromMagicArg parses the Gokrazy update-from-URL command-line
+// flow. It returns nil if args do not select that flow. A non-nil result means
+// the caller may safely invoke clientupdate.GokrazyUpdateFromURL.
+func gokrazyUpdateArgsFromMagicArg(args []string) (*clientupdate.GokrazyUpdateArgs, error) {
+	var updateURL string
+	var unsigned bool
+
+	fs := flag.NewFlagSet("gokrazy-update", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	// This flag path is exercised end-to-end by TestGokrazyUpdatesItselfToSameImage.
+	fs.StringVar(&updateURL, gokrazyUpdateFromURLMagicArg[2:], "", "URL of the Gokrazy archive format file to install")
+	fs.BoolVar(&unsigned, "unsigned", false, "skip GAF signature verification; for tests only")
+	if err := fs.Parse(args); err != nil {
+		return nil, err
 	}
-	return false
+	if fs.NArg() != 0 {
+		return nil, nil
+	}
+	if updateURL == "" {
+		return nil, nil
+	}
+	if !clientupdate.GokrazyUpdateFromURL.IsSet() {
+		return nil, errors.New("gokrazy update support is not linked into this binary")
+	}
+	return &clientupdate.GokrazyUpdateArgs{
+		URL:           updateURL,
+		AllowUnsigned: unsigned,
+		Logf: func(format string, args ...any) {
+			printf(format+"\n", args...)
+		},
+	}, nil
 }

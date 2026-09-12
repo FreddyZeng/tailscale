@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // The sniproxy is an outbound SNI proxy. It receives TLS connections over
@@ -138,10 +138,10 @@ func run(ctx context.Context, ts *tsnet.Server, wgPort int, hostname string, pro
 	}
 
 	// Finally, start mainloop to configure app connector based on information
-	// in the netmap.
-	// We set the NotifyInitialNetMap flag so we will always get woken with the
-	// current netmap, before only being woken on changes.
-	bus, err := lc.WatchIPNBus(ctx, ipn.NotifyWatchEngineUpdates|ipn.NotifyInitialNetMap|ipn.NotifyNoPrivateKeys)
+	// in the self node's CapMap. We set NotifyInitialNetMap so the first
+	// Notify carries the current self node (now via Notify.SelfChange);
+	// subsequent self changes wake us up too.
+	bus, err := lc.WatchIPNBus(ctx, ipn.NotifyWatchEngineUpdates|ipn.NotifyInitialNetMap)
 	if err != nil {
 		log.Fatalf("watching IPN bus: %v", err)
 	}
@@ -155,28 +155,30 @@ func run(ctx context.Context, ts *tsnet.Server, wgPort int, hostname string, pro
 			log.Fatalf("reading IPN bus: %v", err)
 		}
 
-		// NetMap contains app-connector configuration
-		if nm := msg.NetMap; nm != nil && nm.SelfNode.Valid() {
-			var c appctype.AppConnectorConfig
-			nmConf, err := tailcfg.UnmarshalNodeCapViewJSON[appctype.AppConnectorConfig](nm.SelfNode.CapMap(), configCapKey)
-			if err != nil {
-				log.Printf("failed to read app connector configuration from coordination server: %v", err)
-			} else if len(nmConf) > 0 {
-				c = nmConf[0]
-			}
-
-			if c.AdvertiseRoutes {
-				if err := s.advertiseRoutesFromConfig(ctx, &c); err != nil {
-					log.Printf("failed to advertise routes: %v", err)
-				}
-			}
-
-			// Backwards compatibility: combine any configuration from control with flags specified
-			// on the command line. This is intentionally done after we advertise any routes
-			// because its never correct to advertise the nodes native IP addresses.
-			s.mergeConfigFromFlags(&c, ports, forwards)
-			s.srv.Configure(&c)
+		self := msg.SelfChange
+		if self == nil {
+			continue
 		}
+		var c appctype.AppConnectorConfig
+		// View() lets us reuse the existing CapView decoder.
+		nmConf, err := tailcfg.UnmarshalNodeCapViewJSON[appctype.AppConnectorConfig](self.View().CapMap(), configCapKey)
+		if err != nil {
+			log.Printf("failed to read app connector configuration from coordination server: %v", err)
+		} else if len(nmConf) > 0 {
+			c = nmConf[0]
+		}
+
+		if c.AdvertiseRoutes {
+			if err := s.advertiseRoutesFromConfig(ctx, &c); err != nil {
+				log.Printf("failed to advertise routes: %v", err)
+			}
+		}
+
+		// Backwards compatibility: combine any configuration from control with flags specified
+		// on the command line. This is intentionally done after we advertise any routes
+		// because its never correct to advertise the nodes native IP addresses.
+		s.mergeConfigFromFlags(&c, ports, forwards)
+		s.srv.Configure(&c)
 	}
 }
 
@@ -225,7 +227,7 @@ func (s *sniproxy) mergeConfigFromFlags(out *appctype.AppConnectorConfig, ports,
 		Addrs: []netip.Addr{ip4, ip6},
 	}
 	if ports != "" {
-		for _, portStr := range strings.Split(ports, ",") {
+		for portStr := range strings.SplitSeq(ports, ",") {
 			port, err := strconv.ParseUint(portStr, 10, 16)
 			if err != nil {
 				log.Fatalf("invalid port: %s", portStr)
@@ -238,7 +240,7 @@ func (s *sniproxy) mergeConfigFromFlags(out *appctype.AppConnectorConfig, ports,
 	}
 
 	var forwardConfigFromFlags []appctype.DNATConfig
-	for _, forwStr := range strings.Split(forwards, ",") {
+	for forwStr := range strings.SplitSeq(forwards, ",") {
 		if forwStr == "" {
 			continue
 		}

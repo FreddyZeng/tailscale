@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package lapitest provides utilities for black-box testing of LocalAPI ([ipnserver]).
@@ -22,7 +22,6 @@ import (
 	"tailscale.com/ipn/ipnserver"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/logid"
-	"tailscale.com/types/ptr"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/rands"
 )
@@ -153,7 +152,7 @@ func (s *Server) MakeTestActor(name string, clientID string) *ipnauth.TestActor 
 	}
 
 	// Create a shallow copy of the base actor and assign it the new client ID.
-	actor := ptr.To(*baseActor)
+	actor := new(*baseActor)
 	actor.CID = ipnauth.ClientIDFrom(clientID)
 	return actor
 }
@@ -196,7 +195,7 @@ func (s *Server) CheckCurrentUser(want ipnauth.Actor) {
 	if lb == nil {
 		s.tb.Fatalf("Backend: nil")
 	}
-	gotUID, gotActor := lb.CurrentUserForTest()
+	gotUID, gotActor := lb.ForTest().CurrentUser()
 	if gotUID != wantUID {
 		s.tb.Errorf("CurrentUser: got UID %q; want %q", gotUID, wantUID)
 	}
@@ -236,7 +235,7 @@ func (s *Server) Close() {
 func newUnstartedIPNServer(opts *options) *ipnserver.Server {
 	opts.TB().Helper()
 	lb := opts.Backend()
-	server := ipnserver.New(opts.Logf(), logid.PublicID{}, lb.NetMon())
+	server := ipnserver.New(opts.Logf(), logid.PublicID{}, lb.EventBus(), lb.NetMon())
 	server.SetLocalBackend(lb)
 	return server
 }

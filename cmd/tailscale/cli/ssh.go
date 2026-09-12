@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package cli
@@ -11,9 +11,9 @@ import (
 	"log"
 	"net/netip"
 	"os"
-	"os/user"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 
 	"github.com/peterbourgon/ff/v3/ffcli"
@@ -58,14 +58,15 @@ func runSSH(ctx context.Context, args []string) error {
 	username, host, ok := strings.Cut(arg, "@")
 	if !ok {
 		host = arg
-		lu, err := user.Current()
-		if err != nil {
-			return nil
-		}
-		username = lu.Username
+		username = ""
 	}
 
 	st, err := localClient.Status(ctx)
+	if err != nil {
+		return err
+	}
+
+	prefs, err := localClient.GetPrefs(ctx)
 	if err != nil {
 		return err
 	}
@@ -74,8 +75,19 @@ func runSSH(ctx context.Context, args []string) error {
 	// connecting to, so we have to maintain fewer entries in the
 	// known_hosts files.
 	hostForSSH := host
-	if v, ok := nodeDNSNameFromArg(st, host); ok {
-		hostForSSH = v
+	ps, ok := peerStatusFromArg(st, host)
+	if ok {
+		hostForSSH = ps.DNSName
+
+		// If MagicDNS isn't enabled on the client,
+		// we will use the first IPv4 we know about
+		// or fallback to the first IPv6 address
+		if !prefs.CorpDNS {
+			ipHost, found := ipFromPeerStatus(ps)
+			if found {
+				hostForSSH = ipHost
+			}
+		}
 	}
 
 	ssh, err := findSSH()
@@ -129,7 +141,11 @@ func runSSH(ctx context.Context, args []string) error {
 	// to use a different one, we'll later be making stock ssh
 	// work well by default too. (doing things like automatically
 	// setting known_hosts, etc)
-	argv = append(argv, username+"@"+hostForSSH)
+	if username == "" {
+		argv = append(argv, hostForSSH)
+	} else {
+		argv = append(argv, username+"@"+hostForSSH)
+	}
 
 	argv = append(argv, argRest...)
 
@@ -169,9 +185,36 @@ func genKnownHosts(st *ipnstate.Status) []byte {
 				continue
 			}
 			fmt.Fprintf(&buf, "%s %s\n", ps.DNSName, hostKey)
+			for _, ip := range ps.TailscaleIPs {
+				fmt.Fprintf(&buf, "%s %s\n", ip.String(), hostKey)
+			}
 		}
 	}
 	return buf.Bytes()
+}
+
+// peerStatusFromArg returns the PeerStatus that matches
+// the input arg which can be a base name, full DNS name, or an IP.
+func peerStatusFromArg(st *ipnstate.Status, arg string) (*ipnstate.PeerStatus, bool) {
+	if arg == "" {
+		return nil, false
+	}
+	argIP, _ := netip.ParseAddr(arg)
+	for _, ps := range st.Peer {
+		if argIP.IsValid() {
+			if slices.Contains(ps.TailscaleIPs, argIP) {
+				return ps, true
+			}
+			continue
+		}
+		if strings.EqualFold(strings.TrimSuffix(arg, "."), strings.TrimSuffix(ps.DNSName, ".")) {
+			return ps, true
+		}
+		if base, _, ok := strings.Cut(ps.DNSName, "."); ok && strings.EqualFold(base, arg) {
+			return ps, true
+		}
+	}
+	return nil, false
 }
 
 // nodeDNSNameFromArg returns the PeerStatus.DNSName value from a peer
@@ -185,10 +228,8 @@ func nodeDNSNameFromArg(st *ipnstate.Status, arg string) (dnsName string, ok boo
 	for _, ps := range st.Peer {
 		dnsName = ps.DNSName
 		if argIP.IsValid() {
-			for _, ip := range ps.TailscaleIPs {
-				if ip == argIP {
-					return dnsName, true
-				}
+			if slices.Contains(ps.TailscaleIPs, argIP) {
+				return dnsName, true
 			}
 			continue
 		}
@@ -200,6 +241,20 @@ func nodeDNSNameFromArg(st *ipnstate.Status, arg string) (dnsName string, ok boo
 		}
 	}
 	return "", false
+}
+
+func ipFromPeerStatus(ps *ipnstate.PeerStatus) (string, bool) {
+	if len(ps.TailscaleIPs) < 1 {
+		return "", false
+	}
+
+	// Look for a IPv4 address or default to the first IP of the list
+	for _, ip := range ps.TailscaleIPs {
+		if ip.Is4() {
+			return ip.String(), true
+		}
+	}
+	return ps.TailscaleIPs[0].String(), true
 }
 
 // getSSHClientEnvVar returns the "SSH_CLIENT" environment variable

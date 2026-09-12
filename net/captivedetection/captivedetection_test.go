@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package captivedetection
@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"tailscale.com/derp/derphttp"
+	"tailscale.com/derp/derpserver"
 	"tailscale.com/net/netmon"
 	"tailscale.com/syncs"
 	"tailscale.com/tstest/nettest"
@@ -94,8 +94,7 @@ func TestCaptivePortalRequest(t *testing.T) {
 	now := time.Now()
 	d.clock = func() time.Time { return now }
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" {
@@ -133,10 +132,9 @@ func TestCaptivePortalRequest(t *testing.T) {
 func TestAgainstDERPHandler(t *testing.T) {
 	d := NewDetector(t.Logf)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
-	s := httptest.NewServer(http.HandlerFunc(derphttp.ServeNoContent))
+	s := httptest.NewServer(http.HandlerFunc(derpserver.ServeNoContent))
 	defer s.Close()
 	e := Endpoint{
 		URL:                        must.Get(url.Parse(s.URL + "/generate_204")),

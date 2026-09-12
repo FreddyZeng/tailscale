@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !plan9
@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"reflect"
 	"testing"
 
 	"go.uber.org/zap"
@@ -14,32 +15,38 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"tailscale.com/client/tailscale/v2"
+
 	"tailscale.com/ipn"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
+	"tailscale.com/k8s-operator/tsclient"
 	"tailscale.com/kube/kubetypes"
 	"tailscale.com/tstest"
-	"tailscale.com/types/ptr"
 	"tailscale.com/util/mak"
 )
 
 func TestTailscaleIngress(t *testing.T) {
 	fc := fake.NewFakeClient(ingressClass())
-	ft := &fakeTSClient{}
+	ft := &fakeTSClient{
+		vipServices: make(map[string]tailscale.VIPService),
+	}
 	fakeTsnetServer := &fakeTSNetServer{certDomains: []string{"foo.com"}}
 	zl, err := zap.NewDevelopment()
 	if err != nil {
 		t.Fatal(err)
 	}
 	ingR := &IngressReconciler{
-		Client: fc,
+		Client:           fc,
+		ingressClassName: "tailscale",
 		ssr: &tailscaleSTSReconciler{
 			Client:            fc,
-			tsClient:          ft,
+			clients:           tsclient.NewProvider(ft),
 			tsnetServer:       fakeTsnetServer,
 			defaultTags:       []string{"tag:k8s"},
 			operatorNamespace: "operator-ns",
@@ -56,22 +63,26 @@ func TestTailscaleIngress(t *testing.T) {
 
 	fullName, shortName := findGenName(t, fc, "default", "test", "ingress")
 	opts := configOpts{
+		replicas:   new(int32(1)),
 		stsName:    shortName,
 		secretName: fullName,
 		namespace:  "default",
 		parentType: "ingress",
 		hostname:   "default-test",
 		app:        kubetypes.AppIngressResource,
+		serveConfig: &ipn.ServeConfig{
+			TCP: map[uint16]*ipn.TCPPortHandler{443: {HTTPS: true}},
+			Web: map[ipn.HostPort]*ipn.WebServerConfig{
+				"${TS_CERT_DOMAIN}:443": {Handlers: map[string]*ipn.HTTPHandler{
+					"/": {Proxy: "http://1.2.3.4:8080/"},
+				}},
+			},
+		},
 	}
-	serveConfig := &ipn.ServeConfig{
-		TCP: map[uint16]*ipn.TCPPortHandler{443: {HTTPS: true}},
-		Web: map[ipn.HostPort]*ipn.WebServerConfig{"${TS_CERT_DOMAIN}:443": {Handlers: map[string]*ipn.HTTPHandler{"/": {Proxy: "http://1.2.3.4:8080/"}}}},
-	}
-	opts.serveConfig = serveConfig
 
 	expectEqual(t, fc, expectedSecret(t, fc, opts))
 	expectEqual(t, fc, expectedHeadlessService(shortName, "ingress"))
-	expectEqual(t, fc, expectedSTSUserspace(t, fc, opts), removeHashAnnotation, removeResourceReqs)
+	expectEqual(t, fc, expectedSTSUserspace(t, fc, opts), removeResourceReqs)
 
 	// 2. Ingress status gets updated with ingress proxy's MagicDNS name
 	// once that becomes available.
@@ -98,11 +109,11 @@ func TestTailscaleIngress(t *testing.T) {
 	})
 	opts.shouldEnableForwardingClusterTrafficViaIngress = true
 	expectReconciled(t, ingR, "default", "test")
-	expectEqual(t, fc, expectedSTS(t, fc, opts), removeHashAnnotation, removeResourceReqs)
+	expectEqual(t, fc, expectedSTS(t, fc, opts), removeResourceReqs)
 
 	// 4. Resources get cleaned up when Ingress class is unset
 	mustUpdate(t, fc, "default", "test", func(ing *networkingv1.Ingress) {
-		ing.Spec.IngressClassName = ptr.To("nginx")
+		ing.Spec.IngressClassName = new("nginx")
 	})
 	expectReconciled(t, ingR, "default", "test")
 	expectReconciled(t, ingR, "default", "test") // deleting Ingress STS requires two reconciles
@@ -120,10 +131,11 @@ func TestTailscaleIngressHostname(t *testing.T) {
 		t.Fatal(err)
 	}
 	ingR := &IngressReconciler{
-		Client: fc,
+		Client:           fc,
+		ingressClassName: "tailscale",
 		ssr: &tailscaleSTSReconciler{
 			Client:            fc,
-			tsClient:          ft,
+			clients:           tsclient.NewProvider(ft),
 			tsnetServer:       fakeTsnetServer,
 			defaultTags:       []string{"tag:k8s"},
 			operatorNamespace: "operator-ns",
@@ -153,16 +165,19 @@ func TestTailscaleIngressHostname(t *testing.T) {
 		parentType: "ingress",
 		hostname:   "default-test",
 		app:        kubetypes.AppIngressResource,
+		serveConfig: &ipn.ServeConfig{
+			TCP: map[uint16]*ipn.TCPPortHandler{443: {HTTPS: true}},
+			Web: map[ipn.HostPort]*ipn.WebServerConfig{
+				"${TS_CERT_DOMAIN}:443": {Handlers: map[string]*ipn.HTTPHandler{
+					"/": {Proxy: "http://1.2.3.4:8080/"},
+				}},
+			},
+		},
 	}
-	serveConfig := &ipn.ServeConfig{
-		TCP: map[uint16]*ipn.TCPPortHandler{443: {HTTPS: true}},
-		Web: map[ipn.HostPort]*ipn.WebServerConfig{"${TS_CERT_DOMAIN}:443": {Handlers: map[string]*ipn.HTTPHandler{"/": {Proxy: "http://1.2.3.4:8080/"}}}},
-	}
-	opts.serveConfig = serveConfig
 
 	expectEqual(t, fc, expectedSecret(t, fc, opts))
 	expectEqual(t, fc, expectedHeadlessService(shortName, "ingress"))
-	expectEqual(t, fc, expectedSTSUserspace(t, fc, opts), removeHashAnnotation, removeResourceReqs)
+	expectEqual(t, fc, expectedSTSUserspace(t, fc, opts), removeResourceReqs)
 
 	// 2. Ingress proxy with capability version >= 110 does not have an HTTPS endpoint set
 	mustUpdate(t, fc, "operator-ns", opts.secretName, func(secret *corev1.Secret) {
@@ -230,7 +245,18 @@ func TestTailscaleIngressWithProxyClass(t *testing.T) {
 		Spec: tsapi.ProxyClassSpec{StatefulSet: &tsapi.StatefulSet{
 			Labels:      tsapi.Labels{"foo": "bar"},
 			Annotations: map[string]string{"bar.io/foo": "some-val"},
-			Pod:         &tsapi.Pod{Annotations: map[string]string{"foo.io/bar": "some-val"}}}},
+			Pod: &tsapi.Pod{
+				Annotations: map[string]string{"foo.io/bar": "some-val"},
+				TailscaleContainer: &tsapi.Container{
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceCPU:    resource.MustParse("500m"),
+							corev1.ResourceMemory: resource.MustParse("28Mi"),
+						},
+					},
+				},
+			},
+		}},
 	}
 	fc := fake.NewClientBuilder().
 		WithScheme(tsapi.GlobalScheme).
@@ -244,10 +270,11 @@ func TestTailscaleIngressWithProxyClass(t *testing.T) {
 		t.Fatal(err)
 	}
 	ingR := &IngressReconciler{
-		Client: fc,
+		Client:           fc,
+		ingressClassName: "tailscale",
 		ssr: &tailscaleSTSReconciler{
 			Client:            fc,
-			tsClient:          ft,
+			clients:           tsclient.NewProvider(ft),
 			tsnetServer:       fakeTsnetServer,
 			defaultTags:       []string{"tag:k8s"},
 			operatorNamespace: "operator-ns",
@@ -271,24 +298,27 @@ func TestTailscaleIngressWithProxyClass(t *testing.T) {
 		parentType: "ingress",
 		hostname:   "default-test",
 		app:        kubetypes.AppIngressResource,
+		serveConfig: &ipn.ServeConfig{
+			TCP: map[uint16]*ipn.TCPPortHandler{443: {HTTPS: true}},
+			Web: map[ipn.HostPort]*ipn.WebServerConfig{
+				"${TS_CERT_DOMAIN}:443": {Handlers: map[string]*ipn.HTTPHandler{
+					"/": {Proxy: "http://1.2.3.4:8080/"},
+				}},
+			},
+		},
 	}
-	serveConfig := &ipn.ServeConfig{
-		TCP: map[uint16]*ipn.TCPPortHandler{443: {HTTPS: true}},
-		Web: map[ipn.HostPort]*ipn.WebServerConfig{"${TS_CERT_DOMAIN}:443": {Handlers: map[string]*ipn.HTTPHandler{"/": {Proxy: "http://1.2.3.4:8080/"}}}},
-	}
-	opts.serveConfig = serveConfig
 
 	expectEqual(t, fc, expectedSecret(t, fc, opts))
 	expectEqual(t, fc, expectedHeadlessService(shortName, "ingress"))
-	expectEqual(t, fc, expectedSTSUserspace(t, fc, opts), removeHashAnnotation, removeResourceReqs)
+	expectEqual(t, fc, expectedSTSUserspace(t, fc, opts))
 
 	// 2. Ingress is updated to specify a ProxyClass, ProxyClass is not yet
 	// ready, so proxy resource configuration does not change.
 	mustUpdate(t, fc, "default", "test", func(ing *networkingv1.Ingress) {
-		mak.Set(&ing.ObjectMeta.Labels, LabelProxyClass, "custom-metadata")
+		mak.Set(&ing.ObjectMeta.Labels, LabelAnnotationProxyClass, "custom-metadata")
 	})
 	expectReconciled(t, ingR, "default", "test")
-	expectEqual(t, fc, expectedSTSUserspace(t, fc, opts), removeHashAnnotation, removeResourceReqs)
+	expectEqual(t, fc, expectedSTSUserspace(t, fc, opts))
 
 	// 3. ProxyClass is set to Ready by proxy-class reconciler. Ingress get
 	// reconciled and configuration from the ProxyClass is applied to the
@@ -299,21 +329,22 @@ func TestTailscaleIngressWithProxyClass(t *testing.T) {
 				Status:             metav1.ConditionTrue,
 				Type:               string(tsapi.ProxyClassReady),
 				ObservedGeneration: pc.Generation,
-			}}}
+			}},
+		}
 	})
 	expectReconciled(t, ingR, "default", "test")
 	opts.proxyClass = pc.Name
-	expectEqual(t, fc, expectedSTSUserspace(t, fc, opts), removeHashAnnotation, removeResourceReqs)
+	expectEqual(t, fc, expectedSTSUserspace(t, fc, opts))
 
 	// 4. tailscale.com/proxy-class label is removed from the Ingress, the
 	// Ingress gets reconciled and the custom ProxyClass configuration is
 	// removed from the proxy resources.
 	mustUpdate(t, fc, "default", "test", func(ing *networkingv1.Ingress) {
-		delete(ing.ObjectMeta.Labels, LabelProxyClass)
+		delete(ing.ObjectMeta.Labels, LabelAnnotationProxyClass)
 	})
 	expectReconciled(t, ingR, "default", "test")
 	opts.proxyClass = ""
-	expectEqual(t, fc, expectedSTSUserspace(t, fc, opts), removeHashAnnotation, removeResourceReqs)
+	expectEqual(t, fc, expectedSTSUserspace(t, fc, opts), removeResourceReqs)
 }
 
 func TestTailscaleIngressWithServiceMonitor(t *testing.T) {
@@ -325,14 +356,15 @@ func TestTailscaleIngressWithServiceMonitor(t *testing.T) {
 				Status:             metav1.ConditionTrue,
 				Type:               string(tsapi.ProxyClassReady),
 				ObservedGeneration: 1,
-			}}},
+			}},
+		},
 	}
 	crd := &apiextensionsv1.CustomResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: serviceMonitorCRD}}
 
 	// Create fake client with ProxyClass, IngressClass, Ingress with metrics ProxyClass, and Service
 	ing := ingress()
 	ing.Labels = map[string]string{
-		LabelProxyClass: "metrics",
+		LabelAnnotationProxyClass: "metrics",
 	}
 	fc := fake.NewClientBuilder().
 		WithScheme(tsapi.GlobalScheme).
@@ -347,10 +379,11 @@ func TestTailscaleIngressWithServiceMonitor(t *testing.T) {
 		t.Fatal(err)
 	}
 	ingR := &IngressReconciler{
-		Client: fc,
+		Client:           fc,
+		ingressClassName: "tailscale",
 		ssr: &tailscaleSTSReconciler{
 			Client:            fc,
-			tsClient:          ft,
+			clients:           tsclient.NewProvider(ft),
 			tsnetServer:       fakeTsnetServer,
 			defaultTags:       []string{"tag:k8s"},
 			operatorNamespace: "operator-ns",
@@ -360,10 +393,6 @@ func TestTailscaleIngressWithServiceMonitor(t *testing.T) {
 	}
 	expectReconciled(t, ingR, "default", "test")
 	fullName, shortName := findGenName(t, fc, "default", "test", "ingress")
-	serveConfig := &ipn.ServeConfig{
-		TCP: map[uint16]*ipn.TCPPortHandler{443: {HTTPS: true}},
-		Web: map[ipn.HostPort]*ipn.WebServerConfig{"${TS_CERT_DOMAIN}:443": {Handlers: map[string]*ipn.HTTPHandler{"/": {Proxy: "http://1.2.3.4:8080/"}}}},
-	}
 	opts := configOpts{
 		stsName:            shortName,
 		secretName:         fullName,
@@ -374,8 +403,15 @@ func TestTailscaleIngressWithServiceMonitor(t *testing.T) {
 		app:                kubetypes.AppIngressResource,
 		namespaced:         true,
 		proxyType:          proxyTypeIngressResource,
-		serveConfig:        serveConfig,
-		resourceVersion:    "1",
+		serveConfig: &ipn.ServeConfig{
+			TCP: map[uint16]*ipn.TCPPortHandler{443: {HTTPS: true}},
+			Web: map[ipn.HostPort]*ipn.WebServerConfig{
+				"${TS_CERT_DOMAIN}:443": {Handlers: map[string]*ipn.HTTPHandler{
+					"/": {Proxy: "http://1.2.3.4:8080/"},
+				}},
+			},
+		},
+		resourceVersion: "1",
 	}
 
 	// 1. Enable metrics- expect metrics Service to be created
@@ -421,13 +457,121 @@ func TestTailscaleIngressWithServiceMonitor(t *testing.T) {
 	// ServiceMonitor gets garbage collected when the Service is deleted - we cannot test that here.
 }
 
+func TestIngressProxyClassAnnotation(t *testing.T) {
+	cl := tstest.NewClock(tstest.ClockOpts{})
+	zl := zap.Must(zap.NewDevelopment())
+
+	pcLEStaging, pcLEStagingFalse, _ := proxyClassesForLEStagingTest()
+
+	testCases := []struct {
+		name                 string
+		proxyClassAnnotation string
+		proxyClassLabel      string
+		proxyClassDefault    string
+		expectedProxyClass   string
+		expectEvents         []string
+	}{
+		{
+			name:               "via_label",
+			proxyClassLabel:    pcLEStaging.Name,
+			expectedProxyClass: pcLEStaging.Name,
+		},
+		{
+			name:                 "via_annotation",
+			proxyClassAnnotation: pcLEStaging.Name,
+			expectedProxyClass:   pcLEStaging.Name,
+		},
+		{
+			name:               "via_default",
+			proxyClassDefault:  pcLEStaging.Name,
+			expectedProxyClass: pcLEStaging.Name,
+		},
+		{
+			name:                 "via_label_override_annotation",
+			proxyClassLabel:      pcLEStaging.Name,
+			proxyClassAnnotation: pcLEStagingFalse.Name,
+			expectedProxyClass:   pcLEStaging.Name,
+		},
+	}
+
+	for _, tt := range testCases {
+		t.Run(tt.name, func(t *testing.T) {
+			builder := fake.NewClientBuilder().
+				WithScheme(tsapi.GlobalScheme)
+
+			builder = builder.WithObjects(pcLEStaging, pcLEStagingFalse).
+				WithStatusSubresource(pcLEStaging, pcLEStagingFalse)
+
+			fc := builder.Build()
+
+			if tt.proxyClassAnnotation != "" || tt.proxyClassLabel != "" || tt.proxyClassDefault != "" {
+				name := tt.proxyClassDefault
+				if name == "" {
+					name = tt.proxyClassLabel
+					if name == "" {
+						name = tt.proxyClassAnnotation
+					}
+				}
+				setProxyClassReady(t, fc, cl, name)
+			}
+
+			mustCreate(t, fc, ingressClass())
+			mustCreate(t, fc, service())
+			ing := ingress()
+			if tt.proxyClassLabel != "" {
+				ing.Labels = map[string]string{
+					LabelAnnotationProxyClass: tt.proxyClassLabel,
+				}
+			}
+			if tt.proxyClassAnnotation != "" {
+				ing.Annotations = map[string]string{
+					LabelAnnotationProxyClass: tt.proxyClassAnnotation,
+				}
+			}
+			mustCreate(t, fc, ing)
+
+			ingR := &IngressReconciler{
+				Client:           fc,
+				ingressClassName: "tailscale",
+				ssr: &tailscaleSTSReconciler{
+					Client:            fc,
+					clients:           tsclient.NewProvider(&fakeTSClient{}),
+					tsnetServer:       &fakeTSNetServer{certDomains: []string{"test-host"}},
+					defaultTags:       []string{"tag:test"},
+					operatorNamespace: "operator-ns",
+					proxyImage:        "tailscale/tailscale:test",
+				},
+				logger:            zl.Sugar(),
+				defaultProxyClass: tt.proxyClassDefault,
+			}
+
+			expectReconciled(t, ingR, "default", "test")
+
+			_, shortName := findGenName(t, fc, "default", "test", "ingress")
+			sts := &appsv1.StatefulSet{}
+			if err := fc.Get(context.Background(), client.ObjectKey{Namespace: "operator-ns", Name: shortName}, sts); err != nil {
+				t.Fatalf("failed to get StatefulSet: %v", err)
+			}
+
+			switch tt.expectedProxyClass {
+			case pcLEStaging.Name:
+				verifyEnvVar(t, sts, "TS_DEBUG_ACME_DIRECTORY_URL", letsEncryptStagingEndpoint)
+			case pcLEStagingFalse.Name:
+				verifyEnvVarNotPresent(t, sts, "TS_DEBUG_ACME_DIRECTORY_URL")
+			default:
+				t.Fatalf("unexpected expected ProxyClass %q", tt.expectedProxyClass)
+			}
+		})
+	}
+}
+
 func TestIngressLetsEncryptStaging(t *testing.T) {
 	cl := tstest.NewClock(tstest.ClockOpts{})
 	zl := zap.Must(zap.NewDevelopment())
 
 	pcLEStaging, pcLEStagingFalse, pcOther := proxyClassesForLEStagingTest()
 
-	testCases := testCasesForLEStagingTests(pcLEStaging, pcLEStagingFalse, pcOther)
+	testCases := testCasesForLEStagingTests()
 
 	for _, tt := range testCases {
 		t.Run(tt.name, func(t *testing.T) {
@@ -452,16 +596,17 @@ func TestIngressLetsEncryptStaging(t *testing.T) {
 			ing := ingress()
 			if tt.proxyClassPerResource != "" {
 				ing.Labels = map[string]string{
-					LabelProxyClass: tt.proxyClassPerResource,
+					LabelAnnotationProxyClass: tt.proxyClassPerResource,
 				}
 			}
 			mustCreate(t, fc, ing)
 
 			ingR := &IngressReconciler{
-				Client: fc,
+				Client:           fc,
+				ingressClassName: "tailscale",
 				ssr: &tailscaleSTSReconciler{
 					Client:            fc,
-					tsClient:          &fakeTSClient{},
+					clients:           tsclient.NewProvider(&fakeTSClient{}),
 					tsnetServer:       &fakeTSNetServer{certDomains: []string{"test-host"}},
 					defaultTags:       []string{"tag:test"},
 					operatorNamespace: "operator-ns",
@@ -498,7 +643,7 @@ func TestEmptyPath(t *testing.T) {
 			name: "empty_path_with_prefix_type",
 			paths: []networkingv1.HTTPIngressPath{
 				{
-					PathType: ptrPathType(networkingv1.PathTypePrefix),
+					PathType: new(networkingv1.PathTypePrefix),
 					Path:     "",
 					Backend:  *backend(),
 				},
@@ -511,7 +656,7 @@ func TestEmptyPath(t *testing.T) {
 			name: "empty_path_with_implementation_specific_type",
 			paths: []networkingv1.HTTPIngressPath{
 				{
-					PathType: ptrPathType(networkingv1.PathTypeImplementationSpecific),
+					PathType: new(networkingv1.PathTypeImplementationSpecific),
 					Path:     "",
 					Backend:  *backend(),
 				},
@@ -524,7 +669,7 @@ func TestEmptyPath(t *testing.T) {
 			name: "empty_path_with_exact_type",
 			paths: []networkingv1.HTTPIngressPath{
 				{
-					PathType: ptrPathType(networkingv1.PathTypeExact),
+					PathType: new(networkingv1.PathTypeExact),
 					Path:     "",
 					Backend:  *backend(),
 				},
@@ -538,12 +683,12 @@ func TestEmptyPath(t *testing.T) {
 			name: "two_competing_but_not_identical_paths_including_one_empty",
 			paths: []networkingv1.HTTPIngressPath{
 				{
-					PathType: ptrPathType(networkingv1.PathTypeImplementationSpecific),
+					PathType: new(networkingv1.PathTypeImplementationSpecific),
 					Path:     "",
 					Backend:  *backend(),
 				},
 				{
-					PathType: ptrPathType(networkingv1.PathTypeImplementationSpecific),
+					PathType: new(networkingv1.PathTypeImplementationSpecific),
 					Path:     "/",
 					Backend:  *backend(),
 				},
@@ -565,11 +710,12 @@ func TestEmptyPath(t *testing.T) {
 				t.Fatal(err)
 			}
 			ingR := &IngressReconciler{
-				recorder: fr,
-				Client:   fc,
+				recorder:         fr,
+				Client:           fc,
+				ingressClassName: "tailscale",
 				ssr: &tailscaleSTSReconciler{
 					Client:            fc,
-					tsClient:          ft,
+					clients:           tsclient.NewProvider(ft),
 					tsnetServer:       fakeTsnetServer,
 					defaultTags:       []string{"tag:k8s"},
 					operatorNamespace: "operator-ns",
@@ -599,25 +745,23 @@ func TestEmptyPath(t *testing.T) {
 				parentType: "ingress",
 				hostname:   "foo",
 				app:        kubetypes.AppIngressResource,
+				serveConfig: &ipn.ServeConfig{
+					TCP: map[uint16]*ipn.TCPPortHandler{443: {HTTPS: true}},
+					Web: map[ipn.HostPort]*ipn.WebServerConfig{
+						"${TS_CERT_DOMAIN}:443": {Handlers: map[string]*ipn.HTTPHandler{
+							"/": {Proxy: "http://1.2.3.4:8080/"},
+						}},
+					},
+				},
 			}
-			serveConfig := &ipn.ServeConfig{
-				TCP: map[uint16]*ipn.TCPPortHandler{443: {HTTPS: true}},
-				Web: map[ipn.HostPort]*ipn.WebServerConfig{"${TS_CERT_DOMAIN}:443": {Handlers: map[string]*ipn.HTTPHandler{"/": {Proxy: "http://1.2.3.4:8080/"}}}},
-			}
-			opts.serveConfig = serveConfig
 
 			expectEqual(t, fc, expectedSecret(t, fc, opts))
 			expectEqual(t, fc, expectedHeadlessService(shortName, "ingress"))
-			expectEqual(t, fc, expectedSTSUserspace(t, fc, opts), removeHashAnnotation, removeResourceReqs)
+			expectEqual(t, fc, expectedSTSUserspace(t, fc, opts), removeResourceReqs)
 
 			expectEvents(t, fr, tt.expectedEvents)
 		})
 	}
-}
-
-// ptrPathType is a helper function to return a pointer to the pathtype string (required for TestEmptyPath)
-func ptrPathType(p networkingv1.PathType) *networkingv1.PathType {
-	return &p
 }
 
 func ingressClass() *networkingv1.IngressClass {
@@ -635,9 +779,11 @@ func service() *corev1.Service {
 		},
 		Spec: corev1.ServiceSpec{
 			ClusterIP: "1.2.3.4",
-			Ports: []corev1.ServicePort{{
-				Port: 8080,
-				Name: "http"},
+			Ports: []corev1.ServicePort{
+				{
+					Port: 8080,
+					Name: "http",
+				},
 			},
 		},
 	}
@@ -649,10 +795,10 @@ func ingress() *networkingv1.Ingress {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test",
 			Namespace: "default",
-			UID:       types.UID("1234-UID"),
+			UID:       "1234-UID",
 		},
 		Spec: networkingv1.IngressSpec{
-			IngressClassName: ptr.To("tailscale"),
+			IngressClassName: new("tailscale"),
 			DefaultBackend:   backend(),
 			TLS: []networkingv1.IngressTLS{
 				{Hosts: []string{"default-test"}},
@@ -670,7 +816,7 @@ func ingressWithPaths(paths []networkingv1.HTTPIngressPath) *networkingv1.Ingres
 			UID:       types.UID("1234-UID"),
 		},
 		Spec: networkingv1.IngressSpec{
-			IngressClassName: ptr.To("tailscale"),
+			IngressClassName: new("tailscale"),
 			Rules: []networkingv1.IngressRule{
 				{
 					Host: "foo.tailnetxyz.ts.net",
@@ -697,4 +843,190 @@ func backend() *networkingv1.IngressBackend {
 			},
 		},
 	}
+}
+
+func TestTailscaleIngressWithHTTPRedirect(t *testing.T) {
+	fc := fake.NewFakeClient(ingressClass())
+	ft := &fakeTSClient{}
+	fakeTsnetServer := &fakeTSNetServer{certDomains: []string{"foo.com"}}
+	zl, err := zap.NewDevelopment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ingR := &IngressReconciler{
+		Client:           fc,
+		ingressClassName: "tailscale",
+		ssr: &tailscaleSTSReconciler{
+			Client:            fc,
+			clients:           tsclient.NewProvider(ft),
+			tsnetServer:       fakeTsnetServer,
+			defaultTags:       []string{"tag:k8s"},
+			operatorNamespace: "operator-ns",
+			proxyImage:        "tailscale/tailscale",
+		},
+		logger: zl.Sugar(),
+	}
+
+	// 1. Create Ingress with HTTP redirect annotation
+	ing := ingress()
+	mak.Set(&ing.Annotations, AnnotationHTTPRedirect, "true")
+	mustCreate(t, fc, ing)
+	mustCreate(t, fc, service())
+
+	expectReconciled(t, ingR, "default", "test")
+
+	fullName, shortName := findGenName(t, fc, "default", "test", "ingress")
+	opts := configOpts{
+		replicas:   new(int32(1)),
+		stsName:    shortName,
+		secretName: fullName,
+		namespace:  "default",
+		parentType: "ingress",
+		hostname:   "default-test",
+		app:        kubetypes.AppIngressResource,
+		serveConfig: &ipn.ServeConfig{
+			TCP: map[uint16]*ipn.TCPPortHandler{
+				443: {HTTPS: true},
+				80:  {HTTP: true},
+			},
+			Web: map[ipn.HostPort]*ipn.WebServerConfig{
+				"${TS_CERT_DOMAIN}:443": {Handlers: map[string]*ipn.HTTPHandler{
+					"/": {Proxy: "http://1.2.3.4:8080/"},
+				}},
+				"${TS_CERT_DOMAIN}:80": {Handlers: map[string]*ipn.HTTPHandler{
+					"/": {Redirect: "301:https://${HOST}${REQUEST_URI}"},
+				}},
+			},
+		},
+	}
+
+	expectEqual(t, fc, expectedSecret(t, fc, opts))
+	expectEqual(t, fc, expectedHeadlessService(shortName, "ingress"))
+	expectEqual(t, fc, expectedSTSUserspace(t, fc, opts), removeResourceReqs)
+
+	// 2. Update device info to get status updated
+	mustUpdate(t, fc, "operator-ns", opts.secretName, func(secret *corev1.Secret) {
+		mak.Set(&secret.Data, "device_id", []byte("1234"))
+		mak.Set(&secret.Data, "device_fqdn", []byte("foo.tailnetxyz.ts.net"))
+	})
+	expectReconciled(t, ingR, "default", "test")
+
+	// Verify Ingress status includes both ports 80 and 443
+	ing = &networkingv1.Ingress{}
+	if err := fc.Get(context.Background(), types.NamespacedName{Name: "test", Namespace: "default"}, ing); err != nil {
+		t.Fatal(err)
+	}
+	wantPorts := []networkingv1.IngressPortStatus{
+		{Port: 443, Protocol: "TCP"},
+		{Port: 80, Protocol: "TCP"},
+	}
+	if !reflect.DeepEqual(ing.Status.LoadBalancer.Ingress[0].Ports, wantPorts) {
+		t.Errorf("incorrect status ports: got %v, want %v", ing.Status.LoadBalancer.Ingress[0].Ports, wantPorts)
+	}
+
+	// 3. Remove HTTP redirect annotation
+	mustUpdate(t, fc, "default", "test", func(ing *networkingv1.Ingress) {
+		delete(ing.Annotations, AnnotationHTTPRedirect)
+	})
+	expectReconciled(t, ingR, "default", "test")
+
+	// 4. Verify Ingress status no longer includes port 80
+	ing = &networkingv1.Ingress{}
+	if err := fc.Get(context.Background(), types.NamespacedName{Name: "test", Namespace: "default"}, ing); err != nil {
+		t.Fatal(err)
+	}
+	wantPorts = []networkingv1.IngressPortStatus{
+		{Port: 443, Protocol: "TCP"},
+	}
+	if !reflect.DeepEqual(ing.Status.LoadBalancer.Ingress[0].Ports, wantPorts) {
+		t.Errorf("incorrect status ports after removing redirect: got %v, want %v", ing.Status.LoadBalancer.Ingress[0].Ports, wantPorts)
+	}
+}
+
+func TestTailscaleIngressIPv6(t *testing.T) {
+	fc := fake.NewFakeClient(ingressClass())
+	zl, err := zap.NewDevelopment()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a Service with an IPv6 ClusterIP
+	ipv6Svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-ipv6",
+			Namespace: "default",
+		},
+		Spec: corev1.ServiceSpec{
+			ClusterIP: "fda9:e575:6e22:2::25",
+			Ports: []corev1.ServicePort{
+				{
+					Port: 2283,
+					Name: "http",
+				},
+			},
+		},
+	}
+	mustCreate(t, fc, ipv6Svc)
+
+	// Create an Ingress that routes to the IPv6 service
+	ing := &networkingv1.Ingress{
+		TypeMeta: metav1.TypeMeta{Kind: "Ingress", APIVersion: "networking.k8s.io/v1"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-ipv6",
+			Namespace: "default",
+			UID:       "1234-UID-IPV6",
+		},
+		Spec: networkingv1.IngressSpec{
+			IngressClassName: new("tailscale"),
+			DefaultBackend: &networkingv1.IngressBackend{
+				Service: &networkingv1.IngressServiceBackend{
+					Name: "test-ipv6",
+					Port: networkingv1.ServiceBackendPort{
+						Number: 2283,
+					},
+				},
+			},
+		},
+	}
+	mustCreate(t, fc, ing)
+
+	ingR := &IngressReconciler{
+		Client:           fc,
+		ingressClassName: "tailscale",
+		ssr: &tailscaleSTSReconciler{
+			Client:            fc,
+			clients:           tsclient.NewProvider(&fakeTSClient{}),
+			tsnetServer:       &fakeTSNetServer{certDomains: []string{"test-host"}},
+			defaultTags:       []string{"tag:test"},
+			operatorNamespace: "operator-ns",
+			proxyImage:        "tailscale/tailscale",
+		},
+		logger: zl.Sugar(),
+	}
+
+	expectReconciled(t, ingR, "default", "test-ipv6")
+
+	// Verify the generated serveConfig has properly bracketed IPv6 address
+	fullName, _ := findGenName(t, fc, "default", "test-ipv6", "ingress")
+	opts := configOpts{
+		replicas:   new(int32(1)),
+		stsName:    "tailscale-ipv6-ingress-test-ipv6",
+		secretName: fullName,
+		namespace:  "default",
+		parentType: "ingress",
+		hostname:   "default-test-ipv6-ingress",
+		app:        kubetypes.AppIngressResource,
+		serveConfig: &ipn.ServeConfig{
+			TCP: map[uint16]*ipn.TCPPortHandler{443: {HTTPS: true}},
+			Web: map[ipn.HostPort]*ipn.WebServerConfig{
+				"${TS_CERT_DOMAIN}:443": {Handlers: map[string]*ipn.HTTPHandler{
+					"/": {Proxy: "http://[fda9:e575:6e22:2::25]:2283/"},
+				}},
+			},
+		},
+	}
+	// expectedSecret hardcodes the parent-resource label to "test", so fix it for our IPv6 test
+	secret := expectedSecret(t, fc, opts)
+	secret.Labels[LabelParentName] = "test-ipv6"
+	expectEqual(t, fc, secret)
 }

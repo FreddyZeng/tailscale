@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package magicsock
@@ -6,9 +6,9 @@ package magicsock
 import (
 	"net/netip"
 	"slices"
-	"sync"
 	"time"
 
+	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tempfork/heap"
 	"tailscale.com/util/mak"
@@ -107,7 +107,7 @@ func (eh endpointHeap) Min() *endpointTrackerEntry {
 //
 // See tailscale/tailscale#7877 for more information.
 type endpointTracker struct {
-	mu        sync.Mutex
+	mu        syncs.Mutex
 	endpoints map[netip.Addr]*endpointHeap
 }
 

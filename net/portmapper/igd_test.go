@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package portmapper
@@ -14,7 +14,6 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"tailscale.com/control/controlknobs"
 	"tailscale.com/net/netaddr"
 	"tailscale.com/net/netmon"
 	"tailscale.com/syncs"
@@ -263,16 +262,20 @@ func (d *TestIGD) handlePCPQuery(pkt []byte, src netip.AddrPort) {
 }
 
 // newTestClient configures a new test client connected to igd for mapping updates.
-// If bus != nil, update events are published to it.
-// A cleanup for the resulting client is added to t.
+// If bus == nil, a new empty event bus is constructed that is cleaned up when t exits.
+// A cleanup for the resulting client is also added to t.
 func newTestClient(t *testing.T, igd *TestIGD, bus *eventbus.Bus) *Client {
+	if bus == nil {
+		bus = eventbus.New()
+		t.Log("Created empty event bus for test client")
+		t.Cleanup(bus.Close)
+	}
 	var c *Client
 	c = NewClient(Config{
-		Logf:         tstest.WhileTestRunningLogger(t),
-		NetMon:       netmon.NewStatic(),
-		ControlKnobs: new(controlknobs.Knobs),
-		EventBus:     bus,
-		OnChange: func() {
+		Logf:     tstest.WhileTestRunningLogger(t),
+		NetMon:   netmon.NewStatic(),
+		EventBus: bus,
+		OnChange: func() { // TODO(creachadair): Remove.
 			t.Logf("port map changed")
 			t.Logf("have mapping: %v", c.HaveMapping())
 		},

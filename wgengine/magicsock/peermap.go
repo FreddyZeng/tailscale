@@ -1,10 +1,10 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package magicsock
 
 import (
-	"net/netip"
+	"sync"
 
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
@@ -15,17 +15,17 @@ import (
 // peer.
 type peerInfo struct {
 	ep *endpoint // always non-nil.
-	// ipPorts is an inverted version of peerMap.byIPPort (below), so
+	// epAddrs is an inverted version of peerMap.byEpAddr (below), so
 	// that when we're deleting this node, we can rapidly find out the
-	// keys that need deleting from peerMap.byIPPort without having to
-	// iterate over every IPPort known for any peer.
-	ipPorts set.Set[netip.AddrPort]
+	// keys that need deleting from peerMap.byEpAddr without having to
+	// iterate over every epAddr known for any peer.
+	epAddrs set.Set[epAddr]
 }
 
 func newPeerInfo(ep *endpoint) *peerInfo {
 	return &peerInfo{
 		ep:      ep,
-		ipPorts: set.Set[netip.AddrPort]{},
+		epAddrs: set.Set[epAddr]{},
 	}
 }
 
@@ -35,9 +35,22 @@ func newPeerInfo(ep *endpoint) *peerInfo {
 // It doesn't do any locking; all access must be done with Conn.mu held.
 type peerMap struct {
 	byNodeKey map[key.NodePublic]*peerInfo
-	byIPPort  map[netip.AddrPort]*peerInfo
+	byEpAddr  map[epAddr]*peerInfo
 	byNodeID  map[tailcfg.NodeID]*peerInfo
 
+	// relayEpAddrByNodeKey ensures we only hold a single relay
+	// [epAddr] (vni.isSet()) for a given node key in byEpAddr, vs letting them
+	// grow unbounded. Relay [epAddr]'s are dynamically created by
+	// [relayManager] during path discovery, and are only useful to track in
+	// peerMap so long as they are the endpoint.bestAddr. [relayManager] handles
+	// all creation and initial probing responsibilities otherwise, and it does
+	// not depend on [peerMap].
+	//
+	// Note: This doesn't address unbounded growth of non-relay epAddr's in
+	// byEpAddr. That issue is being tracked in http://go/corp/29422.
+	relayEpAddrByNodeKey map[key.NodePublic]epAddr
+
+	nodesMu sync.RWMutex // protects nodesOfDisco
 	// nodesOfDisco contains the set of nodes that are using a
 	// DiscoKey. Usually those sets will be just one node.
 	nodesOfDisco map[key.DiscoPublic]set.Set[key.NodePublic]
@@ -45,10 +58,11 @@ type peerMap struct {
 
 func newPeerMap() peerMap {
 	return peerMap{
-		byNodeKey:    map[key.NodePublic]*peerInfo{},
-		byIPPort:     map[netip.AddrPort]*peerInfo{},
-		byNodeID:     map[tailcfg.NodeID]*peerInfo{},
-		nodesOfDisco: map[key.DiscoPublic]set.Set[key.NodePublic]{},
+		byNodeKey:            map[key.NodePublic]*peerInfo{},
+		byEpAddr:             map[epAddr]*peerInfo{},
+		byNodeID:             map[tailcfg.NodeID]*peerInfo{},
+		relayEpAddrByNodeKey: map[key.NodePublic]epAddr{},
+		nodesOfDisco:         map[key.DiscoPublic]set.Set[key.NodePublic]{},
 	}
 }
 
@@ -63,6 +77,9 @@ func (m *peerMap) nodeCount() int {
 // knownPeerDiscoKey reports whether there exists any peer with the disco key
 // dk.
 func (m *peerMap) knownPeerDiscoKey(dk key.DiscoPublic) bool {
+	m.nodesMu.RLock()
+	defer m.nodesMu.RUnlock()
+
 	_, ok := m.nodesOfDisco[dk]
 	return ok
 }
@@ -88,10 +105,10 @@ func (m *peerMap) endpointForNodeID(nodeID tailcfg.NodeID) (ep *endpoint, ok boo
 	return nil, false
 }
 
-// endpointForIPPort returns the endpoint for the peer we
-// believe to be at ipp, or nil if we don't know of any such peer.
-func (m *peerMap) endpointForIPPort(ipp netip.AddrPort) (ep *endpoint, ok bool) {
-	if info, ok := m.byIPPort[ipp]; ok {
+// endpointForEpAddr returns the endpoint for the peer we
+// believe to be at addr, or nil if we don't know of any such peer.
+func (m *peerMap) endpointForEpAddr(addr epAddr) (ep *endpoint, ok bool) {
+	if info, ok := m.byEpAddr[addr]; ok {
 		return info.ep, true
 	}
 	return nil, false
@@ -106,8 +123,11 @@ func (m *peerMap) forEachEndpoint(f func(ep *endpoint)) {
 
 // forEachEndpointWithDiscoKey invokes f on every endpoint in m that has the
 // provided DiscoKey until f returns false or there are no endpoints left to
-// iterate.
+// iterate. f must call back into peerMap and mutate [nodesOfDisco].
 func (m *peerMap) forEachEndpointWithDiscoKey(dk key.DiscoPublic, f func(*endpoint) (keepGoing bool)) {
+	m.nodesMu.RLock()
+	defer m.nodesMu.RUnlock()
+
 	for nk := range m.nodesOfDisco[dk] {
 		pi, ok := m.byNodeKey[nk]
 		if !ok {
@@ -127,7 +147,9 @@ func (m *peerMap) forEachEndpointWithDiscoKey(dk key.DiscoPublic, f func(*endpoi
 // upsertEndpoint stores endpoint in the peerInfo for
 // ep.publicKey, and updates indexes. m must already have a
 // tailcfg.Node for ep.publicKey.
-func (m *peerMap) upsertEndpoint(ep *endpoint, oldDiscoKey key.DiscoPublic) {
+func (m *peerMap) upsertEndpoint(ep *endpoint, oldDiscoKey key.DiscoPublic,
+	fromTSMP bool,
+) {
 	if ep.nodeID == 0 {
 		panic("internal error: upsertEndpoint called with zero NodeID")
 	}
@@ -138,9 +160,14 @@ func (m *peerMap) upsertEndpoint(ep *endpoint, oldDiscoKey key.DiscoPublic) {
 	}
 	m.byNodeID[ep.nodeID] = pi
 
+	// Load key and make the comparison based on the source of the new key.
 	epDisco := ep.disco.Load()
-	if epDisco == nil || oldDiscoKey != epDisco.key {
-		delete(m.nodesOfDisco[oldDiscoKey], ep.publicKey)
+	epKey := epDisco.keyFromControl()
+	if fromTSMP {
+		epKey = epDisco.keyFromTSMP()
+	}
+	if epDisco == nil || oldDiscoKey != epKey {
+		m.cleanFromNodesOfDisco(oldDiscoKey, ep.publicKey)
 	}
 	if ep.isWireguardOnly {
 		// If the peer is a WireGuard only peer, add all of its endpoints.
@@ -148,35 +175,56 @@ func (m *peerMap) upsertEndpoint(ep *endpoint, oldDiscoKey key.DiscoPublic) {
 		// TODO(raggi,catzkorn): this could mean that if a "isWireguardOnly"
 		// peer has, say, 192.168.0.2 and so does a tailscale peer, the
 		// wireguard one will win. That may not be the outcome that we want -
-		// perhaps we should prefer bestAddr.AddrPort if it is set?
+		// perhaps we should prefer bestAddr.epAddr.ap if it is set?
 		// see tailscale/tailscale#7994
 		for ipp := range ep.endpointState {
-			m.setNodeKeyForIPPort(ipp, ep.publicKey)
+			m.setNodeKeyForEpAddr(epAddr{ap: ipp}, ep.publicKey)
 		}
 		return
 	}
-	discoSet := m.nodesOfDisco[epDisco.key]
+
+	// There is no need to insert a new node key under a zero disco key as it
+	// wastes space and will risk stale entries just sitting there in a long list
+	// under the zero key.
+	if epKey.IsZero() {
+		return
+	}
+
+	m.nodesMu.Lock()
+	discoSet := m.nodesOfDisco[epKey]
 	if discoSet == nil {
 		discoSet = set.Set[key.NodePublic]{}
-		m.nodesOfDisco[epDisco.key] = discoSet
+		m.nodesOfDisco[epKey] = discoSet
 	}
 	discoSet.Add(ep.publicKey)
+	m.nodesMu.Unlock()
 }
 
-// setNodeKeyForIPPort makes future peer lookups by ipp return the
+// setNodeKeyForEpAddr makes future peer lookups by addr return the
 // same endpoint as a lookup by nk.
 //
-// This should only be called with a fully verified mapping of ipp to
+// This should only be called with a fully verified mapping of addr to
 // nk, because calling this function defines the endpoint we hand to
-// WireGuard for packets received from ipp.
-func (m *peerMap) setNodeKeyForIPPort(ipp netip.AddrPort, nk key.NodePublic) {
-	if pi := m.byIPPort[ipp]; pi != nil {
-		delete(pi.ipPorts, ipp)
-		delete(m.byIPPort, ipp)
+// WireGuard for packets received from addr.
+func (m *peerMap) setNodeKeyForEpAddr(addr epAddr, nk key.NodePublic) {
+	if pi := m.byEpAddr[addr]; pi != nil {
+		delete(pi.epAddrs, addr)
+		delete(m.byEpAddr, addr)
+		if addr.vni.IsSet() {
+			delete(m.relayEpAddrByNodeKey, pi.ep.publicKey)
+		}
 	}
 	if pi, ok := m.byNodeKey[nk]; ok {
-		pi.ipPorts.Add(ipp)
-		m.byIPPort[ipp] = pi
+		if addr.vni.IsSet() {
+			relay, ok := m.relayEpAddrByNodeKey[nk]
+			if ok {
+				delete(pi.epAddrs, relay)
+				delete(m.byEpAddr, relay)
+			}
+			m.relayEpAddrByNodeKey[nk] = addr
+		}
+		pi.epAddrs.Add(addr)
+		m.byEpAddr[addr] = pi
 	}
 }
 
@@ -192,8 +240,16 @@ func (m *peerMap) deleteEndpoint(ep *endpoint) {
 
 	pi := m.byNodeKey[ep.publicKey]
 	if epDisco != nil {
-		delete(m.nodesOfDisco[epDisco.key], ep.publicKey)
+		for _, discoKey := range []key.DiscoPublic{
+			epDisco.keyFromControl(), epDisco.keyFromTSMP(),
+		} {
+			if discoKey.IsZero() {
+				continue
+			}
+			m.cleanFromNodesOfDisco(discoKey, ep.publicKey)
+		}
 	}
+
 	delete(m.byNodeKey, ep.publicKey)
 	if was, ok := m.byNodeID[ep.nodeID]; ok && was.ep == ep {
 		delete(m.byNodeID, ep.nodeID)
@@ -203,7 +259,18 @@ func (m *peerMap) deleteEndpoint(ep *endpoint) {
 		// Unexpected. But no logger plumbed here to log so.
 		return
 	}
-	for ip := range pi.ipPorts {
-		delete(m.byIPPort, ip)
+	for ip := range pi.epAddrs {
+		delete(m.byEpAddr, ip)
+	}
+	delete(m.relayEpAddrByNodeKey, ep.publicKey)
+}
+
+func (m *peerMap) cleanFromNodesOfDisco(disco key.DiscoPublic, node key.NodePublic) {
+	m.nodesMu.Lock()
+	defer m.nodesMu.Unlock()
+	s := m.nodesOfDisco[disco]
+	delete(s, node)
+	if len(s) == 0 {
+		delete(m.nodesOfDisco, disco)
 	}
 }
